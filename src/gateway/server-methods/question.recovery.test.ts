@@ -1,38 +1,14 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import {
-  getAdmittedRunDelegatedAuthority,
-  prepareSystemAgentRunAdmission,
-  type PreparedAgentRunAdmission,
-} from "../../agents/admitted-run-context.js";
-import {
-  abortAndDrainEmbeddedAgentRun,
-  clearActiveEmbeddedRun,
-  setActiveEmbeddedRun,
-  type EmbeddedAgentQueueHandle,
-} from "../../agents/embedded-agent-runner/runs.js";
+import * as runAdmission from "../../agents/admitted-run-context.js";
+import * as runs from "../../agents/embedded-agent-runner/runs.js";
 import { testing as embeddedRunTesting } from "../../agents/embedded-agent-runner/runs.test-support.js";
-import {
-  createAdmittedGatewayToolCallerIdentity,
-  withGatewayToolCallerIdentity,
-} from "../../agents/tools/gateway-caller-context.js";
+import * as caller from "../../agents/tools/gateway-caller-context.js";
 import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { isReplyRunEvidenceStale } from "../../auto-reply/reply/reply-run-registry.state.js";
 import { admitReplyTurn } from "../../auto-reply/reply/reply-turn-admission.js";
-import {
-  claimAgentRunDelegatedAuthority,
-  clearAgentRunContext,
-  registerAgentRunContext,
-  registerAgentRunDelegatedAuthorityClosedHandler,
-  releaseAgentRunDelegatedAuthority,
-  type AgentRunDelegatedAuthority,
-} from "../../infra/agent-run-registry.js";
-import {
-  emitTrustedDiagnosticEvent,
-  onDiagnosticEvent,
-  resetDiagnosticEventsForTest,
-  setDiagnosticsEnabledForProcess,
-} from "../../infra/diagnostic-events.js";
+import * as registry from "../../infra/agent-run-registry.js";
+import * as diagnostics from "../../infra/diagnostic-events.js";
 import { recoverStuckDiagnosticSession } from "../../logging/diagnostic-stuck-session-recovery.runtime.js";
 import { startGatewayDiagnosticHeartbeat } from "../../logging/diagnostic.js";
 import { resetDiagnosticStateForTest } from "../../logging/diagnostic.test-support.js";
@@ -47,28 +23,28 @@ import type { GatewayClient, GatewayRequestHandlerOptions, RespondFn } from "./t
 
 const session = { sessionId: "human-wait-session", sessionKey: "agent:main:main" };
 const ref = { ...session, runId: "human-wait-run" };
+const target = { agentId: "main", sessionKey: session.sessionKey };
 const answers = () => ({ answers: { answer: ["synthetic-human-answer"] } });
 let manager: QuestionManager;
 let scheduler: ReturnType<typeof createTestGatewayScheduler>;
-let authority: AgentRunDelegatedAuthority;
+let authority: registry.AgentRunDelegatedAuthority;
 let unregister: () => void;
 let client: GatewayClient;
 let handlers: ReturnType<typeof createQuestionHandlers>;
-let admission: PreparedAgentRunAdmission;
+let admission: runAdmission.PreparedAgentRunAdmission;
 let onBroadcast: (event: string) => void;
 let requesterActive: boolean;
 let validateAuthority: ReturnType<typeof createAgentRuntimeApprovalAuthorityValidator>;
 const abort = vi.fn();
-let handle: EmbeddedAgentQueueHandle;
+let handle: runs.EmbeddedAgentQueueHandle;
 
-function runtimeClient(claim: AgentRunDelegatedAuthority): GatewayClient {
+function runtimeClient(claim: registry.AgentRunDelegatedAuthority): GatewayClient {
   return {
     connect: { scopes: ["operator.admin"] },
     internal: {
       agentRuntimeIdentity: {
         kind: "agentRuntime",
-        agentId: "main",
-        sessionKey: ref.sessionKey,
+        ...target,
         operationalRunInstance: claim.operationalRunInstance,
         delegatedAuthority: { kind: "local", ...claim },
       },
@@ -93,18 +69,20 @@ function heartbeat(
 
 const withState = (run: () => Promise<void>) => withOpenClawTestState({ scenario: "minimal" }, run);
 
-function replaceOnExpiry(replacement: EmbeddedAgentQueueHandle) {
+function replaceOnExpiry(replacement: runs.EmbeddedAgentQueueHandle) {
   onBroadcast = (event) => {
     if (event === "question.resolved") {
-      setActiveEmbeddedRun(ref.sessionId, replacement, ref.sessionKey);
+      runs.setActiveEmbeddedRun(ref.sessionId, replacement, ref.sessionKey);
     }
   };
 }
 
 function replacementHandle() {
-  const replacement: EmbeddedAgentQueueHandle = {
+  const replacement = {
     ...handle,
-    abort: vi.fn(() => clearActiveEmbeddedRun(ref.sessionId, replacement, ref.sessionKey)),
+    abort: vi.fn<() => void>(() =>
+      runs.clearActiveEmbeddedRun(ref.sessionId, replacement, ref.sessionKey),
+    ),
   };
   return replacement;
 }
@@ -119,18 +97,23 @@ beforeEach(async () => {
   };
   vi.useFakeTimers();
   vi.setSystemTime(Date.parse("2026-08-20T12:00:00Z"));
-  setDiagnosticsEnabledForProcess(true);
+  diagnostics.setDiagnosticsEnabledForProcess(true);
   scheduler = createTestGatewayScheduler("fake-timers");
   manager = new QuestionManager(scheduler);
   onBroadcast = () => {};
   requesterActive = true;
   const validateRunAuthority = createAgentRuntimeApprovalAuthorityValidator();
   validateAuthority = (identity) => requesterActive && validateRunAuthority(identity);
-  registerAgentRunContext(ref.runId, { sessionKey: ref.sessionKey, agentId: "main" });
-  admission = prepareSystemAgentRunAdmission({}, ref.runId, "main", "question-recovery-test");
+  registry.registerAgentRunContext(ref.runId, target);
+  admission = runAdmission.prepareSystemAgentRunAdmission(
+    {},
+    ref.runId,
+    "main",
+    "question-recovery-test",
+  );
   const admitted = await admission.admit("embedded");
-  authority = getAdmittedRunDelegatedAuthority(admitted)!;
-  unregister = registerAgentRunDelegatedAuthorityClosedHandler(() =>
+  authority = runAdmission.getAdmittedRunDelegatedAuthority(admitted)!;
+  unregister = registry.registerAgentRunDelegatedAuthorityClosedHandler(() =>
     manager.cancelClosedAuthorities(),
   );
   client = runtimeClient(authority);
@@ -140,16 +123,15 @@ beforeEach(async () => {
     scheduler,
   );
   abort.mockReset().mockImplementation(() => {
-    releaseAgentRunDelegatedAuthority(authority);
-    clearActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey);
+    registry.releaseAgentRunDelegatedAuthority(authority);
+    runs.clearActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey);
   });
-  await withGatewayToolCallerIdentity(
-    createAdmittedGatewayToolCallerIdentity({
+  await caller.withGatewayToolCallerIdentity(
+    caller.createAdmittedGatewayToolCallerIdentity({
       admittedRunContext: admitted,
-      agentId: "main",
-      sessionKey: ref.sessionKey,
+      ...target,
     }),
-    () => setActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey),
+    () => runs.setActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey),
   );
 });
 
@@ -158,11 +140,11 @@ afterEach(async () => {
   await manager.drain();
   resetDiagnosticStateForTest();
   admission.close();
-  releaseAgentRunDelegatedAuthority(authority);
+  registry.releaseAgentRunDelegatedAuthority(authority);
   unregister();
-  clearAgentRunContext(ref.runId);
+  registry.clearAgentRunContext(ref.runId);
   embeddedRunTesting.resetActiveEmbeddedRuns();
-  resetDiagnosticEventsForTest();
+  diagnostics.resetDiagnosticEventsForTest();
   vi.useRealTimers();
 });
 
@@ -193,8 +175,7 @@ async function call(
 async function request(trusted = true, timeoutMs = 3_600_000, id = "human-question") {
   const params = {
     id,
-    agentId: "main",
-    sessionKey: ref.sessionKey,
+    ...target,
     runId: ref.runId,
     timeoutMs,
     questions: [
@@ -216,7 +197,7 @@ async function request(trusted = true, timeoutMs = 3_600_000, id = "human-questi
 }
 
 function startQuestionTool(toolCallId: string) {
-  emitTrustedDiagnosticEvent({
+  diagnostics.emitTrustedDiagnosticEvent({
     type: "tool.execution.started",
     ...ref,
     toolName: "ask_user",
@@ -234,8 +215,7 @@ it("keeps an accepted one-hour question alive through default diagnostic recover
     expect(recovery).toHaveBeenCalledWith(
       expect.objectContaining({ allowActiveAbort: true, queueDepth: 0 }),
     );
-    expect(abort).not.toHaveBeenCalled();
-    expect(manager.get(id)?.status).toBe("pending");
+    expect([abort.mock.calls.length, manager.get(id)?.status]).toEqual([0, "pending"]);
     const answer = manager.waitAnswer(id);
     await vi.advanceTimersByTimeAsync(2_500_000);
     expect(abort).not.toHaveBeenCalled();
@@ -291,8 +271,7 @@ it("keeps a replacement alive when a heartbeat expires its pending question", as
     await Promise.all(recovery.mock.results.map((result) => result.value));
 
     await expect(answer).resolves.toEqual({ status: "expired" });
-    expect(abort).not.toHaveBeenCalled();
-    expect(replacement.abort).not.toHaveBeenCalled();
+    expect([abort.mock.calls, replacement.abort.mock.calls]).toEqual([[], []]);
   });
 });
 
@@ -302,7 +281,7 @@ it("keeps resumed question work alive when attention reporting settles the quest
     startQuestionTool("reporting-settlement-call");
     const id = await request();
     const answer = manager.waitAnswer(id);
-    const unsubscribe = onDiagnosticEvent((event) => {
+    const unsubscribe = diagnostics.onDiagnosticEvent((event) => {
       if (
         event.type === "session.stalled" &&
         event.sessionId === ref.sessionId &&
@@ -332,30 +311,8 @@ it("keeps resumed question work alive when attention reporting settles the quest
   });
 });
 
-it("does not expire a stopped RPC observer's question before its expiry callback runs", async () => {
-  const id = await request(false, 100);
-  const events: string[] = [];
-  onBroadcast = (event) => events.push(event);
-  const observer = new AsyncWorkScope();
-  const waiting = observer.track(() => call("question.waitAnswer", { id }, false));
-  try {
-    observer.beginClose();
-    // The clock can pass expiry while its timer is still queued. Observation
-    // cleanup must not turn that queued deadline into a question decision.
-    vi.setSystemTime(Date.now() + 101);
-    await expect(waiting).resolves.toEqual([true, { status: "pending" }, undefined]);
-    await observer.drain();
-    manager.close();
-    expect(events).toEqual([]);
-  } finally {
-    manager.close();
-    await waiting;
-    await observer.drain();
-  }
-});
-
-it.each(["signal", "current client"] as const)(
-  "denies a stopped observer's local response when its %s authority closes",
+it.each(["active", "signal", "current client"] as const)(
+  "settles a stopped RPC observer with %s authority without expiring its question",
   async (source) => {
     const id = await request(false, 100);
     const events: string[] = [];
@@ -364,36 +321,46 @@ it.each(["signal", "current client"] as const)(
     const controller = new AbortController();
     let current = true;
     const registered = vi.spyOn(manager, "waitAnswer");
-    const waiting = observer.track(() =>
-      call("question.waitAnswer", { id }, false, {
-        signal: controller.signal,
-        hasCurrentClientAuthority: () => current,
-      }),
-    );
+    const auth =
+      source === "active"
+        ? {}
+        : {
+            signal: controller.signal,
+            hasCurrentClientAuthority: () => current,
+          };
+    const waiting = observer.track(() => call("question.waitAnswer", { id }, false, auth));
     const result = Promise.allSettled([waiting]);
     try {
       expect(registered).toHaveBeenCalledExactlyOnceWith(id, undefined, undefined);
       observer.beginClose();
       if (source === "signal") {
         controller.abort(new Error("Question request source closed"));
-      } else {
+      } else if (source === "current client") {
         current = false;
       }
+      // Cross the deadline with its timer still queued: cleanup is not a decision.
       vi.setSystemTime(Date.now() + 101);
-      expect((await result)[0]).toMatchObject({
-        status: "rejected",
-        reason: {
-          message:
-            source === "signal"
-              ? "Question request source closed"
-              : "Gateway requester authority changed",
-        },
-      });
+      if (source === "active") {
+        await expect(waiting).resolves.toEqual([true, { status: "pending" }, undefined]);
+      } else {
+        const message =
+          source === "signal"
+            ? "Question request source closed"
+            : "Gateway requester authority changed";
+        expect((await result)[0]).toMatchObject({ status: "rejected", reason: { message } });
+      }
       await observer.drain();
-      expect(manager.observe(id)?.record.status).toBe("pending");
+      if (source === "active") {
+        manager.close();
+      } else {
+        expect(manager.observe(id)?.record.status).toBe("pending");
+      }
       expect(events).toEqual([]);
     } finally {
       observer.beginClose();
+      if (source === "active") {
+        manager.close();
+      }
       await result;
       await observer.drain();
       registered.mockRestore();
@@ -412,7 +379,7 @@ it("keeps explicit user abort authoritative during human input", async () => {
   const id = await request();
   await expect(recover()).resolves.toMatchObject({ reason: "human_input_wait" });
   await expect(
-    abortAndDrainEmbeddedAgentRun({ ...ref, reason: "user_abort" }),
+    runs.abortAndDrainEmbeddedAgentRun({ ...ref, reason: "user_abort" }),
   ).resolves.toMatchObject({
     aborted: true,
     drained: true,
@@ -420,62 +387,56 @@ it("keeps explicit user abort authoritative during human input", async () => {
   expect(manager.get(id)?.status).toBe("cancelled");
 });
 
-it("accepts late human input through reply admission instead of treating its owner as stale", async () => {
-  const operation = createReplyOperation({ ...session, resetTriggered: false });
-  operation.attachBackend(Object.assign(handle, { kind: "embedded" as const, cancel: abort }));
-  operation.bindToolAuthoritySnapshot({
-    fingerprint: () => "human-wait-surface",
-    project: () => "human-wait-surface",
-  });
-  operation.setPhase("running");
-  try {
-    await request();
-    startQuestionTool("late-answer-call");
-    await vi.advanceTimersByTimeAsync(930_000);
-    expect(isReplyRunEvidenceStale(operation)).toBe(false);
-    await expect(
-      admitReplyTurn({
-        ...session,
-        kind: "visible",
-        resetTriggered: false,
-        waitForActive: false,
-      }),
-    ).resolves.toMatchObject({
-      status: "skipped",
-      reason: "active-run",
-      activeOperation: operation,
-    });
-  } finally {
-    operation.complete();
-  }
-});
-
-it("does not protect an unrelated reply backend that copies the waiting run's IDs", async () => {
-  const operation = createReplyOperation({ ...session, resetTriggered: false });
-  operation.attachBackend({ ...handle, kind: "embedded", cancel: () => {} });
-  operation.setPhase("running");
-  try {
-    await request();
-    startQuestionTool("unrelated-call");
-    await vi.advanceTimersByTimeAsync(930_000);
-    expect(isReplyRunEvidenceStale(operation)).toBe(true);
-  } finally {
-    operation.complete();
-  }
-});
+it.each([true, false])(
+  "protects late human input only for its owning reply backend (%s)",
+  async (owns) => {
+    const operation = createReplyOperation({ ...session, resetTriggered: false });
+    if (owns) {
+      operation.attachBackend(Object.assign(handle, { kind: "embedded" as const, cancel: abort }));
+      operation.bindToolAuthoritySnapshot({
+        fingerprint: () => "human-wait-surface",
+        project: () => "human-wait-surface",
+      });
+    } else {
+      operation.attachBackend({ ...handle, kind: "embedded", cancel: () => {} });
+    }
+    operation.setPhase("running");
+    try {
+      await request();
+      startQuestionTool(owns ? "late-answer-call" : "unrelated-call");
+      await vi.advanceTimersByTimeAsync(930_000);
+      expect(isReplyRunEvidenceStale(operation)).toBe(!owns);
+      if (owns) {
+        await expect(
+          admitReplyTurn({
+            ...session,
+            kind: "visible",
+            resetTriggered: false,
+            waitForActive: false,
+          }),
+        ).resolves.toMatchObject({
+          status: "skipped",
+          reason: "active-run",
+          activeOperation: operation,
+        });
+      }
+    } finally {
+      operation.complete();
+    }
+  },
+);
 
 it("does not transfer a pending question to a replacement handle with the same run ID", async () => {
   await request();
   const replacement = replacementHandle();
-  setActiveEmbeddedRun(ref.sessionId, replacement, ref.sessionKey);
+  runs.setActiveEmbeddedRun(ref.sessionId, replacement, ref.sessionKey);
   await expect(recover()).resolves.toMatchObject({ status: "aborted" });
-  expect(replacement.abort).toHaveBeenCalledTimes(1);
-  expect(abort).not.toHaveBeenCalled();
+  expect([replacement.abort.mock.calls.length, abort.mock.calls.length]).toEqual([1, 0]);
 });
 
 it("refuses to bind new authority to the old handle when a run ID is reused", async () => {
   await request();
-  const replacementAuthority = claimAgentRunDelegatedAuthority({
+  const replacementAuthority = registry.claimAgentRunDelegatedAuthority({
     runId: ref.runId,
     instanceId: "replacement-instance",
   });
@@ -484,7 +445,7 @@ it("refuses to bind new authority to the old handle when a run ID is reused", as
     await request(true, 3_600_000, "replacement-question");
     await expect(recover()).resolves.toMatchObject({ status: "aborted" });
   } finally {
-    releaseAgentRunDelegatedAuthority(replacementAuthority);
+    registry.releaseAgentRunDelegatedAuthority(replacementAuthority);
   }
 });
 
@@ -536,6 +497,5 @@ it("does not abort a replacement installed synchronously by question expiry", as
     status: "skipped",
     reason: "stale_session_state",
   });
-  expect(abort).not.toHaveBeenCalled();
-  expect(replacement.abort).not.toHaveBeenCalled();
+  expect([abort.mock.calls, replacement.abort.mock.calls]).toEqual([[], []]);
 });

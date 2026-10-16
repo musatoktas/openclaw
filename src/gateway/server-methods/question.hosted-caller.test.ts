@@ -4,22 +4,13 @@ import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execu
 import { prepareSystemAgentRunAdmission } from "../../agents/admitted-run-context.js";
 import { createAskUserTool } from "../../agents/tools/ask-user-tool.js";
 import { resetPendingAskUserQuestionsForTest } from "../../agents/tools/ask-user-tool.test-support.js";
-import {
-  createAdmittedGatewayToolCallerIdentity,
-  withGatewayToolCallerIdentity,
-} from "../../agents/tools/gateway-caller-context.js";
+import * as callerContext from "../../agents/tools/gateway-caller-context.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
-import {
-  loadSessionEntry,
-  upsertSessionEntryCore,
-} from "../../config/sessions/session-accessor.js";
+import * as sessionStore from "../../config/sessions/session-accessor.js";
 import { bindGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
-import {
-  withOpenClawTestState,
-  type OpenClawTestState,
-} from "../../test-utils/openclaw-test-state.js";
+import * as testState from "../../test-utils/openclaw-test-state.js";
 import { createAgentRuntimeApprovalAuthorityValidator } from "../agent-runtime-approval-authority.js";
 import { createGatewayMethodRegistry } from "../methods/registry.js";
 import { captureGatewayOperatorRunAuthority } from "../operator-run-authority.js";
@@ -37,6 +28,7 @@ import type { GatewayRequestHandlerOptions, RespondFn } from "./types.js";
 afterEach(resetPendingAskUserQuestionsForTest);
 
 const sessionKey = "agent:main:hosted-question";
+const target = { agentId: "main", sessionKey };
 const question = { header: "Destination", question: "Where next?" };
 const answers = () => ({ answers: { destination: ["Home"] } });
 const answered = { status: "answered", answers: answers() };
@@ -52,7 +44,7 @@ const toolArgs = {
 };
 
 async function createHostedQuestion(
-  state: OpenClawTestState,
+  state: testState.OpenClawTestState,
   foreign = false,
   broadRole?: "write" | "view" | "none",
 ) {
@@ -67,15 +59,17 @@ async function createHostedQuestion(
   const browser = roleClient(role, "hosted-question-owner");
   browser.connect.scopes = scopes;
   const profileId = expectDefined(browser.authenticatedUserProfile, "original person").profileId;
-  const scope = { agentId: "main", sessionKey, storePath: cfg.session.store };
-  await upsertSessionEntryCore(scope, {
+  const scope = { ...target, storePath: cfg.session.store };
+  await sessionStore.upsertSessionEntryCore(scope, {
     sessionId: "hosted-question-session",
     lifecycleRevision: "hosted-question-generation",
     updatedAt: 1,
     visibility: "shared",
     createdActor: { type: "human", source: "profile", id: foreign ? "other-person" : profileId },
   });
-  expect(loadSessionEntry(scope)?.createdActor?.id).toBe(foreign ? "other-person" : profileId);
+  expect(sessionStore.loadSessionEntry(scope)?.createdActor?.id).toBe(
+    foreign ? "other-person" : profileId,
+  );
   const scheduler = createTestGatewayScheduler();
   const manager = new QuestionManager(scheduler);
   const waiting = createDeferredCore();
@@ -108,10 +102,9 @@ async function createHostedQuestion(
   const admitted = await parent.admit("embedded");
   bindGatewayContextResolver(admitted, () => context);
   const caller = expectDefined(
-    createAdmittedGatewayToolCallerIdentity({
+    callerContext.createAdmittedGatewayToolCallerIdentity({
       admittedRunContext: admitted,
-      agentId: "main",
-      sessionKey,
+      ...target,
     }),
     "hosted caller",
   );
@@ -123,8 +116,7 @@ async function createHostedQuestion(
   const request = vi.fn(async (options: GatewayRequestHandlerOptions) => {
     const client = options.client;
     const internal = client?.internal;
-    expect(internal?.syntheticClient).toBe(true);
-    expect(client?.connect.scopes).toEqual(scopes);
+    expect([internal?.syntheticClient, client?.connect.scopes]).toEqual([true, scopes]);
     expect(readGatewayRequestMutationAuthority(options).sessionScope).toBe(
       broadRole ? undefined : "operator.sessions.write",
     );
@@ -136,8 +128,7 @@ async function createHostedQuestion(
     } else {
       const trustedIdentity = expectDefined(identity, "trusted runtime producer");
       expect(trustedIdentity).toMatchObject({
-        agentId: "main",
-        sessionKey,
+        ...target,
         operationalRunInstance: admitted.operationalRunInstance,
       });
       expect(context.validateAgentRuntimeApprovalAuthority?.(trustedIdentity)).toBe(true);
@@ -189,10 +180,9 @@ async function createHostedQuestion(
   };
   return {
     ask: () =>
-      withGatewayToolCallerIdentity(caller, async () => {
+      callerContext.withGatewayToolCallerIdentity(caller, async () => {
         const tool = createAskUserTool({
-          agentId: "main",
-          sessionKey,
+          ...target,
           runId: admitted.operationalRunInstance.runId,
         });
         return await tool.execute("hosted-question-call", toolArgs);
@@ -203,7 +193,7 @@ async function createHostedQuestion(
     answer: (id: string) => browserRequest("question.resolve", { id, answers: answers() }),
     read: (id: string) => browserRequest("question.get", { id }),
     hosted: (method: string, params: Record<string, unknown>) =>
-      withGatewayToolCallerIdentity(caller, () =>
+      callerContext.withGatewayToolCallerIdentity(caller, () =>
         dispatchGatewayMethodInProcessRaw(method, params, {
           syntheticScopes: ["operator.questions"],
           resolveGatewayContext: caller.gatewayContextResolver,
@@ -224,7 +214,7 @@ async function withHostedQuestion(
   foreign = false,
   role?: "write" | "view" | "none",
 ) {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+  await testState.withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const fixture = await createHostedQuestion(state, foreign, role);
     try {
       await run(fixture);
@@ -249,8 +239,7 @@ it("runs hosted ask_user through the real router with its original narrow operat
       expect(request).toHaveBeenCalledOnce();
       const record = expectDefined(manager.list()[0], "accepted question");
       expect(record).toMatchObject({
-        agentId: "main",
-        sessionKey,
+        ...target,
         runId: "hosted-question-run",
         status: "pending",
       });
@@ -293,8 +282,7 @@ it.each(["write", "view", "none"] as const)(
       async ({ manager, hosted, request: requestSpy }) => {
         const request = {
           id: "broad-shared",
-          agentId: "main",
-          sessionKey,
+          ...target,
           timeoutMs: 60_000,
           questions: [
             {

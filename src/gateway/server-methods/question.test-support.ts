@@ -13,13 +13,16 @@ import {
   releaseAgentRunDelegatedAuthority,
   type AgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { createAgentRuntimeApprovalAuthorityValidator } from "../agent-runtime-approval-authority.js";
+import { captureGatewayOperatorRunAuthority } from "../operator-run-authority.js";
 import { QuestionManager } from "../question-manager.js";
 import type { GatewayBroadcastFn } from "../server-broadcast-types.js";
 import { createGatewayBroadcaster } from "../server-broadcast.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import type { GatewayClientRegistry } from "../server/client-registry.js";
+import type { GatewayWsClient } from "../server/ws-types.js";
 import type { SessionRowProjection } from "../session-row-projection.js";
 import { canReceiveSessionEvent, prepareProjectedSessionSharing } from "../session-sharing.js";
 import { resolveSessionStoreIdentity } from "../session-store-key.js";
@@ -39,6 +42,76 @@ type SecretStoreReload = Parameters<typeof createSecretStoreWriteService>[0]["re
 export let reloadSecrets: ReturnType<typeof vi.fn<SecretStoreReload>>;
 
 export const questionNotFound = [false, undefined, { details: { reason: "QUESTION_NOT_FOUND" } }];
+export const questionOk = (value: unknown) => [true, value, undefined];
+export const questionError = (error: unknown) => [false, undefined, error];
+
+export async function createQuestionSource(
+  client: GatewayClient,
+  cfg: OpenClawConfig,
+  viaClient = false,
+) {
+  const controller = new AbortController();
+  const authority = {
+    signal: controller.signal,
+    assertCurrent: () => controller.signal.throwIfAborted(),
+  };
+  if (viaClient) {
+    client.internal = { ...client.internal, operatorAccessAuthority: authority };
+  }
+  const source = await captureGatewayOperatorRunAuthority({
+    client,
+    context: { getRuntimeConfig: () => cfg },
+    ...(viaClient ? {} : { sourceAuthority: authority }),
+  });
+  if (!source) {
+    throw new Error("Expected admitted question source");
+  }
+  return { source, controller };
+}
+
+type QuestionSend = (
+  wire: string | Buffer,
+  options?: { binary: false } | ((error?: Error) => void),
+  callback?: (error?: Error) => void,
+) => void;
+
+export function createQuestionPeer(
+  client: GatewayClient,
+  connId: string,
+  send = vi.fn<QuestionSend>(),
+) {
+  const socket = { readyState: 1, bufferedAmount: 0, send, close: vi.fn() };
+  const ws: GatewayWsClient = {
+    ...client,
+    authenticatedUserProfile: client.authenticatedUserProfile
+      ? {
+          ...client.authenticatedUserProfile,
+          avatarRevision: client.authenticatedUserProfile.avatarRevision ?? "",
+        }
+      : undefined,
+    connId,
+    usesSharedGatewayAuth: false,
+    socket: socket as unknown as GatewayWsClient["socket"],
+  };
+  return { ws, socket, send };
+}
+
+export function observeQuestionWait(once = true) {
+  const entered = createDeferredCore();
+  const wait = manager.waitAnswer.bind(manager);
+  const observe = (...args: Parameters<typeof wait>) => {
+    const result = wait(...args);
+    entered.resolve();
+    return result;
+  };
+  const spy = vi.spyOn(manager, "waitAnswer");
+  if (once) {
+    spy.mockImplementationOnce(observe);
+  } else {
+    spy.mockImplementation(observe);
+  }
+  return { entered: entered.promise, spy };
+}
 
 export function createProjectedQuestionBroadcaster(
   cfg: OpenClawConfig,

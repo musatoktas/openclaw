@@ -5,6 +5,7 @@ import * as inProcessGateway from "../../agents/tools/in-process-gateway.js";
 import { prepareSessionsSendCommunication } from "../../agents/tools/sessions-send-communication.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   claimAgentRunDelegatedAuthority,
@@ -13,7 +14,10 @@ import {
 } from "../../infra/agent-run-registry.js";
 import type { CommunicationEndpoint } from "../../sessions/communication-admission.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { createOperatorClient } from "../server-plugin-in-process-dispatch.test-support.js";
 import { requestSessionCommunicationApproval } from "../session-communication-approval.js";
@@ -27,78 +31,76 @@ import {
 import type { GatewayClient } from "./types.js";
 
 installQuestionTestHooks();
-const resolve = (cfg: OpenClawConfig, client: GatewayClient, id: string, decision = "Allow once") =>
-  callQuestionRpc(
-    "question.resolve",
-    {
-      id,
-      answers: { answers: { communication: [decision] } },
-    },
-    { cfg, client },
-  );
-const get = (cfg: OpenClawConfig, client: GatewayClient, id: string) =>
-  callQuestionRpc("question.get", { id }, { cfg, client });
-
-async function fixture(
-  run: (fixture: {
-    endpoint: CommunicationEndpoint;
-    cfg: OpenClawConfig;
-    creator: GatewayClient;
-    admin: GatewayClient;
-    peer: GatewayClient;
-    ask: (signal?: AbortSignal) => Promise<void>;
-  }) => Promise<void>,
-) {
-  const options = { scenario: "minimal", prepareProfileCatalog: true } as const;
-  await withOpenClawTestState(options, async (state) => {
-    const storePath = state.path("sessions.json");
-    const cfg: OpenClawConfig = {
-      session: { store: storePath },
-      agents: { entries: { main: {} } },
-    };
-    setRuntimeConfigSnapshot(cfg);
-    const creator = createOperatorClient({ profileId: "recipient", scopes: ["operator.write"] });
-    const admin = createOperatorClient({ profileId: "admin", scopes: ["operator.admin"] });
-    const peer = createOperatorClient({
-      profileId: "sender",
-      scopes: ["operator.questions", "operator.write"],
-    });
-    const endpoint: CommunicationEndpoint = {
-      agentId: "main",
-      sessionKey: "agent:main:communication-recipient",
-      storePath,
-      entry: {
-        sessionId: "recipient-session",
-        updatedAt: 1,
-        communication: { receive: "ask" },
-        createdActor: { type: "human", source: "profile", id: "recipient" },
-      },
-    };
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey: endpoint.sessionKey, storePath: endpoint.storePath },
-      endpoint.entry!,
-    );
-    const context = createDirectChatContext({
-      getRuntimeConfig: () => cfg,
-      questionManager: manager,
-      broadcast,
-    });
-    const ask = (signal?: AbortSignal) =>
-      requestSessionCommunicationApproval({
-        context,
-        approval: { direction: "receive", endpoint },
-        source: { ...endpoint, sessionKey: "agent:main:sender" },
-        target: endpoint,
-        message: "exact message\n  with whitespace ",
-        assertCurrent: () => {},
-        signal,
-      });
-    await run({ endpoint, cfg, creator, admin, peer, ask });
+async function createFixture(state: OpenClawTestState) {
+  const storePath = state.path("sessions.json");
+  const cfg: OpenClawConfig = {
+    session: { store: storePath },
+    agents: { entries: { main: {} } },
+  };
+  setRuntimeConfigSnapshot(cfg);
+  const creator = createOperatorClient({ profileId: "recipient", scopes: ["operator.write"] });
+  const admin = createOperatorClient({ profileId: "admin", scopes: ["operator.admin"] });
+  const peer = createOperatorClient({
+    profileId: "sender",
+    scopes: ["operator.questions", "operator.write"],
   });
+  const endpoint: CommunicationEndpoint = {
+    agentId: "main",
+    sessionKey: "agent:main:communication-recipient",
+    storePath,
+    entry: {
+      sessionId: "recipient-session",
+      updatedAt: 1,
+      communication: { receive: "ask" },
+      createdActor: { type: "human", source: "profile", id: "recipient" },
+    },
+  };
+  const write = (key: string, entry: SessionEntry) =>
+    upsertSessionEntryCore({ agentId: "main", sessionKey: key, storePath }, entry);
+  await write(endpoint.sessionKey, endpoint.entry!);
+  const context = createDirectChatContext({
+    getRuntimeConfig: () => cfg,
+    questionManager: manager,
+    broadcast,
+  });
+  const ask = (signal?: AbortSignal) =>
+    requestSessionCommunicationApproval({
+      context,
+      approval: { direction: "receive", endpoint },
+      source: { ...endpoint, sessionKey: "agent:main:sender" },
+      target: endpoint,
+      message: "exact message\n  with whitespace ",
+      assertCurrent: () => {},
+      signal,
+    });
+  const resolve = (client: GatewayClient, id: string, decision = "Allow once") =>
+    callQuestionRpc(
+      "question.resolve",
+      { id, answers: { answers: { communication: [decision] } } },
+      { cfg, client },
+    );
+  const get = (client: GatewayClient, id: string) =>
+    callQuestionRpc("question.get", { id }, { cfg, client });
+  return { endpoint, cfg, creator, admin, peer, ask, context, write, resolve, get };
+}
+
+async function fixture(run: (f: Awaited<ReturnType<typeof createFixture>>) => Promise<void>) {
+  await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async (state) =>
+    run(await createFixture(state)),
+  );
+}
+
+function beforeAdmission(question: Promise<string>, pending: Promise<unknown>) {
+  return Promise.race([
+    question,
+    pending.then(() => {
+      throw new Error("Expected approval before admission");
+    }),
+  ]);
 }
 
 it("publishes to the real recipient under sender ALS and refuses model/admin self-approval", async () => {
-  await fixture(async ({ endpoint, cfg, creator, admin, ask }) => {
+  await fixture(async ({ endpoint, creator, admin, ask, resolve }) => {
     const model = { ...admin, internal: { syntheticClient: true as const } };
     broadcast.mockImplementation((event, _payload, options) => {
       if (event === "question.requested") {
@@ -114,22 +116,24 @@ it("publishes to the real recipient under sender ALS and refuses model/admin sel
     expect(question.sessionKey).toBe(endpoint.sessionKey);
     expect(question.questions[0]?.header.length).toBeLessThanOrEqual(12);
     expect(question.questions[0]?.question).toContain("exact message\n  with whitespace ");
-    expect((await resolve(cfg, model, question.id))[0]).toBe(false);
+    expect((await resolve(model, question.id))[0]).toBe(false);
     expect(manager.get(question.id)?.status).toBe("pending");
-    expect((await resolve(cfg, creator, question.id))[0]).toBe(true);
+    expect((await resolve(creator, question.id))[0]).toBe(true);
     await expect(pending).resolves.toBeUndefined();
   });
 });
 
 it("retains creator/admin rights without treating assigned responsibility as authority", async () => {
-  await fixture(async ({ endpoint, cfg, creator, admin, peer, ask }) => {
+  await fixture(async ({ endpoint, cfg, creator, admin, peer, ask, resolve, get }) => {
     endpoint.entry!.owner = { actor: { type: "human", id: "sender" } };
     const pending = expect(ask()).rejects.toThrow("not authorized");
     const question = manager.list()[0]!;
-    const canRead = async (client: GatewayClient) => (await get(cfg, client, question.id))[0];
-    expect(await canRead(creator)).toBe(true);
-    expect(await canRead(admin)).toBe(true);
-    expect(await canRead(peer)).toBe(false);
+    const canRead = async (client: GatewayClient) => (await get(client, question.id))[0];
+    expect([await canRead(creator), await canRead(admin), await canRead(peer)]).toEqual([
+      true,
+      true,
+      false,
+    ]);
     expect((await callQuestionRpc("question.list", {}, { cfg, client: peer }))[1]).toEqual({
       questions: [],
     });
@@ -137,27 +141,23 @@ it("retains creator/admin rights without treating assigned responsibility as aut
     expect(await canRead(solo)).toBe(true);
     creator.invalidated = true;
     await expect(canRead(creator)).rejects.toThrow("requester authority changed");
-    await resolve(cfg, admin, question.id, "Deny");
+    await resolve(admin, question.id, "Deny");
     await pending;
   });
 });
 
 it("rejects an already displayed decision after the recipient incarnation changes", async () => {
-  await fixture(async ({ endpoint, cfg, creator, admin, ask }) => {
-    const pending = ask();
-    const denied = expect(pending).rejects.toThrow("not authorized");
+  await fixture(async ({ endpoint, creator, admin, ask, resolve, write }) => {
+    const denied = expect(ask()).rejects.toThrow("not authorized");
     const question = manager.list()[0]!;
-    await upsertSessionEntryCore(
-      { agentId: endpoint.agentId, sessionKey: endpoint.sessionKey, storePath: endpoint.storePath },
-      {
-        ...endpoint.entry!,
-        sessionId: "replacement-recipient-session",
-        lifecycleRevision: "replacement-recipient-lifecycle",
-      },
-    );
-    expect((await resolve(cfg, creator, question.id))[0]).toBe(false);
+    await write(endpoint.sessionKey, {
+      ...endpoint.entry!,
+      sessionId: "replacement-recipient-session",
+      lifecycleRevision: "replacement-recipient-lifecycle",
+    });
+    expect((await resolve(creator, question.id))[0]).toBe(false);
     expect(manager.get(question.id)?.status).toBe("pending");
-    expect((await resolve(cfg, admin, question.id))[0]).toBe(false);
+    expect((await resolve(admin, question.id))[0]).toBe(false);
     manager.cancel(question.id, "recipient-replaced");
     await denied;
   });
@@ -166,12 +166,10 @@ it("rejects an already displayed decision after the recipient incarnation change
 it("cancellation and expiration settle without approval and cannot be released by later policy changes", async () => {
   await fixture(async ({ ask }) => {
     const controller = new AbortController();
-    const cancelled = ask(controller.signal);
-    const cancelledCheck = expect(cancelled).rejects.toThrow();
+    const cancelledCheck = expect(ask(controller.signal)).rejects.toThrow();
     controller.abort();
     await cancelledCheck;
-    const expired = ask();
-    const expiredCheck = expect(expired).rejects.toThrow("not authorized");
+    const expiredCheck = expect(ask()).rejects.toThrow("not authorized");
     await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
     await expiredCheck;
     expect(manager.list()).toEqual([]);
@@ -181,14 +179,9 @@ it("cancellation and expiration settle without approval and cannot be released b
 it.each(["Allow once", "Deny"] as const)(
   "missing configured main gets real recipient consent after empty creation: %s",
   async (decision) => {
-    await fixture(async ({ endpoint, cfg, creator, admin }) => {
+    await fixture(async ({ endpoint, cfg, creator, admin, context, write, resolve }) => {
       cfg.session!.communication = { send: "ask", receive: "ask" };
       setRuntimeConfigSnapshot(cfg);
-      const context = createDirectChatContext({
-        getRuntimeConfig: () => cfg,
-        questionManager: manager,
-        broadcast,
-      });
       const read = async (key: string): Promise<CommunicationEndpoint> => {
         const loaded = await resolveGatewaySessionStoreTargetInWorker({
           cfg,
@@ -205,30 +198,22 @@ it.each(["Allow once", "Deny"] as const)(
       const source = await read(endpoint.sessionKey);
       const target = await read("agent:main:main");
       expect(target.entry).toBeUndefined();
-      const sendQuestion = createDeferredCore<string>();
-      const receiveQuestion = createDeferredCore<string>();
+      const questions = new Map(
+        [source, target].map(({ sessionKey }) => [sessionKey, createDeferredCore<string>()]),
+      );
       broadcast.mockImplementation((event, payload) => {
-        if (event !== "question.requested") {
-          return;
-        }
-        const record = payload as { id: string; sessionKey?: string };
-        if (record.sessionKey === source.sessionKey) {
-          sendQuestion.resolve(record.id);
-        }
-        if (record.sessionKey === target.sessionKey) {
-          receiveQuestion.resolve(record.id);
+        if (event === "question.requested") {
+          const { id, sessionKey } = payload as { id: string; sessionKey: string };
+          questions.get(sessionKey)?.resolve(id);
         }
       });
       const ensureTarget = vi.fn(async (assertCurrent: () => void) => {
         assertCurrent();
-        await upsertSessionEntryCore(
-          { agentId: "main", sessionKey: target.sessionKey, storePath: endpoint.storePath },
-          {
-            sessionId: "created-empty-main",
-            updatedAt: 1,
-            createdActor: { type: "agent", id: source.sessionKey },
-          },
-        );
+        await write(target.sessionKey, {
+          sessionId: "created-empty-main",
+          updatedAt: 1,
+          createdActor: { type: "agent", id: source.sessionKey },
+        });
         assertCurrent();
         return read(target.sessionKey);
       });
@@ -261,21 +246,14 @@ it.each(["Allow once", "Deny"] as const)(
           (gate) => ({ gate, error: undefined }),
           (error: unknown) => ({ gate: undefined, error }),
         );
-        const senderId = await Promise.race([
-          sendQuestion.promise,
-          pending.then(() => {
-            throw new Error("Expected sender approval before admission");
-          }),
-        ]);
+        const senderId = await beforeAdmission(questions.get(source.sessionKey)!.promise, pending);
         expect(ensureTarget).not.toHaveBeenCalled();
         expect(callGateway).not.toHaveBeenCalled();
-        expect((await resolve(cfg, creator, senderId))[0]).toBe(true);
-        const recipientId = await Promise.race([
-          receiveQuestion.promise,
-          pending.then(() => {
-            throw new Error("Expected recipient approval before admission");
-          }),
-        ]);
+        expect((await resolve(creator, senderId))[0]).toBe(true);
+        const recipientId = await beforeAdmission(
+          questions.get(target.sessionKey)!.promise,
+          pending,
+        );
         expect(ensureTarget).toHaveBeenCalledOnce();
         expect(callGateway).not.toHaveBeenCalled();
         expect(manager.get(recipientId)).toMatchObject({
@@ -283,7 +261,7 @@ it.each(["Allow once", "Deny"] as const)(
           status: "pending",
         });
         expect((await read(target.sessionKey)).entry?.sessionId).toBe("created-empty-main");
-        expect((await resolve(cfg, admin, recipientId, decision))[0]).toBe(true);
+        expect((await resolve(admin, recipientId, decision))[0]).toBe(true);
         const result = await observed;
         if (decision === "Deny") {
           expect(result.error).toBeInstanceOf(Error);
