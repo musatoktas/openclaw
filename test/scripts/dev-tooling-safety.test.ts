@@ -40,6 +40,7 @@ import { runQaGatewayFixture } from "../helpers/qa-gateway-cleanup.js";
 const tempDirs: string[] = [];
 const testNodeExecPath = resolveTestNodeExecPath();
 const promptProbeUrl = resolveRuntimeWorkerUrl(scriptProcessEntrypoints.anthropicPromptProbe);
+const fixtureToken = "sk-test1234567890abcdefghijklmnop"; // pragma: allowlist secret
 
 async function tempDir(prefix: string) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -57,6 +58,14 @@ function discordRequest(overrides: Partial<Parameters<typeof discord.requestDisc
     errorPrefix: "Discord API",
     ...overrides,
   });
+}
+
+function fetchResponse(response: Response): typeof fetch {
+  return (() => Promise.resolve(response)) as typeof fetch;
+}
+
+function stalledResponse(headers?: HeadersInit) {
+  return new Response(new ReadableStream({ start() {} }), { headers });
 }
 
 function gatewayLeaderScript(descendantPidPath: string) {
@@ -130,8 +139,81 @@ function childClosed(child: ReturnType<typeof spawn>) {
   });
 }
 
+function captureChild(child: ReturnType<typeof spawn>) {
+  const output = { stdout: "", stderr: "" };
+  child.stdout?.on("data", (chunk) => (output.stdout += String(chunk)));
+  child.stderr?.on("data", (chunk) => (output.stderr += String(chunk)));
+  const closed = childClosed(child);
+  void closed.catch(() => undefined);
+  return { output, closed };
+}
+
+async function withDescendantFixture(
+  child: ReturnType<typeof spawn>,
+  pidPath: string,
+  signal: AbortSignal,
+  check: (fixture: {
+    closed: ReturnType<typeof childClosed>;
+    ready: () => Promise<number>;
+  }) => Promise<void>,
+  ipc = false,
+  group = false,
+) {
+  const message = ipc ? once(child, "message") : undefined;
+  const closed = childClosed(child);
+  void closed.catch(() => undefined);
+  let descendantPid = 0;
+  try {
+    await check({
+      closed,
+      ready: async () => {
+        descendantPid = message
+          ? Number(
+              (
+                await withinTest(
+                  awaitGateBeforeSettlement(message, closed, "timed out waiting for condition"),
+                  signal,
+                )
+              )[0],
+            )
+          : await withinTest(promptReadyBeforeSettlement(pidPath, closed), signal);
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        expect(isProcessAlive(descendantPid)).toBe(true);
+        return descendantPid;
+      },
+    });
+  } finally {
+    if (child.pid && isProcessAlive(child.pid)) {
+      process.kill(group ? -child.pid : child.pid, group ? "SIGKILL" : "SIGTERM");
+    }
+    const pid = descendantPid || (existsSync(pidPath) ? Number(readFileSync(pidPath, "utf8")) : 0);
+    await closed;
+    if (pid && isProcessAlive(pid)) {
+      process.kill(pid, "SIGKILL");
+    }
+  }
+}
+
+async function promptFixture(prefix: string, mode?: Parameters<typeof writeFakePromptCli>[2]) {
+  const root = await tempDir(prefix);
+  const pidPath = path.join(root, "descendant.pid");
+  return { root, pidPath, claudeBin: await writeFakePromptCli(root, pidPath, mode) };
+}
+
+async function logFixture(contents: string) {
+  const logPath = path.join(await tempDir("openclaw-prompt-probe-log-"), "gateway.log");
+  await fs.writeFile(logPath, contents, "utf8");
+  return logPath;
+}
+
 function quotePosixShellArg(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+async function writeShell(root: string, name: string, lines: string[]) {
+  const filename = path.join(root, name);
+  await fs.writeFile(filename, ["#!/bin/sh", ...lines, ""].join("\n"), { mode: 0o755 });
+  return filename;
 }
 
 async function writeFakePromptCli(
@@ -155,7 +237,6 @@ async function writeFakePromptCli(
     ].join("\n"),
   );
 
-  const fakeCli = path.join(root, "fake-prompt-cli.sh");
   if (mode === "escaped-output") {
     const leaderPath = path.join(root, "fake-prompt-leader.mjs");
     await fs.writeFile(
@@ -175,37 +256,15 @@ async function writeFakePromptCli(
         "",
       ].join("\n"),
     );
-    await fs.writeFile(
-      fakeCli,
-      [
-        "#!/bin/sh",
-        `exec ${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(leaderPath)} "$@"`,
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-    return fakeCli;
+    return writeShell(root, "fake-prompt-cli.sh", [
+      `exec ${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(leaderPath)} "$@"`,
+    ]);
   }
-  await fs.writeFile(
-    fakeCli,
-    [
-      "#!/bin/sh",
-      `${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(descendantPath)} ${quotePosixShellArg(descendantPidPath)} >/dev/null 2>&1 &`,
-      `while [ ! -s ${quotePosixShellArg(descendantPidPath)} ]; do sleep 0.01; done`,
-      mode === "leader-exit" ? "exit 0" : "while :; do sleep 1; done",
-      "",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
-  return fakeCli;
-}
-
-async function writeBlockingPromptCli(root: string): Promise<string> {
-  const fakeCli = path.join(root, "blocking-prompt-cli.sh");
-  await fs.writeFile(fakeCli, ["#!/bin/sh", "while :; do sleep 1; done", ""].join("\n"), {
-    mode: 0o755,
-  });
-  return fakeCli;
+  return writeShell(root, "fake-prompt-cli.sh", [
+    `${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(descendantPath)} ${quotePosixShellArg(descendantPidPath)} >/dev/null 2>&1 &`,
+    `while [ ! -s ${quotePosixShellArg(descendantPidPath)} ]; do sleep 0.01; done`,
+    mode === "leader-exit" ? "exit 0" : "while :; do sleep 1; done",
+  ]);
 }
 
 type CliResult = {
@@ -215,24 +274,14 @@ type CliResult = {
 };
 
 function runCli(scriptPath: string, args: string[]): Promise<CliResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(testNodeExecPath, ["--import", "tsx", scriptPath, ...args], {
-      cwd: process.cwd(),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.once("error", reject);
-    child.once("close", (status) => resolve({ status, stderr, stdout }));
+  const child = spawn(testNodeExecPath, ["--import", "tsx", scriptPath, ...args], {
+    cwd: process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const { output, closed } = captureChild(child);
+  return closed.then(({ code }) => ({ status: code, ...output }));
 }
 
 afterEach(async () => {
@@ -244,20 +293,18 @@ afterEach(async () => {
 
 describe("dev tooling safety helpers", () => {
   it("redacts secrets before truncating script log previews", () => {
-    const token = "sk-test1234567890abcdefghijklmnop"; // pragma: allowlist secret
-    const preview = previewForDevToolLog(`prefix OPENAI_API_KEY=${token} suffix`, 80);
+    const preview = previewForDevToolLog(`prefix OPENAI_API_KEY=${fixtureToken} suffix`, 80);
 
-    expect(preview).not.toContain(token);
+    expect(preview).not.toContain(fixtureToken);
     expect(preview).toContain("OPENAI_API_KEY=");
   });
 
   it("recursively redacts JSON-ish detail values before printing smoke results", () => {
-    const token = "sk-test1234567890abcdefghijklmnop"; // pragma: allowlist secret
     const redacted = redactJsonValueForDevToolLog({
-      nested: [{ message: `Authorization: Bearer ${token}` }],
+      nested: [{ message: `Authorization: Bearer ${fixtureToken}` }],
     }) as { nested: Array<{ message: string }> };
 
-    expect(redacted.nested[0]?.message).not.toContain(token);
+    expect(redacted.nested[0]?.message).not.toContain(fixtureToken);
     expect(redacted.nested[0]?.message).toContain("Authorization");
   });
 
@@ -294,18 +341,43 @@ describe("script-specific dev tooling hardening", () => {
     expect(() => parse(["--wat"])).toThrow("Unknown argument: --wat");
     const result = await runCli(script, ["--wat"]);
 
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr.trim()).toBe("Unknown argument: --wat");
+    expect({ ...result, stderr: result.stderr.trim() }).toEqual({
+      status: 1,
+      stdout: "",
+      stderr: "Unknown argument: --wat",
+    });
   });
 
-  it("rejects missing Discord smoke option values before env fallbacks", () => {
-    expect(() => discord.parseArgs(["--channel"])).toThrow("--channel requires a value");
-    expect(() => discord.parseArgs(["--channel="])).toThrow("--channel requires a value");
-    expect(() => discord.parseArgs(["--channel", "--json"])).toThrow("--channel requires a value");
-    for (const flag of ["--channel", "--token", "--timeout-ms", "--state-dir"]) {
-      expect(() => discord.parseArgs([flag, "-h"])).toThrow(`${flag} requires a value`);
-    }
+  it.each([
+    [discord.parseArgs, ["--channel"], "--channel requires a value"],
+    [discord.parseArgs, ["--channel="], "--channel requires a value"],
+    [discord.parseArgs, ["--channel", "--json"], "--channel requires a value"],
+    ...["--channel", "--token", "--timeout-ms", "--state-dir"].map(
+      (flag) => [discord.parseArgs, [flag, "-h"], `${flag} requires a value`] as const,
+    ),
+    [realtime.parseRealtimeSmokeArgs, ["--wat"], "Unknown argument: --wat"],
+    [
+      realtime.parseRealtimeSmokeArgs,
+      ["--openai-audio-cycles"],
+      "--openai-audio-cycles requires a value",
+    ],
+    [
+      realtime.parseRealtimeSmokeArgs,
+      ["--openai-audio-cycles", "0"],
+      "--openai-audio-cycles must be an integer >= 1",
+    ],
+    [
+      realtime.parseRealtimeSmokeArgs,
+      ["--openai-audio-cycles", "11"],
+      "--openai-audio-cycles must be <= 10",
+    ],
+    [claude.parseArgs, ["--wat"], "Unknown argument: --wat"],
+    [claude.parseArgs, ["--agent"], "--agent requires a value"],
+    [claude.parseArgs, ["--agent="], "--agent requires a value"],
+    [claude.parseArgs, ["--session-key", "--reveal"], "--session-key requires a value"],
+    [claude.parseArgs, ["--session-key= "], "--session-key requires a value"],
+  ] as const)("rejects malformed script arguments %j", (parse, args, error) => {
+    expect(() => parse([...args])).toThrow(error);
   });
 
   it("redacts Discord webhook tokens from API paths", () => {
@@ -342,14 +414,8 @@ describe("script-specific dev tooling hardening", () => {
 
   it("times out stalled Discord smoke response body reads", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-    const response = new Response(
-      new ReadableStream({
-        start() {},
-      }),
-      { status: 200, statusText: "OK" },
-    );
     const request = discordRequest({
-      fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
+      fetchImpl: fetchResponse(stalledResponse()),
     });
 
     const rejection = expect(request).rejects.toThrow(
@@ -366,7 +432,7 @@ describe("script-specific dev tooling hardening", () => {
     const request = discordRequest({
       timeoutMs: 50,
       responseBodyMaxBytes: 5,
-      fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
+      fetchImpl: fetchResponse(response),
     });
 
     await expect(request).rejects.toThrow(
@@ -485,15 +551,9 @@ describe("script-specific dev tooling hardening", () => {
   ])(
     "times out stalled $name response body reads",
     async ({ request, credential, headers, error }) => {
-      const response = new Response(
-        new ReadableStream({
-          start() {},
-        }),
-        { headers },
-      );
       const pending = request(credential, {
         timeoutMs: 5,
-        fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
+        fetchImpl: fetchResponse(stalledResponse(headers)),
       });
 
       await expect(pending).rejects.toThrow(error);
@@ -522,40 +582,24 @@ describe("script-specific dev tooling hardening", () => {
     expect(() => resolve(invalid)).toThrow(error);
   });
 
+  it.each([
+    [["--help"], true, 1, false],
+    [["--openai-only"], false, 1, true],
+    [["--openai-audio-cycles", "3"], false, 3, false],
+  ] as const)("parses realtime smoke arguments %j", (args, help, openAIAudioCycles, openAIOnly) => {
+    expect(realtime.parseRealtimeSmokeArgs([...args])).toEqual({
+      help,
+      openAIAudioCycles,
+      openAIOnly,
+    });
+  });
+
   it("formats OpenAI realtime smoke help without launching live checks", () => {
-    expect(realtime.parseRealtimeSmokeArgs(["--help"])).toEqual({
-      help: true,
-      openAIAudioCycles: 1,
-      openAIOnly: false,
-    });
-    expect(realtime.parseRealtimeSmokeArgs(["--openai-only"])).toEqual({
-      help: false,
-      openAIAudioCycles: 1,
-      openAIOnly: true,
-    });
-    expect(realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles", "3"])).toEqual({
-      help: false,
-      openAIAudioCycles: 3,
-      openAIOnly: false,
-    });
     expect(realtime.usage()).toContain(
       "Usage: node --import tsx scripts/dev/realtime-talk-live-smoke.ts",
     );
     expect(realtime.usage()).toContain("--openai-only");
     expect(realtime.usage()).toContain("--openai-audio-cycles");
-  });
-
-  it("rejects unknown OpenAI realtime smoke args before runtime setup", () => {
-    expect(() => realtime.parseRealtimeSmokeArgs(["--wat"])).toThrow("Unknown argument: --wat");
-    expect(() => realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles"])).toThrow(
-      "--openai-audio-cycles requires a value",
-    );
-    expect(() => realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles", "0"])).toThrow(
-      "--openai-audio-cycles must be an integer >= 1",
-    );
-    expect(() => realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles", "11"])).toThrow(
-      "--openai-audio-cycles must be <= 10",
-    );
   });
 
   it("chunks PCM input without copying or dropping bytes", async () => {
@@ -663,31 +707,24 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("reads only the bounded Anthropic prompt probe gateway log tail", async () => {
-    const tempRoot = await tempDir("openclaw-prompt-probe-log-");
-    const logPath = path.join(tempRoot, "gateway.log");
-    const token = "sk-test1234567890abcdefghijklmnop"; // pragma: allowlist secret
-    await fs.writeFile(
-      logPath,
+    const logPath = await logFixture(
       [
-        `DO_NOT_PRINT_OLD_GATEWAY_LOG OPENAI_API_KEY=${token}`,
+        `DO_NOT_PRINT_OLD_GATEWAY_LOG OPENAI_API_KEY=${fixtureToken}`,
         "x".repeat(256),
-        `recent gateway tail Authorization: Bearer ${token}`,
+        `recent gateway tail Authorization: Bearer ${fixtureToken}`,
       ].join("\n"),
-      "utf8",
     );
 
     const tail = await prompt.readLogTail(logPath, 128);
 
     expect(tail).toContain("recent gateway tail");
     expect(tail).not.toContain("DO_NOT_PRINT_OLD_GATEWAY_LOG");
-    expect(tail).not.toContain(token);
+    expect(tail).not.toContain(fixtureToken);
   });
 
   it("drops partial Anthropic prompt probe log lines before redaction", async () => {
-    const tempRoot = await tempDir("openclaw-prompt-probe-log-");
-    const logPath = path.join(tempRoot, "gateway.log");
     const token = `sk-test${"a".repeat(80)}`; // pragma: allowlist secret
-    await fs.writeFile(logPath, `Authorization: Bearer ${token}\nrecent gateway tail`, "utf8");
+    const logPath = await logFixture(`Authorization: Bearer ${token}\nrecent gateway tail`);
 
     const tail = await prompt.readLogTail(logPath, "recent gateway tail".length + 24);
 
@@ -713,12 +750,13 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "rejects Anthropic direct prompt success while its descendant remains active",
     async ({ signal }) => {
-      const tempRoot = await tempDir("openclaw-direct-normal-exit-");
-      const descendantPidPath = path.join(tempRoot, "descendant.pid");
-      const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath, "leader-exit");
+      const { pidPath: descendantPidPath, claudeBin } = await promptFixture(
+        "openclaw-direct-normal-exit-",
+        "leader-exit",
+      );
       let descendantPid = 0;
       const result = prompt.runDirectPrompt("normal exit cleanup proof", {
-        claudeBin: fakeClaudeBin,
+        claudeBin,
         timeoutMs: 5_000,
       });
       void result.catch(() => undefined);
@@ -774,13 +812,8 @@ describe("script-specific dev tooling hardening", () => {
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let stdout = "";
-      let stderr = "";
       let descendantPid = 0;
-      probe.stdout.on("data", (chunk) => (stdout += String(chunk)));
-      probe.stderr.on("data", (chunk) => (stderr += String(chunk)));
-      const closed = childClosed(probe);
-      void closed.catch(() => undefined);
+      const { output, closed } = captureChild(probe);
 
       await runQaGatewayFixture(
         async () => {
@@ -800,10 +833,10 @@ describe("script-specific dev tooling hardening", () => {
           expect(isProcessAlive(descendantPid)).toBe(true);
           expect(() => owner.assertReleased()).toThrow("Unreleased Vitest resource claim");
           expect(exit).toEqual({ code: 1, signal: null });
-          expect(stderr).toContain(
+          expect(output.stderr).toContain(
             "Managed command cleanup could not verify child, process group, and output closure",
           );
-          expect(stdout).toBe("");
+          expect(output.stdout).toBe("");
           const launches = (await fs.readFile(path.join(tempRoot, "launches.jsonl"), "utf8"))
             .trim()
             .split("\n");
@@ -866,7 +899,9 @@ describe("script-specific dev tooling hardening", () => {
     "returns a terminal result after an Anthropic direct prompt timeout",
     async () => {
       const tempRoot = await tempDir("openclaw-direct-prompt-tree-");
-      const fakeClaudeBin = await writeBlockingPromptCli(tempRoot);
+      const fakeClaudeBin = await writeShell(tempRoot, "blocking-prompt-cli.sh", [
+        "while :; do sleep 1; done",
+      ]);
 
       await expect(
         prompt.runDirectPrompt("timeout cleanup proof", {
@@ -884,15 +919,14 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "cleans Anthropic direct prompt descendants on parent signal",
     async ({ signal }) => {
-      const tempRoot = await tempDir("openclaw-direct-parent-signal-");
-      const descendantPidPath = path.join(tempRoot, "descendant.pid");
-      let descendantPid = 0;
-      const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath);
+      const { pidPath: descendantPidPath, claudeBin } = await promptFixture(
+        "openclaw-direct-parent-signal-",
+      );
       const probe = spawn(process.execPath, resolveRuntimeWorkerArgv(promptProbeUrl), {
         cwd: process.cwd(),
         env: {
           ...process.env,
-          CLAUDE_BIN: fakeClaudeBin,
+          CLAUDE_BIN: claudeBin,
           OPENCLAW_PROMPT_TEXT: "parent signal cleanup proof",
           OPENCLAW_PROMPT_TIMEOUT_MS: "10000",
           OPENCLAW_PROMPT_TRANSPORT: "direct",
@@ -900,32 +934,13 @@ describe("script-specific dev tooling hardening", () => {
         stdio: "ignore",
       });
 
-      const probeExit = childClosed(probe);
-      void probeExit.catch(() => undefined);
-      try {
-        descendantPid = await withinTest(
-          promptReadyBeforeSettlement(descendantPidPath, probeExit),
-          signal,
-        );
-        expect(Number.isInteger(descendantPid)).toBe(true);
-        expect(isProcessAlive(descendantPid)).toBe(true);
-
+      await withDescendantFixture(probe, descendantPidPath, signal, async ({ ready, closed }) => {
+        const descendantPid = await ready();
         process.kill(probe.pid!, "SIGTERM");
-        await expect(withinTest(probeExit, signal)).resolves.toEqual({ code: 143, signal: null });
+        await expect(withinTest(closed, signal)).resolves.toEqual({ code: 143, signal: null });
         // runDirectPrompt joins its strict managed process tree before the parent exits.
         expect(isProcessAlive(descendantPid)).toBe(false);
-      } finally {
-        if (probe.pid && isProcessAlive(probe.pid)) {
-          process.kill(probe.pid, "SIGTERM");
-        }
-        if (!descendantPid && existsSync(descendantPidPath)) {
-          descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
-        }
-        await probeExit;
-        if (descendantPid && isProcessAlive(descendantPid)) {
-          process.kill(descendantPid, "SIGKILL");
-        }
-      }
+      });
     },
   );
 
@@ -935,7 +950,7 @@ describe("script-specific dev tooling hardening", () => {
   ])("Anthropic prompt gateway cleanup $name", async ({ exits, killWaitMs }) => {
     const events = new EventEmitter();
     const signals: NodeJS.Signals[] = [];
-    let closeCalls = 0;
+    const log = { close: vi.fn(async () => {}) };
     const child = {
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
@@ -954,20 +969,11 @@ describe("script-specific dev tooling hardening", () => {
       },
     };
 
-    const stopped = await prompt.stopGatewayPromptChild(
-      child,
-      {
-        close: async () => {
-          closeCalls += 1;
-        },
-      },
-      1,
-      killWaitMs,
-    );
+    const stopped = await prompt.stopGatewayPromptChild(child, log, 1, killWaitMs);
 
     expect(stopped).toBe(exits);
     expect(signals).toEqual(["SIGINT", "SIGKILL"]);
-    expect(closeCalls).toBe(1);
+    expect(log.close).toHaveBeenCalledTimes(1);
   });
 
   it.runIf(process.platform !== "win32")(
@@ -975,54 +981,34 @@ describe("script-specific dev tooling hardening", () => {
     async ({ signal }) => {
       const tempRoot = await tempDir("openclaw-prompt-gateway-tree-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
-      let descendantPid = 0;
       const leaderScript = gatewayLeaderScript(descendantPidPath);
       const child = spawn(process.execPath, ["--input-type=module", "--eval", leaderScript], {
         detached: true,
         stdio: ["ignore", "ignore", "ignore", "ipc"],
       });
       const spawned = once(child, "spawn");
-      const descendantReady = once(child, "message");
-      const closed = childClosed(child);
-      void closed.catch(() => undefined);
-      let closeCalls = 0;
+      const log = { close: vi.fn(async () => {}) };
+      await withDescendantFixture(
+        child,
+        descendantPidPath,
+        signal,
+        async ({ ready }) => {
+          await withinTest(spawned, signal);
+          const descendantPid = await ready();
+          const stopped = await prompt.stopGatewayPromptChild(
+            child as Parameters<typeof prompt.stopGatewayPromptChild>[0],
+            log,
+            50,
+            100,
+          );
 
-      try {
-        await withinTest(spawned, signal);
-        const [pid] = await withinTest(
-          awaitGateBeforeSettlement(descendantReady, closed, "timed out waiting for condition"),
-          signal,
-        );
-        descendantPid = Number(pid);
-        expect(Number.isInteger(descendantPid)).toBe(true);
-        expect(isProcessAlive(descendantPid)).toBe(true);
-
-        const stopped = await prompt.stopGatewayPromptChild(
-          child as Parameters<typeof prompt.stopGatewayPromptChild>[0],
-          {
-            close: async () => {
-              closeCalls += 1;
-            },
-          },
-          50,
-          100,
-        );
-
-        expect(stopped).toBe(true);
-        expect(closeCalls).toBe(1);
-        await waitForExtinction(descendantPid, signal);
-      } finally {
-        if (child.pid && isProcessAlive(child.pid)) {
-          process.kill(-child.pid, "SIGKILL");
-        }
-        if (!descendantPid && existsSync(descendantPidPath)) {
-          descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
-        }
-        await closed;
-        if (descendantPid && isProcessAlive(descendantPid)) {
-          process.kill(descendantPid, "SIGKILL");
-        }
-      }
+          expect(stopped).toBe(true);
+          expect(log.close).toHaveBeenCalledTimes(1);
+          await waitForExtinction(descendantPid, signal);
+        },
+        true,
+        true,
+      );
     },
   );
 
@@ -1032,7 +1018,6 @@ describe("script-specific dev tooling hardening", () => {
       const tempRoot = await tempDir("openclaw-prompt-parent-signal-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
       const runnerPath = path.join(tempRoot, "parent-signal-runner.mjs");
-      let descendantPid = 0;
       const leaderScript = gatewayLeaderScript(descendantPidPath);
       await fs.writeFile(
         runnerPath,
@@ -1067,34 +1052,18 @@ describe("script-specific dev tooling hardening", () => {
           stdio: ["ignore", "ignore", "ignore", "ipc"],
         },
       );
-      const descendantReady = once(runner, "message");
-      const runnerExit = childClosed(runner);
-      void runnerExit.catch(() => undefined);
-
-      try {
-        const [pid] = await withinTest(
-          awaitGateBeforeSettlement(descendantReady, runnerExit, "timed out waiting for condition"),
-          signal,
-        );
-        descendantPid = Number(pid);
-        expect(Number.isInteger(descendantPid)).toBe(true);
-        expect(isProcessAlive(descendantPid)).toBe(true);
-
-        process.kill(runner.pid!, "SIGTERM");
-        await expect(withinTest(runnerExit, signal)).resolves.toEqual({ code: 143, signal: null });
-        await waitForExtinction(descendantPid, signal);
-      } finally {
-        if (runner.pid && isProcessAlive(runner.pid)) {
-          process.kill(runner.pid, "SIGTERM");
-        }
-        if (!descendantPid && existsSync(descendantPidPath)) {
-          descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
-        }
-        await runnerExit;
-        if (descendantPid && isProcessAlive(descendantPid)) {
-          process.kill(descendantPid, "SIGKILL");
-        }
-      }
+      await withDescendantFixture(
+        runner,
+        descendantPidPath,
+        signal,
+        async ({ ready, closed }) => {
+          const descendantPid = await ready();
+          process.kill(runner.pid!, "SIGTERM");
+          await expect(withinTest(closed, signal)).resolves.toEqual({ code: 143, signal: null });
+          await waitForExtinction(descendantPid, signal);
+        },
+        true,
+      );
     },
   );
 
@@ -1153,13 +1122,6 @@ describe("script-specific dev tooling hardening", () => {
       reveal: false,
       sessionKey: undefined,
     });
-    expect(() => claude.parseArgs(["--wat"])).toThrow("Unknown argument: --wat");
-    expect(() => claude.parseArgs(["--agent"])).toThrow("--agent requires a value");
-    expect(() => claude.parseArgs(["--agent="])).toThrow("--agent requires a value");
-    expect(() => claude.parseArgs(["--session-key", "--reveal"])).toThrow(
-      "--session-key requires a value",
-    );
-    expect(() => claude.parseArgs(["--session-key= "])).toThrow("--session-key requires a value");
   });
 
   it.each([
@@ -1201,7 +1163,7 @@ describe("script-specific dev tooling hardening", () => {
       const startedAt = Date.now();
       const proxyUrl = `http://127.0.0.1:${proxy.port}/v1/messages`;
       const request = sendsHeaders
-        ? new Promise<{ status: number; body: string }>((resolve, reject) => {
+        ? (async (): Promise<{ status: number; body: string }> => {
             const downstream = spawn(
               testNodeExecPath,
               [
@@ -1214,19 +1176,13 @@ describe("script-specific dev tooling hardening", () => {
               ],
               { stdio: ["ignore", "pipe", "pipe"] },
             );
-            let stdout = "";
-            let stderr = "";
-            downstream.stdout.on("data", (chunk) => (stdout += chunk));
-            downstream.stderr.on("data", (chunk) => (stderr += chunk));
-            downstream.once("error", reject);
-            downstream.once("close", (code) => {
-              if (code === 0) {
-                resolve(JSON.parse(stdout));
-              } else {
-                reject(new Error(stderr || `proxy client exited ${String(code)}`));
-              }
-            });
-          })
+            const { output, closed } = captureChild(downstream);
+            const { code } = await closed;
+            if (code !== 0) {
+              throw new Error(output.stderr || `proxy client exited ${String(code)}`);
+            }
+            return JSON.parse(output.stdout);
+          })()
         : nativeFetch(proxyUrl, { method: "POST", body: "{}" }).then(async (response) => ({
             status: response.status,
             body: await response.text(),

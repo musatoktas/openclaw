@@ -33,65 +33,73 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-type Request = { method: string; path: string; authorization: string | null; body?: unknown };
-const request = (
-  method: string,
-  requestPath: string,
-  authorization: string | null,
-  body?: unknown,
-): Request => ({
-  method,
-  path: requestPath,
-  authorization,
-  ...(body === undefined ? {} : { body }),
-});
+type Request = [method: string, path: string, authorization: string | null, body: unknown];
+const webhook = "/webhooks/webhook/synthetic-webhook";
+const jsonOutput = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
 
 async function runDriver(driver: "token" | "webhook", failure?: "identity" | "send") {
   vi.resetModules();
   fixture.entries.mockReset().mockResolvedValue([{ value: binding }]);
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   vi.setSystemTime(fixture.now);
-  const requests: Request[] = [];
   const sender = driver === "token" ? "driver-user" : "webhook-user";
+  const auth = `Bot synthetic-${driver === "token" ? "driver" : "bot"}`;
+  const refusal = () =>
+    Response.json({ message: "synthetic refusal" }, { status: 403, statusText: "Forbidden" });
+  const exchanges: Array<[Request, Response]> = [
+    [
+      ["GET", "/users/@me", auth, undefined],
+      failure === "identity" ? refusal() : Response.json({ id: "driver-user" }),
+    ],
+  ];
+  if (failure !== "identity") {
+    if (driver === "webhook") {
+      exchanges.push([
+        ["POST", "/channels/parent/webhooks", auth, { name: "openclaw-acp-smoke-00000000" }],
+        Response.json({ id: "webhook", token: "synthetic-webhook" }),
+      ]);
+    }
+    exchanges.push([
+      [
+        "POST",
+        driver === "token" ? "/channels/parent/messages" : `${webhook}?wait=true`,
+        driver === "token" ? auth : null,
+        {
+          content: "<@mentioned-user> Synthetic ACP instruction",
+          allowed_mentions: { parse: [], users: ["mentioned-user"] },
+        },
+      ],
+      failure === "send" ? refusal() : Response.json({ id: "sent", author: { id: sender } }),
+    ]);
+    if (failure !== "send") {
+      exchanges.push([
+        ["GET", "/channels/thread/messages?limit=50", auth, undefined],
+        Response.json([
+          { id: "sender-copy", author: { id: sender }, content: ackToken },
+          { id: "ack", author: { id: "agent-user", username: "Agent" }, content: ackToken },
+        ]),
+      ]);
+    }
+    if (driver === "webhook") {
+      exchanges.push([["DELETE", webhook, null, undefined], new Response(null, { status: 204 })]);
+    }
+  }
+  const expectedRequests = exchanges.map(([request]) => request);
+  const actualRequests: Request[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn<typeof fetch>(async (input, init) => {
       const incoming = new globalThis.Request(input, init);
       const url = new URL(incoming.url);
-      const call = {
-        method: incoming.method,
-        path: `${url.pathname}${url.search}`.replace(/^\/api\/v10/u, ""),
-        authorization: incoming.headers.get("Authorization"),
-        ...(incoming.body === null ? {} : { body: await incoming.json() }),
-      };
-      requests.push(call);
-      if (
-        (failure === "identity" && call.path === "/users/@me") ||
-        (failure === "send" &&
-          (call.path === "/channels/parent/messages" || call.path.endsWith("?wait=true")))
-      ) {
-        return Response.json(
-          { message: "synthetic refusal" },
-          { status: 403, statusText: "Forbidden" },
-        );
-      }
-      if (call.path === "/users/@me") {
-        return Response.json({ id: "driver-user" });
-      }
-      if (call.path === "/channels/parent/webhooks") {
-        return Response.json({ id: "webhook", token: "synthetic-webhook" });
-      }
-      if (call.method === "POST") {
-        return Response.json({ id: "sent", author: { id: sender } });
-      }
-      if (call.method === "DELETE") {
-        return new Response(null, { status: 204 });
-      }
-      expect(call.path).toBe("/channels/thread/messages?limit=50");
-      return Response.json([
-        { id: "sender-copy", author: { id: sender }, content: ackToken },
-        { id: "ack", author: { id: "agent-user", username: "Agent" }, content: ackToken },
+      const exchange = exchanges.shift();
+      expect(exchange, "unexpected Discord request").toBeDefined();
+      actualRequests.push([
+        incoming.method,
+        `${url.pathname}${url.search}`.replace(/^\/api\/v10/u, ""),
+        incoming.headers.get("Authorization"),
+        incoming.body === null ? undefined : await incoming.json(),
       ]);
+      return exchange![1];
     }),
   );
   const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
@@ -121,23 +129,30 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
   );
   expect(exit).toHaveBeenCalledOnce();
   expect(vi.getTimerCount()).toBe(0);
+  expect(exchanges).toEqual([]);
+  // Assert after main returns so its API-error handling cannot swallow a mismatch.
+  expect(actualRequests).toEqual(expectedRequests);
   return {
-    requests,
     exitCode: exit.mock.calls[0]?.[0],
     stdout: stdout.mock.calls.map(([chunk]) => String(chunk)).join(""),
     stderr: stderr.mock.calls.map(([chunk]) => String(chunk)).join(""),
   };
 }
 
-it.each(["token", "webhook"] as const)(
-  "runs the %s driver through identity, send, binding and a different author's acknowledgement",
-  async (driver) => {
-    const result = await runDriver(driver);
-    expect(result.exitCode).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toBe(
-      `${JSON.stringify(
-        {
+it.each([
+  ["token", undefined],
+  ["webhook", undefined],
+  ["token", "identity"],
+  ["webhook", "identity"],
+  ["webhook", "send"],
+] as const)(
+  "%s driver completes or reports %s failure and cleans up owned webhooks",
+  async (driver, failure) => {
+    const result = await runDriver(driver, failure);
+    expect(result).toMatchObject({ exitCode: failure ? 1 : 0, stderr: "" });
+    if (!failure) {
+      expect(result.stdout).toBe(
+        jsonOutput({
           ok: true,
           smokeId,
           ackToken,
@@ -149,78 +164,24 @@ it.each(["token", "webhook"] as const)(
             authorUsername: "Agent",
             content: ackToken,
           },
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    const auth = `Bot synthetic-${driver === "token" ? "driver" : "bot"}`;
-    const message = {
-      content: "<@mentioned-user> Synthetic ACP instruction",
-      allowed_mentions: { parse: [], users: ["mentioned-user"] },
-    };
-    expect(result.requests).toEqual([
-      request("GET", "/users/@me", auth),
-      ...(driver === "webhook"
-        ? [
-            request("POST", "/channels/parent/webhooks", auth, {
-              name: "openclaw-acp-smoke-00000000",
-            }),
-          ]
-        : []),
-      request(
-        "POST",
-        driver === "token"
-          ? "/channels/parent/messages"
-          : "/webhooks/webhook/synthetic-webhook?wait=true",
-        driver === "token" ? auth : null,
-        message,
-      ),
-      request("GET", "/channels/thread/messages?limit=50", auth),
-      ...(driver === "webhook"
-        ? [request("DELETE", "/webhooks/webhook/synthetic-webhook", null)]
-        : []),
-    ]);
-  },
-);
-
-it.each([
-  ["token", "identity"],
-  ["webhook", "identity"],
-  ["webhook", "send"],
-] as const)(
-  "reports %s %s failures without polling bindings and cleans up owned webhooks",
-  async (driver, failure) => {
-    const result = await runDriver(driver, failure);
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toBe("");
-    if (failure === "identity") {
-      expect(JSON.parse(result.stdout)).toEqual({
-        ok: false,
-        stage: "discord-api",
-        smokeId,
-        error:
-          'Discord API GET /users/@me failed: 403 Forbidden :: {"message":"synthetic refusal"}',
-      });
+        }),
+      );
     } else {
-      expect(JSON.parse(result.stdout)).toMatchObject({
+      const expected = {
         ok: false,
-        stage: "send-message",
+        stage: failure === "identity" ? "discord-api" : "send-message",
         smokeId,
-      });
+      };
+      if (failure === "identity") {
+        expect(JSON.parse(result.stdout)).toEqual({
+          ...expected,
+          error:
+            'Discord API GET /users/@me failed: 403 Forbidden :: {"message":"synthetic refusal"}',
+        });
+      } else {
+        expect(JSON.parse(result.stdout)).toMatchObject(expected);
+      }
+      expect(fixture.entries).not.toHaveBeenCalled();
     }
-    expect(
-      result.requests.map(({ method, path: requestPath }) => `${method} ${requestPath}`),
-    ).toEqual([
-      "GET /users/@me",
-      ...(failure === "send"
-        ? [
-            "POST /channels/parent/webhooks",
-            "POST /webhooks/webhook/synthetic-webhook?wait=true",
-            "DELETE /webhooks/webhook/synthetic-webhook",
-          ]
-        : []),
-    ]);
-    expect(fixture.entries).not.toHaveBeenCalled();
   },
 );
