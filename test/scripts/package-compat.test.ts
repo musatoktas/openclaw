@@ -67,7 +67,16 @@ if (args.includes('--help')) {
   return entry;
 }
 
-function runShell(root: string, entry: string, script: string) {
+function runCandidate(
+  script: string,
+  options: Parameters<typeof writeCandidate>[1] = {},
+  replacement = false,
+) {
+  const root = tempDirs.make("openclaw-consent-");
+  const entry = writeCandidate(root, options);
+  if (replacement) {
+    writeCandidate(root, {}, "replacement.cjs");
+  }
   const result = spawnSync(BASH_BIN, ["-c", `set -euo pipefail\n${script}`], {
     encoding: "utf8",
     timeout: 30_000,
@@ -93,21 +102,43 @@ function runShell(root: string, entry: string, script: string) {
   return { ...result, calls };
 }
 
-function runCandidate(script: string, options: Parameters<typeof writeCandidate>[1] = {}) {
-  const root = tempDirs.make("openclaw-consent-");
-  return runShell(root, writeCandidate(root, options), script);
+function fixtureNode(directory: "plugins" | "kitchen-sink-plugin", extra = "") {
+  return `node() {
+  case "$1" in
+${extra}    scripts/e2e/lib/${directory}/assertions.mjs) return 0 ;;
+    *) command node "$@" ;;
+  esac
+}`;
 }
 
-function clawhubScenario(environment: string, node = "") {
+function clawhubScenario(live = true, spec?: string, id?: string, serve = false) {
   return `
 export OPENCLAW_PLUGINS_SWEEP_SOURCE_ONLY=1
 export OPENCLAW_PLUGINS_E2E_CLAWHUB=1
-${environment}
+export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=${live ? "1" : "0"}
+${spec ? `export OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC=${spec}` : "unset OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC"}
+${id ? `export OPENCLAW_PLUGINS_E2E_CLAWHUB_ID=${id}` : "unset OPENCLAW_PLUGINS_E2E_CLAWHUB_ID"}
 source scripts/e2e/lib/plugins/sweep.sh
-${node}
+${
+  spec || serve
+    ? fixtureNode(
+        "plugins",
+        serve
+          ? `    scripts/e2e/lib/clawhub-fixture-server.cjs)
+      printf '12345\\n' > "$3"
+      while true; do sleep 1; done
+      ;;
+`
+          : "",
+      )
+    : ""
+}
 run_plugins_clawhub_scenario
 `;
 }
+
+const installsFor = (calls: string[][]) =>
+  calls.filter((args) => args[1] === "install" && !args.includes("--help"));
 
 const fixtureCommand = `
 source scripts/lib/openclaw-e2e-instance.sh
@@ -126,13 +157,7 @@ source() {
     builtin source "$@"
   fi
 }
-node() {
-  case "$1" in
-    scripts/e2e/lib/fixture.mjs) mkdir -p "$3" ;;
-    scripts/e2e/lib/plugins/assertions.mjs) return 0 ;;
-    *) command node "$@" ;;
-  esac
-}
+${fixtureNode("plugins", '    scripts/e2e/lib/fixture.mjs) mkdir -p "$3" ;;\n')}
 git() { printf 'fixture-commit\\n'; }
 source scripts/e2e/lib/plugins/sweep.sh
 `;
@@ -140,12 +165,7 @@ source scripts/e2e/lib/plugins/sweep.sh
 const kitchenFixtureLoader = `
 export KITCHEN_SINK_SWEEP_SOURCE_ONLY=1
 source scripts/e2e/lib/kitchen-sink-plugin/sweep.sh
-node() {
-  case "$1" in
-    scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs) return 0 ;;
-    *) command node "$@" ;;
-  esac
-}
+${fixtureNode("kitchen-sink-plugin")}
 KITCHEN_SINK_LABEL=fixture
 KITCHEN_SINK_ID=fixture-id
 KITCHEN_SINK_SPEC=fixture-spec
@@ -157,19 +177,16 @@ run_failure_scenario
 `;
 
 describe("package fixture consent compatibility", () => {
-  it.each([true, false])(
-    "runs the plugin sweep with selective consent (supported=%s)",
-    (supported) => {
-      const result = runCandidate(sweepFixtureLoader, {
-        commands: supported ? undefined : [],
-        preserveUninstallIntent: true,
-      });
+  describe.each([true, false])("consent support=%s", (supported) => {
+    const run = (script: string, options: Parameters<typeof writeCandidate>[1] = {}) => {
+      const result = runCandidate(script, { commands: supported ? undefined : [], ...options });
       expect(result.status, result.stderr).toBe(0);
-      const mutations = result.calls.filter(
-        (args) => args[0] === "plugins" && !args.includes("--help"),
-      );
-      const installs = mutations.filter((args) => args[1] === "install");
-      expect(installs).toHaveLength(12);
+      return result.calls;
+    };
+    it("runs the plugin sweep with selective consent", () => {
+      const calls = run(sweepFixtureLoader, { preserveUninstallIntent: true });
+      const mutations = calls.filter((args) => args[0] === "plugins" && !args.includes("--help"));
+      expect(installsFor(mutations)).toHaveLength(12);
       for (const args of mutations) {
         const positive =
           (args[1] === "install" && !args.some((arg) => arg.includes("invalid-metadata"))) ||
@@ -184,26 +201,27 @@ describe("package fixture consent compatibility", () => {
         "demo-plugin-npm",
         "claude-bundle-e2e",
       ]);
-    },
-  );
+    });
 
-  it.each([true, false])(
-    "runs kitchen-sink success and registry failure (supported=%s)",
-    (supported) => {
-      const result = runCandidate(kitchenFixtureLoader, { commands: supported ? undefined : [] });
-      expect(result.status, result.stderr).toBe(0);
-      const installs = result.calls.filter(
-        (args) => args[1] === "install" && !args.includes("--help"),
-      );
-      expect(installs.map((args) => args[2])).toEqual([
-        "preinstall-spec",
-        "fixture-spec",
-        "missing-version",
+    it("runs kitchen-sink success and registry failure", () => {
+      const calls = run(kitchenFixtureLoader);
+      const installs = installsFor(calls);
+      expect(installs.map((args) => [args[2], args.includes(consent)])).toEqual([
+        ["preinstall-spec", supported],
+        ["fixture-spec", supported],
+        ["missing-version", false],
       ]);
-      expect(installs.map((args) => args.includes(consent))).toEqual([supported, supported, false]);
-      expect(result.calls.find((args) => args[1] === "enable")).not.toContain(consent);
-    },
-  );
+      expect(calls.find((args) => args[1] === "enable")).not.toContain(consent);
+    });
+
+    it("consents to ClawHub install but not unchanged update", () => {
+      const calls = run(
+        clawhubScenario(true, "clawhub:@example/consent-fixture", "consent-fixture"),
+      );
+      expect(installsFor(calls)[0]?.includes(consent)).toBe(supported);
+      expect(calls.find((args) => args[1] === "update")).not.toContain(consent);
+    });
+  });
 
   it("probes each command and preserves literal argv", () => {
     const result = runCandidate(
@@ -223,86 +241,23 @@ ${fixtureCommand} plugins update fixture`,
     ]);
   });
 
-  it.each([true, false])(
-    "consents to ClawHub install but not unchanged update (supported=%s)",
-    (supported) => {
-      const result = runCandidate(
-        clawhubScenario(
-          `
-export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=1
-export OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC=clawhub:@example/consent-fixture
-export OPENCLAW_PLUGINS_E2E_CLAWHUB_ID=consent-fixture
-`,
-          `node() {
-  case "$1" in
-    scripts/e2e/lib/plugins/assertions.mjs) return 0 ;;
-    *) command node "$@" ;;
-  esac
-}`,
-        ),
-        { commands: supported ? undefined : [] },
-      );
-      expect(result.status, result.stderr).toBe(0);
-      expect(
-        result.calls
-          .find((args) => args[1] === "install" && !args.includes("--help"))
-          ?.includes(consent),
-      ).toBe(supported);
-      expect(result.calls.find((args) => args[1] === "update")).not.toContain(consent);
-    },
-  );
-
   it("requires an explicit package identity for live ClawHub E2E", () => {
-    const result = runCandidate(
-      clawhubScenario(`
-export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=1
-unset OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC OPENCLAW_PLUGINS_E2E_CLAWHUB_ID
-`),
-    );
+    const result = runCandidate(clawhubScenario());
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("the Kitchen Sink listing has been retired");
   });
 
   it.each([
-    {
-      environment: `
-export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=0
-unset OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC OPENCLAW_PLUGINS_E2E_CLAWHUB_ID
-`,
-      expectedId: "openclaw-kitchen-sink-fixture",
-      expectedSpec: "clawhub:@openclaw/plugin-e2e-fixture",
-      name: "fixture default",
-    },
-    {
-      environment: `
-export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=1
-export OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC=clawhub:@example/custom-plugin
-export OPENCLAW_PLUGINS_E2E_CLAWHUB_ID=custom-plugin
-`,
-      expectedId: "custom-plugin",
-      expectedSpec: "clawhub:@example/custom-plugin",
-      name: "explicit override",
-    },
-  ])("selects the ClawHub identity for $name", ({ environment, expectedId, expectedSpec }) => {
+    [false, "openclaw-kitchen-sink-fixture", "clawhub:@openclaw/plugin-e2e-fixture"],
+    [true, "custom-plugin", "clawhub:@example/custom-plugin"],
+  ] as const)("selects the ClawHub identity (live=%s)", (live, expectedId, expectedSpec) => {
     const result = runCandidate(
-      clawhubScenario(
-        environment,
-        `node() {
-  case "$1" in
-    scripts/e2e/lib/clawhub-fixture-server.cjs)
-      printf '12345\\n' > "$3"
-      while true; do sleep 1; done
-      ;;
-    scripts/e2e/lib/plugins/assertions.mjs) return 0 ;;
-    *) command node "$@" ;;
-  esac
-}`,
-      ),
+      clawhubScenario(live, live ? expectedSpec : undefined, live ? expectedId : undefined, true),
     );
 
     expect(result.status, result.stderr).toBe(0);
-    const install = result.calls.find((args) => args[1] === "install" && !args.includes("--help"));
+    const install = installsFor(result.calls)[0];
     expect(install?.[2]).toBe(expectedSpec);
     expect(result.calls.filter((args) => args[1] === "inspect").map((args) => args[2])).toEqual([
       expectedId,
@@ -350,15 +305,12 @@ run_${runner}_fixture_logged failure plugins install fixture --force
   });
 
   it("reprobes a replacement at the same executable path and version", () => {
-    const root = tempDirs.make("openclaw-consent-replacement-");
-    const entry = writeCandidate(root, { commands: [] });
-    writeCandidate(root, {}, "replacement.cjs");
-    const result = runShell(
-      root,
-      entry,
+    const result = runCandidate(
       `${fixtureCommand} plugins install fixture
 cp "$HOME/replacement.cjs" "$OPENCLAW_ENTRY"
 ${fixtureCommand} plugins install fixture`,
+      { commands: [] },
+      true,
     );
     expect(result.status, result.stderr).toBe(0);
     expect(result.calls).toEqual([

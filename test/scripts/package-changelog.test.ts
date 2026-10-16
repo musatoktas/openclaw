@@ -12,38 +12,13 @@ import { withEnv } from "../../src/test-utils/env.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+afterEach(() => vi.restoreAllMocks());
 
-function changelog(strings: TemplateStringsArray, ...values: string[]) {
-  return `${String.raw({ raw: strings }, ...values)
-    .replace(/^\n/u, "")
-    .trimEnd()}\n`;
-}
-
-const cumulativeChangelog = changelog`
-# Changelog
-Docs: https://docs.openclaw.ai
-## Unreleased
-### Fixes
-- Pending note.
-## 2026.5.28
-### Highlights
-- Current highlight.
-### Changes
-- Current change.
-### Fixes
-- Current fix.
-## 2026.5.27
-### Highlights
-- Older highlight.
-`;
-
-const oversizedContributionRecord = `### Complete contribution record
-
-${"- **PR #123** Thanks @contributor.\n".repeat(20_000)}`;
-const oversizedChangelog = cumulativeChangelog.replace(
-  "## 2026.5.27",
-  `${oversizedContributionRecord}\n## 2026.5.27`,
-);
+const notes = (version: string, body: string) => `## ${version}\n${body}\n`;
+const current = notes("2026.5.28", "- Current fix.\n- Complete editorial release notes.");
+const cumulativeChangelog = `# Changelog\nDocs: https://docs.openclaw.ai\n${notes("Unreleased", "- Pending note.")}${current}${notes("2026.5.27", "- Older highlight.")}`;
+const largeRecord = `### Complete contribution record\n\n${"- **PR #123** Thanks @contributor.\n".repeat(20_000)}`;
+const oversizedChangelog = cumulativeChangelog.replace(current, `${current}${largeRecord}\n`);
 
 function makeChangelog(source = oversizedChangelog, version = "2026.5.28-beta.1") {
   const root = tempDirs.make("openclaw-package-changelog-");
@@ -59,58 +34,55 @@ function makeChangelog(source = oversizedChangelog, version = "2026.5.28-beta.1"
 }
 
 describe("package-changelog", () => {
-  it.each([1, 20_000])(
-    "packages a %i-paragraph docs mirror and restores every source artifact",
-    async (paragraphs) => {
-      const version = "2026.5.28";
-      const docsPath = `docs/releases/${version}.md`;
-      const entryPath = `CHANGELOG/${version}.md`;
-      const recordPath = `CHANGELOG/records/${version}.md`;
-      const index = `# Changelog\n\n- [${version}](${entryPath})\n`;
-      const docs = `# Release notes\n\n${"Complete release documentation.\n\n".repeat(paragraphs)}Final release detail.\n`;
-      const record = `## ${version}\n\n### Complete contribution record\n\n- **PR #123** Thanks @contributor.\n`;
-      const { root, write, read } = makeChangelog(index, version);
-      write(docsPath, docs);
-      const mirror = renderReleaseDocsMirror({ rootDir: root, version, sources: [docsPath] });
-      const sources = new Map([
-        ["CHANGELOG.md", index],
-        [docsPath, docs],
-        [entryPath, mirror],
-        [recordPath, record],
-      ]);
-      for (const [file, content] of sources) {
-        write(file, content);
-      }
-      await expect(preparePackageChangelog(root)).resolves.toBe(true);
-      const packaged = read();
-      expect(packaged).toContain(`## ${version}`);
-      if (paragraphs === 1) {
-        expect(packaged).toBe(`# Changelog\n\n${mirror.trimEnd()}\n`);
-      } else {
-        expect(Buffer.byteLength(mirror)).toBeGreaterThan(500 * 1024);
-        expect(packaged).toContain(`https://github.com/openclaw/openclaw/blob/main/${entryPath}`);
-        expect(packaged).toContain(
-          `https://github.com/openclaw/openclaw/raw/refs/heads/main/${entryPath}`,
-        );
-        expect(packaged).toContain(`https://github.com/openclaw/openclaw/blob/main/${recordPath}`);
-        expect(packaged).toContain(`https://docs.openclaw.ai/releases/${version}`);
-        expect(packaged).not.toContain(`/v${version}/`);
-      }
-      expect(Buffer.byteLength(packaged)).toBeLessThanOrEqual(500 * 1024);
+  it.each([1, 20_000])("packages and restores a %i-paragraph docs mirror", async (paragraphs) => {
+    const version = "2026.5.28";
+    const docsPath = `docs/releases/${version}.md`;
+    const entryPath = `CHANGELOG/${version}.md`;
+    const recordPath = `CHANGELOG/records/${version}.md`;
+    const index = `# Changelog\n\n- [${version}](${entryPath})\n`;
+    const docs = `# Release notes\n\n${"Complete release documentation.\n\n".repeat(paragraphs)}Final release detail.\n`;
+    const record = `## ${version}\n\n### Complete contribution record\n\n- **PR #123** Thanks @contributor.\n`;
+    const { root, write, read } = makeChangelog(index, version);
+    write(docsPath, docs);
+    const mirror = renderReleaseDocsMirror({ rootDir: root, version, sources: [docsPath] });
+    const sources = new Map([
+      ["CHANGELOG.md", index],
+      [docsPath, docs],
+      [entryPath, mirror],
+      [recordPath, record],
+    ]);
+    for (const [file, content] of sources) {
+      write(file, content);
+    }
+    await expect(preparePackageChangelog(root)).resolves.toBe(true);
+    const packaged = read();
+    expect(packaged).toContain(`## ${version}`);
+    if (paragraphs === 1) {
+      expect(packaged).toBe(`# Changelog\n\n${mirror.trimEnd()}\n`);
+    } else {
+      expect(Buffer.byteLength(mirror)).toBeGreaterThan(500 * 1024);
+      expect(packaged).toContain(`https://github.com/openclaw/openclaw/blob/main/${entryPath}`);
+      expect(packaged).toContain(
+        `https://github.com/openclaw/openclaw/raw/refs/heads/main/${entryPath}`,
+      );
+      expect(packaged).toContain(`https://github.com/openclaw/openclaw/blob/main/${recordPath}`);
+      expect(packaged).toContain(`https://docs.openclaw.ai/releases/${version}`);
+      expect(packaged).not.toContain(`/v${version}/`);
+    }
+    expect(Buffer.byteLength(packaged)).toBeLessThanOrEqual(500 * 1024);
 
-      await expect(restorePackageChangelog(root)).resolves.toBe(true);
-      for (const [file, content] of sources) {
-        expect(read(file)).toBe(content);
-      }
-    },
-  );
+    await expect(restorePackageChangelog(root)).resolves.toBe(true);
+    for (const [file, content] of sources) {
+      expect(read(file)).toBe(content);
+    }
+  });
 
   it("packages only a split release, pins its record, and restores the index after source edits", async () => {
     const index = "# Changelog\n\n- [2026.5.28](CHANGELOG/2026.5.28.md)\n";
-    const section = `## 2026.5.28\n\n- Complete editorial notes and credit. Thanks @contributor.\n\n${oversizedContributionRecord}\n`;
+    const section = `## 2026.5.28\n\n- Complete editorial notes and credit. Thanks @contributor.\n\n${largeRecord}\n`;
     const { root, write, read } = makeChangelog(index);
     write("CHANGELOG/2026.5.28.md", section);
-    write("CHANGELOG/records/2026.5.28.md", `## 2026.5.28\n\n${oversizedContributionRecord}\n`);
+    write("CHANGELOG/records/2026.5.28.md", `## 2026.5.28\n\n${largeRecord}\n`);
     write("CHANGELOG/2026.5.27.md", "## 2026.5.27\n\n- Old history.\n");
 
     await expect(preparePackageChangelog(root)).resolves.toBe(true);
@@ -179,7 +151,7 @@ describe("package-changelog", () => {
   });
 
   it.each(["Unreleased", "2026.5.30 (Unreleased)", "2026.5.30 (Release notes)"])(
-    "fails closed without a matching release section even with %s notes",
+    "rejects a missing release below %s notes",
     (heading) => {
       const source = cumulativeChangelog.replace("## Unreleased", `## ${heading}`);
       expect(() => extractCurrentPackageChangelog(source, "2026.5.29")).toThrow(
@@ -188,64 +160,41 @@ describe("package-changelog", () => {
     },
   );
 
-  it("does not fall back to draft notes when exact non-publish notes fail safety checks", () => {
-    const heading = "2026.5.30 (Unreleased)";
-    const source = changelog`
-# Changelog
-## ${heading}
-- Pending development package notes with enough release detail.
-## 2026.5.29
-- Tiny.
-## 2026.5.28
-- Older stable release notes with enough detail.
-`;
-
+  it("rejects unsafe exact notes instead of falling back to drafts", () => {
+    const source = `# Changelog\n${notes("2026.5.30 (Unreleased)", "- Pending development package notes with enough release detail.")}${notes("2026.5.29", "- Tiny.")}${current}`;
     expect(() =>
       extractCurrentPackageChangelog(source, "2026.5.29", { allowUnreleased: true }),
     ).toThrow("Packaged changelog section for 2026.5.29 is only 7 body bytes");
   });
 
-  it.each(["", oversizedContributionRecord])(
-    "blocks oversized editorial notes locally and warns in CI (%#)",
-    (record) => {
-      const source = changelog`
-# Changelog
-## 2026.5.28
-${"é".repeat(260_000)}
-${record}
-`;
-
-      const output = vi.spyOn(console, "error").mockImplementation(() => {});
-      try {
-        withEnv({ GITHUB_ACTIONS: undefined, GITHUB_STEP_SUMMARY: undefined }, () => {
-          expect(() => extractCurrentPackageChangelog(source, "2026.5.28")).toThrow(
-            "exceeds the 512000 byte size limit",
-          );
-        });
-        output.mockClear();
-        withEnv({ GITHUB_ACTIONS: "true", GITHUB_STEP_SUMMARY: undefined }, () => {
-          expect(extractCurrentPackageChangelog(source, "2026.5.28")).toContain(
-            "é".repeat(260_000),
-          );
-        });
-        expect(output).toHaveBeenCalledWith(
-          expect.stringContaining("::warning file=CHANGELOG.md,"),
-        );
-      } finally {
-        output.mockRestore();
-      }
-    },
-  );
-
-  it("does not use the generated contribution link to satisfy the release-note minimum", () => {
-    const source = `# Changelog\n\n## 2026.5.28\n\n### Fixes\n\n${oversizedContributionRecord}\n`;
+  it("excludes the generated record link from the editorial minimum", () => {
+    const source = `# Changelog\n\n## 2026.5.28\n\n### Fixes\n\n${largeRecord}\n`;
     expect(() => extractCurrentPackageChangelog(source, "2026.5.28")).toThrow(
       "below the 32 byte safety minimum",
     );
   });
 
-  it("prepares and restores all source notes and credits", async () => {
-    const { root, read } = makeChangelog();
+  it.each(["", largeRecord])(
+    "bounds oversized editorial notes locally and in CI (%#)",
+    (record) => {
+      const source = `# Changelog\n${notes("2026.5.28", `${"é".repeat(260_000)}\n${record}`)}`;
+
+      const output = vi.spyOn(console, "error").mockImplementation(() => {});
+      withEnv({ GITHUB_ACTIONS: undefined, GITHUB_STEP_SUMMARY: undefined }, () => {
+        expect(() => extractCurrentPackageChangelog(source, "2026.5.28")).toThrow(
+          "exceeds the 512000 byte size limit",
+        );
+      });
+      output.mockClear();
+      withEnv({ GITHUB_ACTIONS: "true", GITHUB_STEP_SUMMARY: undefined }, () => {
+        expect(extractCurrentPackageChangelog(source, "2026.5.28")).toContain("é".repeat(260_000));
+      });
+      expect(output).toHaveBeenCalledWith(expect.stringContaining("::warning file=CHANGELOG.md,"));
+    },
+  );
+
+  it.each([false, true])("restores unchanged notes and rejects edits (%s)", async (edited) => {
+    const { root, read, write } = makeChangelog();
 
     await expect(preparePackageChangelog(root)).resolves.toBe(true);
     const packaged = read();
@@ -256,12 +205,24 @@ ${record}
       "https://github.com/openclaw/openclaw/blob/v2026.5.28-beta.1/CHANGELOG.md#complete-contribution-record",
     );
 
-    await expect(restorePackageChangelog(root)).resolves.toBe(true);
-    expect(read()).toBe(oversizedChangelog);
+    if (edited) {
+      const editedChangelog = packaged.replace("- Current fix.", "- Current fix edited.");
+      write("CHANGELOG.md", editedChangelog);
+      await expect(restorePackageChangelog(root)).rejects.toThrow(
+        "Refusing to restore packaged changelog backup",
+      );
+      expect(read()).toBe(editedChangelog);
+      expect(
+        existsSync(path.join(root, ".artifacts/package-changelog/CHANGELOG.md.prepack-backup")),
+      ).toBe(true);
+    } else {
+      await expect(restorePackageChangelog(root)).resolves.toBe(true);
+      expect(read()).toBe(oversizedChangelog);
+    }
   });
 
   it.each(["Unreleased", "2026.5.30 (Unreleased)"])(
-    "recovers interrupted %s QA packaging with the default restore path",
+    "restores interrupted %s QA packaging",
     async (heading) => {
       const unreleasedChangelog = cumulativeChangelog
         .replace("## Unreleased", `## ${heading}`)
@@ -275,19 +236,4 @@ ${record}
       expect(read()).toBe(unreleasedChangelog);
     },
   );
-
-  it("refuses to restore over edits after package preparation", async () => {
-    const { root, read, write } = makeChangelog();
-    await preparePackageChangelog(root);
-    const editedChangelog = read().replace("- Current fix.", "- Current fix edited.");
-    write("CHANGELOG.md", editedChangelog);
-
-    await expect(restorePackageChangelog(root)).rejects.toThrow(
-      "Refusing to restore packaged changelog backup",
-    );
-    expect(read()).toBe(editedChangelog);
-    expect(
-      existsSync(path.join(root, ".artifacts/package-changelog/CHANGELOG.md.prepack-backup")),
-    ).toBe(true);
-  });
 });
