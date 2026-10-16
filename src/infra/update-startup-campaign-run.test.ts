@@ -69,6 +69,24 @@ function createApplyingCampaign(version = "2.0.0-beta.1") {
   return campaign;
 }
 
+function runBetaCampaign(
+  params: Pick<Parameters<typeof runCampaignUpdate>[0], "campaign" | "runAuto"> &
+    Partial<Parameters<typeof runCampaignUpdate>[0]>,
+) {
+  return runCampaignUpdate({
+    channel: "beta",
+    mode: "npm",
+    version: "2.0.0-beta.1",
+    tag: "beta",
+    forced: false,
+    root: "/opt/openclaw",
+    log: { info: vi.fn() },
+    canApply: () => true,
+    onAttempt: () => {},
+    ...params,
+  });
+}
+
 describe("automatic campaign handoff failure", () => {
   let state: OpenClawTestState;
 
@@ -131,19 +149,7 @@ describe("automatic campaign handoff failure", () => {
       const attempt = async (version = "2.0.0-beta.1") => {
         const campaign = createApplyingCampaign(version);
         try {
-          return await runCampaignUpdate({
-            channel: "beta",
-            mode: "npm",
-            version,
-            tag: "beta",
-            forced: false,
-            root: "/opt/openclaw",
-            log,
-            canApply: () => true,
-            campaign,
-            onAttempt: () => {},
-            runAuto,
-          });
+          return await runBetaCampaign({ version, log, campaign, runAuto });
         } finally {
           campaign.clear();
         }
@@ -217,17 +223,9 @@ describe("automatic campaign handoff failure", () => {
         await release.promise;
         return result;
       });
-    const operation = runCampaignUpdate({
-      channel: "beta",
-      mode: "npm",
-      version: "2.0.0-beta.1",
-      tag: "beta",
-      forced: false,
-      root: "/opt/openclaw",
-      log: { info: vi.fn() },
+    const operation = runBetaCampaign({
       campaign,
       onAttempt: vi.fn(),
-      canApply: () => true,
       runAuto: async () => ({
         status: "skipped",
         message: "Already current",
@@ -284,9 +282,7 @@ describe("automatic campaign handoff failure", () => {
           record.mockImplementationOnce(execute);
         }
         record.mockRejectedValueOnce(
-          Object.assign(new Error("diagnostic ledger is read-only"), {
-            code: "SQLITE_READONLY",
-          }),
+          Object.assign(new Error("diagnostic ledger is read-only"), { code: "SQLITE_READONLY" }),
         );
         throw new Error("pipe closed");
       });
@@ -367,13 +363,7 @@ describe("automatic campaign handoff failure", () => {
       let restoreDiagnosticFailure: (() => void) | undefined;
       try {
         await expect(
-          runCampaignUpdate({
-            channel: "beta",
-            mode: "npm",
-            version: "2.0.0-beta.1",
-            tag: "beta",
-            forced: false,
-            root: "/opt/openclaw",
+          runBetaCampaign({
             log,
             runAuto: async (params) => {
               const outcome = await runAutoUpdateCommand(params, log);
@@ -390,7 +380,6 @@ describe("automatic campaign handoff failure", () => {
               }
               return outcome;
             },
-            canApply: () => true,
             campaign,
             onAttempt,
           }),
@@ -462,17 +451,9 @@ describe("automatic campaign handoff failure", () => {
       let restoreRead: (() => void) | undefined;
       try {
         await expect(
-          runCampaignUpdate({
-            channel: "beta",
-            mode: "npm",
-            version: "2.0.0-beta.1",
-            tag: "beta",
-            forced: false,
-            root: "/opt/openclaw",
+          runBetaCampaign({
             log,
-            canApply: () => true,
             campaign,
-            onAttempt: () => {},
             runAuto: async () => {
               const fail = () => {
                 throw new Error("diagnostic persistence unavailable");

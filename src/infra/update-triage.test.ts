@@ -54,6 +54,19 @@ async function createInstalledTriage(params: { hang?: boolean; promptPath?: stri
   };
 }
 
+function runDiagnostics(
+  target: Parameters<typeof runUpdateFailureTriage>[0]["target"],
+  overrides: Partial<Omit<Parameters<typeof runUpdateFailureTriage>[0], "target">> = {},
+) {
+  return runUpdateFailureTriage({
+    failure: { error: "Update failed" },
+    mode: "json",
+    runtime: { log: vi.fn(), error: vi.fn() },
+    ...overrides,
+    target,
+  });
+}
+
 describe("update triage child lifecycle", () => {
   it.each(["abort", "owner closure"] as const)(
     "does not start prepared interactive triage after %s during cwd validation",
@@ -104,12 +117,10 @@ describe("update triage child lifecycle", () => {
     const { target, promptPath, receiptPath } = await createInstalledTriage();
     const runCommand = vi.spyOn(exec, "runCommandWithTimeout");
     const runtime = { log: vi.fn(), error: vi.fn() };
-    const result = await runUpdateFailureTriage({
-      failure: { error: "Update could not install the package" },
-      target: { ...target, env: { ...target.env, [UPDATE_RUN_ID_ENV]: "completed-update-run" } },
-      mode: "json",
-      runtime,
-    });
+    const result = await runDiagnostics(
+      { ...target, env: { ...target.env, [UPDATE_RUN_ID_ENV]: "completed-update-run" } },
+      { failure: { error: "Update could not install the package" }, runtime },
+    );
     expect(result).toMatchObject({
       status: "completed",
       hint: expect.stringContaining("Diagnostics export unavailable: Snapshot unavailable"),
@@ -132,18 +143,17 @@ describe("update triage child lifecycle", () => {
     let releaseRoot!: (root: string) => void;
     const { promise: discovering, resolve: started } = createDeferred();
     let current = true;
-    const pending = runUpdateFailureTriage({
-      failure: { error: "Update failed" },
-      target: { ...target, root: undefined },
-      resolveRoot: () =>
-        new Promise((resolve) => {
-          releaseRoot = resolve;
-          started();
-        }),
-      mode: "json",
-      runtime: { log: vi.fn(), error: vi.fn() },
-      isCurrent: () => current,
-    });
+    const pending = runDiagnostics(
+      { ...target, root: undefined },
+      {
+        resolveRoot: () =>
+          new Promise((resolve) => {
+            releaseRoot = resolve;
+            started();
+          }),
+        isCurrent: () => current,
+      },
+    );
     await discovering;
     current = false;
     releaseRoot(target.root);
@@ -157,13 +167,7 @@ describe("update triage child lifecycle", () => {
     const { target, receiptPath } = await createInstalledTriage({ hang: true });
     const controller = new AbortController();
     const runtime = { log: vi.fn(), error: vi.fn() };
-    const pending = runUpdateFailureTriage({
-      failure: { error: "Update failed" },
-      target,
-      mode: "json",
-      runtime,
-      signal: controller.signal,
-    });
+    const pending = runDiagnostics(target, { runtime, signal: controller.signal });
     try {
       // The child writes its record before replying; receipt delivery and command exit are unordered.
       const settled = pending.then(async () => {
@@ -205,12 +209,7 @@ describe("update triage child lifecycle", () => {
       killed: true,
       termination: "timeout",
     });
-    const result = await runUpdateFailureTriage({
-      failure: { error: "Update failed" },
-      target,
-      mode: "json",
-      runtime: { log: vi.fn(), error: vi.fn() },
-    });
+    const result = await runDiagnostics(target);
     expect(result).toMatchObject({
       status: "failed",
       hint: expect.stringContaining("Triage stopped (timeout)"),
@@ -219,12 +218,7 @@ describe("update triage child lifecycle", () => {
 
   it("rejects empty report paths", async () => {
     const { target } = await createInstalledTriage({ promptPath: "" });
-    const result = await runUpdateFailureTriage({
-      failure: { error: "Update failed" },
-      target,
-      mode: "json",
-      runtime: { log: vi.fn(), error: vi.fn() },
-    });
+    const result = await runDiagnostics(target);
     expect(result).toMatchObject({
       status: "failed",
       hint: expect.stringContaining("openclaw triage"),
@@ -249,12 +243,7 @@ describe("update triage child lifecycle", () => {
         new Error(`ENOSPC Authorization: Bearer ${credential}\n${"detail ".repeat(1000)}`),
       );
     const runtime = { log: vi.fn(), error: vi.fn() };
-    const result = await runUpdateFailureTriage({
-      failure: { error: "Update failed" },
-      target: { ...target, env: targetEnv },
-      mode: "json",
-      runtime,
-    });
+    const result = await runDiagnostics({ ...target, env: targetEnv }, { runtime });
     expect(result).toMatchObject({ status: "failed", hint: expect.stringContaining("ENOSPC") });
     expect(JSON.stringify(result)).not.toContain(credential);
     if (result.status === "failed") {
@@ -271,9 +260,7 @@ describe("update triage child lifecycle", () => {
       for (const selector of [targetEnv.OPENCLAW_STATE_DIR, configPath, workspaceDir]) {
         expect(guidance).toContain(`'${selector.replaceAll("'", "''")}'`);
       }
-      await expect(fs.stat(contextPath)).resolves.toMatchObject({
-        size: expect.any(Number),
-      });
+      await expect(fs.stat(contextPath)).resolves.toMatchObject({ size: expect.any(Number) });
     }
   });
 });

@@ -14,19 +14,17 @@ import {
   createGatewayUpdateLifecycle,
   type UpdateCheckLifecycle,
 } from "./update-check-lifecycle.js";
-import type { UpdateCheckResult } from "./update-check.js";
 import { prepareUpdateFailureReport } from "./update-failure-report-prepare.js";
 import { getUpdateRun, listUpdateRuns } from "./update-run-ledger.js";
 import { renderUpdateRunReport } from "./update-run-report.js";
 import { readUpdateRunStatus } from "./update-run-status.js";
+import { createDevGitStatus } from "./update-startup-git.test-support.js";
 import { getUpdateSchedule, resetUpdateStatusState } from "./update-status-state.js";
 
 const { fault } = vi.hoisted(
   (): {
     fault: { at?: "sentinel-read" | "state-write"; error?: Error };
-  } => ({
-    fault: {},
-  }),
+  } => ({ fault: {} }),
 );
 
 vi.mock("./restart-sentinel.js", async () => {
@@ -146,24 +144,7 @@ describe("update campaign apply exception boundary", () => {
     { at: "sentinel-read", code: undefined, message: "sentinel transaction unavailable" },
   ] as const)("records and logs $at failure ($code)", async ({ at, code, message }) => {
     const { checkUpdateStatus, resolveNpmChannelTag } = await import("./update-check.js");
-    vi.mocked(checkUpdateStatus).mockResolvedValue({
-      root: "/opt/openclaw",
-      installKind: "git",
-      packageManager: "pnpm",
-      git: {
-        root: "/opt/openclaw",
-        sha: "current-sha",
-        tag: null,
-        branch: "main",
-        upstream: "origin/main",
-        upstreamSha: "upstream-sha",
-        commitAtMs: null,
-        dirty: false,
-        ahead: 0,
-        behind: 2,
-        fetchOk: true,
-      },
-    } satisfies UpdateCheckResult);
+    vi.mocked(checkUpdateStatus).mockResolvedValue(createDevGitStatus());
     vi.mocked(resolveNpmChannelTag).mockResolvedValue({ tag: "dev", version: "99.0.0-dev.1" });
     const { runGatewayUpdateCheck } = await import("./update-startup.js");
     const runAutoUpdate = vi.fn(async () => ({ status: "handoff" as const }));
