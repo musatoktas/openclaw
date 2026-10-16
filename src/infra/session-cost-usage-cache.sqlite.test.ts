@@ -39,6 +39,8 @@ import {
   partitionUsageCostRollup,
   decodeUsageCostPartition,
   USAGE_COST_PARTITION_SCOPE,
+  usageCostPartitionKey,
+  readUsageCostPartitionKey,
 } from "./session-cost-usage-partitions.js";
 import { projectSessionCostSummaries } from "./session-cost-usage-projection.js";
 import {
@@ -160,15 +162,15 @@ describe("session cost usage SQLite cache", () => {
           )
           .all(
             USAGE_COST_PARTITION_SCOPE,
-            `${sessionFile}\0${startDate}`,
-            `${sessionFile}\0${endDate}`,
+            usageCostPartitionKey(sessionFile, startDate),
+            usageCostPartitionKey(sessionFile, endDate),
           )
           .map((row) => {
             if (typeof row.value_json !== "string" || !(row.blob instanceof Uint8Array)) {
               throw new Error("Expected a persisted usage partition");
             }
             return {
-              date: String(row.key).slice(sessionFile.length + 1),
+              date: readUsageCostPartitionKey(String(row.key)).date,
               valueJson: row.value_json,
               blob: row.blob,
             };

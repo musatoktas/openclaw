@@ -5,11 +5,21 @@ import { prepareSessionCostUsageRefreshLock } from "./session-cost-usage-cache.s
 import {
   USAGE_COST_PARTITION_SCOPE,
   usageCostPartitionKey,
+  readUsageCostPartitionKey,
 } from "./session-cost-usage-partitions.js";
 
 function utf8Json(value: string) {
   return new TextEncoder().encode(value);
 }
+
+it.each(['folder/"quoted":\\雪', "folder\0literal", "folder\\u0000literal"])(
+  "encodes partition source %j without PostgreSQL text delimiters",
+  (sessionFile) => {
+    const key = usageCostPartitionKey(sessionFile, "2026-10-01");
+    expect(key).not.toContain("\0");
+    expect(readUsageCostPartitionKey(key)).toEqual({ sessionFile, date: "2026-10-01" });
+  },
+);
 
 it("retires selected months across batches atomically while retaining other partitions", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -65,7 +75,7 @@ it("retires selected months across batches atomically while retaining other part
       // The last month fails after the first deletion batch has already run.
       db.exec(`CREATE TRIGGER refuse_late_month_delete BEFORE DELETE ON cache_entries
       WHEN OLD.scope = '${USAGE_COST_PARTITION_SCOPE}'
-        AND OLD.key = 'session.jsonl' || char(0) || '${removedDates[100]}'
+        AND OLD.key = '"session.jsonl":${removedDates[100]}'
       BEGIN SELECT RAISE(ABORT, 'late month delete refused'); END;`);
       await expect(owner.writeRollup(update)).rejects.toThrow("late month delete refused");
       expect(db.prepare("SELECT * FROM cache_entries ORDER BY scope, key").all()).toEqual(before);

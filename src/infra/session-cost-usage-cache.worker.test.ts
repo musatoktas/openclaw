@@ -23,7 +23,10 @@ import { refreshCostUsageCacheForAgent } from "./session-cost-usage-aggregation.
 import * as usageCacheSqlite from "./session-cost-usage-cache.sqlite.js";
 import { readSessionCostUsageRollupRows } from "./session-cost-usage-cache.test-support.js";
 import { onSessionCostUsageUpdated } from "./session-cost-usage-events.js";
-import { USAGE_COST_PARTITION_SCOPE } from "./session-cost-usage-partitions.js";
+import {
+  LEGACY_USAGE_COST_PARTITION_SCOPE,
+  USAGE_COST_PARTITION_SCOPE,
+} from "./session-cost-usage-partitions.js";
 import { resolveUsageCostPricingFingerprint } from "./session-cost-usage-pricing-context.js";
 import { openUsageCostRefreshFailures } from "./session-cost-usage-refresh-health.js";
 import { prepareUsageCostWorker, runUsageCostWorker } from "./session-cost-usage-worker-runtime.js";
@@ -94,6 +97,46 @@ function usageLine(id: string): string {
     },
   })}\n`;
 }
+
+it("rebuilds retired usage partitions even when the transcript is unchanged", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const agentId = "usage-retired-partitions";
+    const sessionFile = path.join(state.sessionsDir(agentId), "session.jsonl");
+    await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+    await fs.writeFile(sessionFile, usageLine("retained"));
+    const refresh = () =>
+      refreshCostUsageCacheForAgent({ config, agentId, sessionFiles: [sessionFile] });
+    await refresh();
+    const row = readSessionCostUsageRollupRows(agentId)[0]!;
+    const envelope: unknown = JSON.parse(row.valueJson);
+    if (!isRecord(envelope) || !isRecord(envelope.projection)) {
+      throw new Error("Expected a persisted partition checkpoint");
+    }
+    envelope.projection.version = 2;
+    const { db } = openOpenClawAgentDatabase({ agentId });
+    db.prepare("UPDATE cache_entries SET value_json = ? WHERE scope = ? AND key = ?").run(
+      JSON.stringify(envelope),
+      "session-cost-usage-rollup-v3",
+      row.key,
+    );
+    db.prepare("UPDATE cache_entries SET scope = ?, key = ? WHERE scope = ?").run(
+      LEGACY_USAGE_COST_PARTITION_SCOPE,
+      [row.key, "2026-09-01"].join("\0"),
+      USAGE_COST_PARTITION_SCOPE,
+    );
+
+    await refresh();
+    expect(
+      db
+        .prepare("SELECT count(*) AS count FROM cache_entries WHERE scope = ?")
+        .get(USAGE_COST_PARTITION_SCOPE),
+    ).toEqual({ count: 1 });
+    expect(JSON.parse(readSessionCostUsageRollupRows(agentId)[0]!.valueJson)).toMatchObject({
+      projection: { version: 3 },
+    });
+    expect(await fs.readFile(sessionFile, "utf8")).toBe(usageLine("retained"));
+  });
+});
 
 it("batches full-refresh snapshots within payload bounds and preserves targeted refreshes and later writes", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {

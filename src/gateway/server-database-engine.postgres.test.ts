@@ -23,7 +23,7 @@ import {
 import { acquireTestPortBlock } from "../test-utils/port-claims.js";
 import { installGatewayDatabaseEngine } from "./server-database-engine.js";
 import { prepareGatewayServerBootstrap } from "./server-startup-bootstrap.js";
-import { createWorkerEnvironmentStore } from "./worker-environments/store.js";
+import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
 const connection = typeof configured === "string" ? configured : undefined;
@@ -176,11 +176,12 @@ describe.skipIf(!connection)("Gateway PostgreSQL shared-state bootstrap", () => 
     expect(completion).toEqual([{ value_json: "true" }]);
 
     await installGatewayDatabaseEngine(snapshot);
-    const workerStore = await createWorkerEnvironmentStore();
+    const workers = await loadGatewayWorkerEnvironmentStartupState();
     try {
-      expect(workerStore.list()).toEqual([]);
+      expect(workers.store.list()).toEqual([]);
+      expect(await workers.placementStore.listAsync()).toEqual([]);
     } finally {
-      await workerStore.close();
+      await workers.store.close();
     }
     const context = captureOpenClawStateWorkerContext({ env: current.env });
     // A captured lifetime must not re-resolve its SecretRef when a worker opens later.

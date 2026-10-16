@@ -27,6 +27,7 @@ import { agentPostgresRuntime } from "../../state/postgres-schema.generated/agen
 import { agentSearchPostgresRuntime } from "../../state/postgres-schema.generated/agent-search-runtime.js";
 import manifest from "../../state/postgres-schema.generated/manifest.json" with { type: "json" };
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
+import { LEGACY_USAGE_COST_PARTITION_SCOPE } from "../session-cost-usage-partitions.js";
 import { admitSqliteSchema } from "../sqlite-schema-facts.js";
 import { normalizeSchemaSql } from "../sqlite-schema-sql.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
@@ -235,11 +236,15 @@ export async function loadAgentPortDescriptor(
         version < 23 ? "legacy" : "current",
         true,
       );
+      const hasRetiredUsagePartitions = db
+        .prepare("SELECT 1 FROM cache_entries WHERE scope = ? LIMIT 1")
+        .get(LEGACY_USAGE_COST_PARTITION_SCOPE);
       return {
         version,
         migrationRequired:
           version !== OPENCLAW_AGENT_SCHEMA_VERSION ||
           needsIndexRepair ||
+          Boolean(hasRetiredUsagePartitions) ||
           hasPendingCurrentVersionAgentDatabaseMigration(db),
         pendingColumns: {},
       };
@@ -261,7 +266,13 @@ export async function loadAgentPortDescriptor(
               renew: assertCurrent,
             },
             file,
-            async () => ensureOpenClawAgentDatabaseSchema(db, { agentId, register: false }),
+            async () => {
+              ensureOpenClawAgentDatabaseSchema(db, { agentId, register: false });
+              // Retired partitions are rebuilt from retained transcripts; their NUL keys cannot port.
+              db.prepare("DELETE FROM cache_entries WHERE scope = ?").run(
+                LEGACY_USAGE_COST_PARTITION_SCOPE,
+              );
+            },
           ),
       );
     },
