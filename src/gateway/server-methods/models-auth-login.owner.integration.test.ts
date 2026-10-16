@@ -1,4 +1,3 @@
-import { once } from "node:events";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import { createServer } from "node:http";
@@ -12,10 +11,7 @@ import { acquireGatewayLock } from "../../infra/gateway-lock.js";
 import { captureGatewayStateOwner } from "../../infra/gateway-state-owner.js";
 import * as providerPersistence from "../../plugins/provider-auth-persistence.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
-import {
-  createOpenClawTestState,
-  type OpenClawTestState,
-} from "../../test-utils/openclaw-test-state.js";
+import type { OpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   connectGatewayClient,
   disconnectGatewayClient,
@@ -23,6 +19,11 @@ import {
 } from "../test-helpers.e2e.js";
 import type { GatewayClient as ServerGatewayClient } from "./client-types.js";
 import { modelsAuthLoginHandlers } from "./models-auth-login.js";
+import {
+  closeModelsEndpoint,
+  createModelsTestState,
+  listenModelsEndpoint,
+} from "./models-integration.test-support.js";
 
 const provider = "owner-login-fixture";
 const profileId = `${provider}:owner`;
@@ -78,17 +79,10 @@ async function withGatewayOwner<T>(state: OpenClawTestState, operation: () => Pr
 }
 
 async function createState() {
-  return createOpenClawTestState({
-    label: "owner-bound-login",
+  return createModelsTestState("owner-bound-login", {
     layout: "state-only",
     env: {
       OPENCLAW_TEST_MINIMAL_GATEWAY: "0",
-      OPENCLAW_SKIP_CHANNELS: "1",
-      OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-      OPENCLAW_SKIP_CRON: "1",
-      OPENCLAW_SKIP_CANVAS_HOST: "1",
-      OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
     },
   });
 }
@@ -205,13 +199,7 @@ it.for(["allowed", "non-admin", "revoked"] as const)(
       }
     });
     try {
-      endpoint.listen(0, "127.0.0.1");
-      await once(endpoint, "listening");
-      const address = endpoint.address();
-      if (!address || typeof address === "string") {
-        throw new Error("Fixture endpoint has no TCP address");
-      }
-      const cfg = await writePlugin(state, `http://127.0.0.1:${address.port}`);
+      const cfg = await writePlugin(state, await listenModelsEndpoint(endpoint));
       await state.writeConfig(cfg);
       await withGatewayOwner(state, async () => {
         const { client, server, port } = await startGatewayWithClient({
@@ -312,15 +300,7 @@ it.for(["allowed", "non-admin", "revoked"] as const)(
       release.resolve();
       endpoint.closeAllConnections();
       if (endpoint.listening) {
-        const closedEndpoint = Promise.withResolvers<void>();
-        endpoint.close((error) => {
-          if (error) {
-            closedEndpoint.reject(error);
-          } else {
-            closedEndpoint.resolve();
-          }
-        });
-        await closedEndpoint.promise;
+        await closeModelsEndpoint(endpoint);
       }
       await state.cleanup();
     }

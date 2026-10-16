@@ -7,8 +7,12 @@ import { readConfigFileSnapshot } from "../../config/config.js";
 import * as configLock from "../../config/write-lock.js";
 import { defaultRuntime } from "../../runtime.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers.e2e.js";
+import { createModelsTestState } from "./models-integration.test-support.js";
+
+function configuredProvider(apiKey: string, models: { id: string; name: string }[] = []) {
+  return { baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", apiKey, models };
+}
 
 describe("models.authLogout with a concurrent registered config set", () => {
   it.each([
@@ -51,15 +55,8 @@ describe("models.authLogout with a concurrent registered config set", () => {
   ])(
     "$name",
     async ({ updatedProvider, replacement, selectedKey, conflict, reloadMode = "off" }) => {
-      const state = await createOpenClawTestState({
-        label: "models-auth-removal",
+      const state = await createModelsTestState("models-auth-removal", {
         env: {
-          OPENCLAW_SKIP_CHANNELS: "1",
-          OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-          OPENCLAW_SKIP_CRON: "1",
-          OPENCLAW_SKIP_CANVAS_HOST: "1",
-          OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-          OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
           OPENCLAW_TEST_MINIMAL_GATEWAY: "0",
           INLINE_REMOVAL_TEST_KEY: "synthetic-secret-B",
           INLINE_REMOVAL_SAME_KEY: "synthetic-inline-A",
@@ -72,24 +69,11 @@ describe("models.authLogout with a concurrent registered config set", () => {
         gateway: { mode: "local", auth: { mode: "token", token }, reload: { mode: reloadMode } },
         models: {
           providers: {
-            fixture: {
-              baseUrl: "http://127.0.0.1:9/v1",
-              api: "openai-completions",
-              apiKey: "synthetic-inline-A",
-              models: [],
-            },
-            FIXTURE: {
-              baseUrl: "http://127.0.0.1:9/v1",
-              api: "openai-completions",
-              apiKey: "${INLINE_REMOVAL_TEST_KEY}",
-              models: [{ id: "fixture-model", name: "Fixture" }],
-            },
-            "other-fixture": {
-              baseUrl: "http://127.0.0.1:9/v1",
-              api: "openai-completions",
-              apiKey: "synthetic-unrelated-A",
-              models: [],
-            },
+            fixture: configuredProvider("synthetic-inline-A"),
+            FIXTURE: configuredProvider("${INLINE_REMOVAL_TEST_KEY}", [
+              { id: "fixture-model", name: "Fixture" },
+            ]),
+            "other-fixture": configuredProvider("synthetic-unrelated-A"),
           },
         },
       };

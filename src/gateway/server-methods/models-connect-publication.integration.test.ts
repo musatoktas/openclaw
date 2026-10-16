@@ -1,4 +1,4 @@
-import { beforeAll, expect, it, onTestFailed, vi } from "vitest";
+import { beforeAll, expect, it, vi } from "vitest";
 import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
@@ -17,7 +17,6 @@ import {
   getActiveGatewayRootWorkCount,
   getActiveGatewayRootWorkHolders,
 } from "../../process/gateway-work-admission.js";
-import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { acquireTestPortBlock } from "../../test-utils/port-claims.js";
 import {
   connectGatewayClient,
@@ -25,6 +24,7 @@ import {
   startGatewayWithClient,
 } from "../test-helpers.e2e.js";
 import * as chatMetadataHandler from "./chat-metadata-handler.js";
+import { createModelsTestState } from "./models-integration.test-support.js";
 
 // mock-isolation: Optional startup prewarming must not compete with the catalog request drain.
 vi.mock("../server-startup-handler-prewarm.js", () => ({
@@ -50,30 +50,9 @@ beforeAll(async () => {
 });
 
 it("connect negotiates snapshots and preserves draft and saved-session catalog scopes", async () => {
-  const startedAt = performance.now();
-  const phases: { phase: string; elapsedMs: number }[] = [];
   const publications: ModelsSnapshotEvent[] = [];
-  const enterPhase = (phase: string) => {
-    phases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) });
-  };
-  onTestFailed(() => {
-    console.error("Model catalog integration phases", {
-      phases,
-      elapsedMs: Math.round(performance.now() - startedAt),
-      snapshots: publications.length,
-      activeRootWork: getActiveGatewayRootWorkCount(),
-    });
-  });
-  enterPhase("test state");
-  const state = await createOpenClawTestState({
-    label: "models-connect-publication",
-    env: {
-      OPENCLAW_SKIP_CHANNELS: "1",
-      OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-      OPENCLAW_SKIP_CRON: "1",
-      OPENCLAW_SKIP_CANVAS_HOST: "1",
-      OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-    },
+  const state = await createModelsTestState("models-connect-publication", {
+    env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS },
   });
   const token = "synthetic-catalog-gateway-token";
   try {
@@ -96,18 +75,43 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
       },
       "alpha",
     );
-    enterPhase("Gateway startup and connect");
     const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
     const { port } = portClaim;
-    const { client, server } = await startGatewayWithClient({
-      portClaim,
-      configPath: state.configPath,
+    const clientOptions = {
       token,
       clientName: GATEWAY_CLIENT_IDS.CONTROL_UI,
-      modelCatalog: {},
       mode: GATEWAY_CLIENT_MODES.WEBCHAT,
       origin: `http://127.0.0.1:${port}`,
       scopes: ["operator.admin"],
+    } satisfies Omit<Parameters<typeof connectGatewayClient>[0], "url">;
+    const connect = (
+      options: Pick<
+        Parameters<typeof connectGatewayClient>[0],
+        "clientName" | "modelCatalog" | "caps" | "onEvent"
+      >,
+    ) => connectGatewayClient({ ...clientOptions, url: `ws://127.0.0.1:${port}`, ...options });
+    const recordSnapshots =
+      (
+        target: ModelsSnapshotEvent[],
+        published = () => {},
+      ): NonNullable<Parameters<typeof connectGatewayClient>[0]["onEvent"]> =>
+      (event) => {
+        if (event.event === "models.snapshot") {
+          target.push(event.payload as ModelsSnapshotEvent);
+          published();
+        }
+      };
+    const model = (id: string, manualSelectionAllowed?: boolean) => ({
+      id,
+      provider: "fixture",
+      available: true,
+      ...(manualSelectionAllowed === undefined ? {} : { manualSelectionAllowed }),
+    });
+    const { client, server } = await startGatewayWithClient({
+      ...clientOptions,
+      portClaim,
+      configPath: state.configPath,
+      modelCatalog: {},
       cfg: {
         gateway: {
           mode: "local",
@@ -145,20 +149,15 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
           },
         },
       },
-      onEvent(event) {
-        if (event.event === "models.snapshot") {
-          publications.push(event.payload as ModelsSnapshotEvent);
-        }
-      },
+      onEvent: recordSnapshots(publications),
     });
     try {
-      enterPhase("draft catalogs");
       await expect
         .poll(() => publications, { timeout: 15_000 })
         .toMatchObject([
           {
             scope: { agentId: "alpha" },
-            catalog: { models: [{ id: "first", provider: "fixture", available: true }] },
+            catalog: { models: [model("first")] },
           },
         ]);
       for (const selection of [
@@ -166,19 +165,9 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
         { hint: "missing", agentId: "alpha", modelId: "first" },
       ]) {
         const otherPublications: ModelsSnapshotEvent[] = [];
-        const other = await connectGatewayClient({
-          url: `ws://127.0.0.1:${port}`,
-          token,
-          clientName: GATEWAY_CLIENT_IDS.CONTROL_UI,
+        const other = await connect({
           modelCatalog: { agentId: selection.hint },
-          mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-          origin: `http://127.0.0.1:${port}`,
-          scopes: ["operator.admin"],
-          onEvent(event) {
-            if (event.event === "models.snapshot") {
-              otherPublications.push(event.payload as ModelsSnapshotEvent);
-            }
-          },
+          onEvent: recordSnapshots(otherPublications),
         });
         try {
           await expect
@@ -187,7 +176,7 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
               {
                 scope: { agentId: selection.agentId },
                 catalog: {
-                  models: [{ id: selection.modelId, provider: "fixture", available: true }],
+                  models: [model(selection.modelId)],
                 },
               },
             ]);
@@ -196,7 +185,6 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
           await disconnectGatewayClient(other);
         }
       }
-      enterPhase("saved-session catalogs");
       const sessionKey = "agent:alpha:dashboard:12345678-1234-4123-8123-123456789abc";
       await upsertSessionEntryCore(
         { agentId: "alpha", sessionKey },
@@ -216,21 +204,10 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
       ]) {
         const savedPublications: ModelsSnapshotEvent[] = [];
         const savedPublication = createDeferred();
-        const saved = await connectGatewayClient({
-          url: `ws://127.0.0.1:${port}`,
-          token,
-          clientName: GATEWAY_CLIENT_IDS.CONTROL_UI,
+        const saved = await connect({
           modelCatalog,
           caps: ["model-selection-policy"],
-          mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-          origin: `http://127.0.0.1:${port}`,
-          scopes: ["operator.admin"],
-          onEvent(event) {
-            if (event.event === "models.snapshot") {
-              savedPublications.push(event.payload as ModelsSnapshotEvent);
-              savedPublication.resolve();
-            }
-          },
+          onEvent: recordSnapshots(savedPublications, savedPublication.resolve),
         });
         try {
           // hello-ok precedes worker-backed catalog publication; join that event
@@ -242,18 +219,8 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
               scope: { agentId: "alpha", sessionKey },
               catalog: {
                 models: expect.arrayContaining([
-                  expect.objectContaining({
-                    id: "first",
-                    provider: "fixture",
-                    available: true,
-                    manualSelectionAllowed: true,
-                  }),
-                  expect.objectContaining({
-                    id: "second",
-                    provider: "fixture",
-                    available: true,
-                    manualSelectionAllowed: false,
-                  }),
+                  expect.objectContaining(model("first", true)),
+                  expect.objectContaining(model("second", false)),
                 ]),
                 accountSelection: {
                   kind: "shared",
@@ -269,7 +236,6 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
           await disconnectGatewayClient(saved);
         }
       }
-      enterPhase("initial publication supersession");
       await client.request("sessions.patch", {
         key: sessionKey,
         agentId: "alpha",
@@ -278,42 +244,44 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
       const publicationStarted = createDeferred();
       const releasePublication = createDeferred();
       const resolveReadParams = chatMetadataHandler.resolveChatMetadataReadParams;
+      const holdNextPublication = (
+        started: ReturnType<typeof createDeferred<void>>,
+        release: ReturnType<typeof createDeferred<void>>,
+        settled = () => {},
+      ) =>
+        vi
+          .spyOn(chatMetadataHandler, "resolveChatMetadataReadParams")
+          .mockImplementationOnce(async (...args) => {
+            const scope = await resolveReadParams(...args);
+            if (!scope?.withCurrent) {
+              throw new Error("Expected saved-session publication authority");
+            }
+            const withCurrent = scope.withCurrent;
+            return {
+              ...scope,
+              withCurrent: async <T>(consume: () => T): Promise<Awaited<T>> => {
+                started.resolve();
+                await release.promise;
+                try {
+                  return await withCurrent(consume);
+                } finally {
+                  settled();
+                }
+              },
+            };
+          });
       let publicationSettled = false;
-      const publicationSpy = vi
-        .spyOn(chatMetadataHandler, "resolveChatMetadataReadParams")
-        .mockImplementationOnce(async (...args) => {
-          const scope = await resolveReadParams(...args);
-          if (!scope?.withCurrent) {
-            throw new Error("Expected saved-session publication authority");
-          }
-          const withCurrent = scope.withCurrent;
-          return {
-            ...scope,
-            withCurrent: async <T>(consume: () => T): Promise<Awaited<T>> => {
-              // Cached projections still cross the live publication authority boundary.
-              publicationStarted.resolve();
-              await releasePublication.promise;
-              try {
-                return await withCurrent(consume);
-              } finally {
-                publicationSettled = true;
-              }
-            },
-          };
-        });
+      // Cached projections still cross the live publication authority boundary.
+      const publicationSpy = holdNextPublication(publicationStarted, releasePublication, () => {
+        publicationSettled = true;
+      });
       const racingPublications: ModelsSnapshotEvent[] = [];
       const sessionChanges: unknown[] = [];
       let racingClient: Awaited<ReturnType<typeof connectGatewayClient>> | undefined;
       try {
-        racingClient = await connectGatewayClient({
-          url: `ws://127.0.0.1:${port}`,
-          token,
-          clientName: GATEWAY_CLIENT_IDS.CONTROL_UI,
+        racingClient = await connect({
           modelCatalog: { agentId: "alpha", sessionKey },
           caps: ["model-selection-policy"],
-          mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-          origin: `http://127.0.0.1:${port}`,
-          scopes: ["operator.admin"],
           onEvent(event) {
             if (event.event === "models.snapshot") {
               racingPublications.push(event.payload as ModelsSnapshotEvent);
@@ -361,9 +329,7 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
         await expect(
           racingClient.request("models.list", { agentId: "alpha", sessionKey }),
         ).resolves.toMatchObject({
-          models: [
-            { id: "first", provider: "fixture", available: true, manualSelectionAllowed: true },
-          ],
+          models: [model("first", true)],
           accountSelection: {
             authProfileId: "fixture:replacement-account",
             source: "user",
@@ -381,7 +347,6 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
           await disconnectGatewayClient(racingClient);
         }
       }
-      enterPhase("catalog request during unrelated session patch");
       const unrelatedKey = "agent:alpha:catalog-other";
       await upsertSessionEntryCore(
         { agentId: "alpha", sessionKey: unrelatedKey },
@@ -389,26 +354,10 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
       );
       const requestEntered = createDeferred();
       const releaseRequest = createDeferred();
-      const pendingPublication = vi
-        .spyOn(chatMetadataHandler, "resolveChatMetadataReadParams")
-        .mockImplementationOnce(async (...args) => {
-          const scope = await resolveReadParams(...args);
-          if (!scope?.withCurrent) {
-            throw new Error("Expected saved-session publication authority");
-          }
-          const withCurrent = scope.withCurrent;
-          return {
-            ...scope,
-            withCurrent: async <T>(consume: () => T): Promise<Awaited<T>> => {
-              requestEntered.resolve();
-              await releaseRequest.promise;
-              return withCurrent(consume);
-            },
-          };
-        });
+      const pendingPublication = holdNextPublication(requestEntered, releaseRequest);
       const pendingCatalog = client.request("models.list", { agentId: "alpha", sessionKey });
       const deliveredCatalog = expect(pendingCatalog).resolves.toMatchObject({
-        models: [{ id: "first", provider: "fixture", available: true }],
+        models: [model("first")],
         accountSelection: { authProfileId: "fixture:replacement-account" },
       });
       try {
@@ -429,7 +378,6 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
         pendingPublication.mockRestore();
         await Promise.allSettled([pendingCatalog, deliveredCatalog]);
       }
-      enterPhase("legacy clients");
       for (const clientName of [
         GATEWAY_CLIENT_IDS.CONTROL_UI,
         GATEWAY_CLIENT_IDS.CLI,
@@ -437,13 +385,8 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
         GATEWAY_CLIENT_IDS.ANDROID_APP,
       ]) {
         const oldPublications: unknown[] = [];
-        const old = await connectGatewayClient({
-          url: `ws://127.0.0.1:${port}`,
-          token,
+        const old = await connect({
           clientName,
-          mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-          origin: `http://127.0.0.1:${port}`,
-          scopes: ["operator.admin"],
           onEvent(event) {
             if (event.event === "models.snapshot") {
               oldPublications.push(event.payload);
@@ -460,13 +403,10 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
         }
       }
     } finally {
-      enterPhase("client cleanup");
       await disconnectGatewayClient(client);
-      enterPhase("Gateway cleanup");
       await server.close({ reason: "catalog publication test complete" });
     }
   } finally {
-    enterPhase("test state cleanup");
     await state.cleanup();
   }
 }, 60_000);

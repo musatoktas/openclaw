@@ -1,34 +1,26 @@
-import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import type { ModelsListResult } from "../../../packages/gateway-protocol/src/schema/agents-models-skills.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
-import { resolveTestNodeExecPath } from "../../test-utils/node-process.js";
-import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers.e2e.js";
 import {
   observeCatalogWorkerTasks,
   waitForCatalogPublication,
 } from "./models-auth-catalog.test-support.js";
+import {
+  closeModelsEndpoint,
+  createModelsTestState,
+  listenModelsEndpoint,
+  writeAuthStoreExternally,
+} from "./models-integration.test-support.js";
 
 describe("models.authRefresh learned catalog", () => {
   it("retains same-account rows while renewing and discovers a replacement account", async ({
     signal,
   }) => {
-    const state = await createOpenClawTestState({
-      label: "models-auth-refresh-catalog",
-      env: {
-        OPENCLAW_SKIP_CHANNELS: "1",
-        OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-        OPENCLAW_SKIP_CRON: "1",
-        OPENCLAW_SKIP_CANVAS_HOST: "1",
-        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-        OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      },
-    });
+    const state = await createModelsTestState("models-auth-refresh-catalog");
     const provider = "renewal-fixture";
     const catalogWork = observeCatalogWorkerTasks();
     const initialRefreshReturned = createDeferred();
@@ -83,13 +75,7 @@ describe("models.authRefresh learned catalog", () => {
       };
     };
     try {
-      discovery.listen(0, "127.0.0.1");
-      await once(discovery, "listening");
-      const address = discovery.address();
-      if (!address || typeof address === "string") {
-        throw new Error("Discovery fixture did not bind a TCP port");
-      }
-      const baseUrl = `http://127.0.0.1:${address.port}`;
+      const baseUrl = await listenModelsEndpoint(discovery);
       await state.writeJson("catalog-plugin/openclaw.plugin.json", {
         id: provider,
         providers: [provider],
@@ -145,30 +131,7 @@ describe("models.authRefresh learned catalog", () => {
         accountStore("account-one", "account-one-original"),
       );
       const writePersistedAuthProfiles = async (store: AuthProfileStore) => {
-        // External refresh must reload credentials without an in-process Gateway write receipt.
-        const update = await promisify(execFile)(
-          resolveTestNodeExecPath(),
-          [
-            "--input-type=module",
-            "--eval",
-            `
-              import { DatabaseSync } from "node:sqlite";
-              const database = new DatabaseSync(process.argv[1]);
-              try {
-                const result = database
-                  .prepare("UPDATE auth_profile_store SET store_json = ?, updated_at = ? WHERE store_key = ?")
-                  .run(process.argv[2], Date.now(), "primary");
-                process.stdout.write(String(result.changes));
-              } finally {
-                database.close();
-              }
-            `,
-            agentDatabasePath,
-            JSON.stringify(store),
-          ],
-          { env: { ...state.env, NODE_OPTIONS: undefined } },
-        );
-        expect(update.stdout).toBe("1");
+        await writeAuthStoreExternally(state, agentDatabasePath, store);
       };
       const { client, server } = await startGatewayWithClient({
         cfg,
@@ -186,6 +149,15 @@ describe("models.authRefresh learned catalog", () => {
           });
           return result.models.filter((model) => model.provider === provider);
         };
+        const waitForIdle = async () => {
+          expect(
+            await waitForCatalogPublication({
+              signal,
+              read: async () => catalogWork.read().pendingTasks,
+              ready: (pending) => pending === 0,
+            }),
+          ).toBe(0);
+        };
         const original = await waitForCatalogPublication({
           signal,
           start: async () => {
@@ -201,35 +173,17 @@ describe("models.authRefresh learned catalog", () => {
         expect(
           requests.every((authorization) => authorization === "Bearer account-one-original"),
         ).toBe(true);
-        expect(
-          await waitForCatalogPublication({
-            signal,
-            read: async () => catalogWork.read().pendingTasks,
-            ready: (pending) => pending === 0,
-          }),
-        ).toBe(0);
+        await waitForIdle();
         const initialRequests = requests.length;
         const initialTasks = catalogWork.read().completedTasks;
         const renewalRequest = once(discovery, "request");
-        const renewalStarted = Date.now();
         await writePersistedAuthProfiles(accountStore("account-one", "account-one-renewed"));
         await expect(
           client.request("models.authRefresh", { agentId: "main", operation: "update" }),
         ).resolves.toEqual({ refreshed: true });
         expect((await list()).map((model) => model.id)).toEqual(["account-one-learned"]);
-        console.log(
-          "RENEWAL_PENDING",
-          await client.request("models.list", { agentId: "main", view: "all" }),
-        );
         await renewalRequest;
-        console.log("RENEWAL_REQUEST_MS", Date.now() - renewalStarted);
-        expect(
-          await waitForCatalogPublication({
-            signal,
-            read: async () => catalogWork.read().pendingTasks,
-            ready: (pending) => pending === 0,
-          }),
-        ).toBe(0);
+        await waitForIdle();
         expect(requests.slice(initialRequests)).toEqual(["Bearer account-one-renewed"]);
         expect(catalogWork.read()).toMatchObject({
           workersCreated: 1,
@@ -266,11 +220,9 @@ describe("models.authRefresh learned catalog", () => {
           expect(heldResponses).toHaveLength(1);
           expect(catalogWork.read().pendingTasks).toBeGreaterThan(0);
           await writePersistedAuthProfiles({ version: 1, profiles: {} });
-          const logoutStarted = Date.now();
           await expect(
             client.request("models.authRefresh", { agentId: "main", operation: "logout" }),
           ).resolves.toEqual({ refreshed: true });
-          console.log("LOGOUT_DURING_DISCOVERY_MS", Date.now() - logoutStarted);
           // Revocation must publish while the old discovery response is still withheld.
           const revoked = await list();
           expect(revoked.filter((model) => model.available)).toEqual([]);
@@ -293,9 +245,7 @@ describe("models.authRefresh learned catalog", () => {
       initialRefreshReturned.resolve();
       catalogWork.close();
       try {
-        await new Promise<void>((resolve, reject) => {
-          discovery.close((error) => (error ? reject(error) : resolve()));
-        });
+        await closeModelsEndpoint(discovery);
       } finally {
         await state.cleanup();
       }

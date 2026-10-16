@@ -1,5 +1,3 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
 import { SHARED_AUTH_STORE_STATE_KEY } from "../../agents/auth-profiles/sqlite-json.js";
@@ -11,28 +9,46 @@ import { getActiveSecretsRuntimeSnapshot } from "../../secrets/runtime.js";
 import { deleteSecretStoreEntry, writeSecretStoreEntry } from "../../secrets/store/secret-store.js";
 import { writeConfigMachineState } from "../../state/config-machine-state-write.js";
 import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
-import { resolveTestNodeExecPath } from "../../test-utils/node-process.js";
-import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   connectGatewayClient,
   disconnectGatewayClient,
   startGatewayWithClient,
 } from "../test-helpers.e2e.js";
 import type { ModelAuthStatusResult } from "./models-auth-status.types.js";
+import {
+  createModelsTestState,
+  writeAuthStoreExternally,
+} from "./models-integration.test-support.js";
+
+function expectIsolatedState(state: Awaited<ReturnType<typeof createModelsTestState>>) {
+  expect([process.env.OPENCLAW_HOME, resolveStateDir(), resolveConfigPath()]).toEqual([
+    state.home,
+    state.stateDir,
+    state.configPath,
+  ]);
+  for (const resolved of [state.home, resolveStateDir(), resolveConfigPath()]) {
+    expect(isPathInside(state.root, resolved)).toBe(true);
+  }
+}
+
+function expectProfile(
+  client: Awaited<ReturnType<typeof startGatewayWithClient>>["client"],
+  provider: string,
+  profileId: string,
+) {
+  return expect(client.request("models.authStatus", { agentId: "main" })).resolves.toMatchObject({
+    providers: expect.arrayContaining([
+      expect.objectContaining({
+        provider,
+        profiles: expect.arrayContaining([expect.objectContaining({ profileId })]),
+      }),
+    ]),
+  });
+}
 
 describe("models.authRefresh", () => {
   it("publishes and clears quoted provider warnings through registered refresh", async () => {
-    const state = await createOpenClawTestState({
-      label: "models-auth-refresh-quoted",
-      env: {
-        OPENCLAW_SKIP_CHANNELS: "1",
-        OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-        OPENCLAW_SKIP_CRON: "1",
-        OPENCLAW_SKIP_CANVAS_HOST: "1",
-        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-        OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      },
-    });
+    const state = await createModelsTestState("models-auth-refresh-quoted");
     const token = "quoted-auth-refresh-token";
     const providerNames = ["plain", "123", "local.service"];
     const providerPaths = [
@@ -74,12 +90,7 @@ describe("models.authRefresh", () => {
         database: { env: state.env },
       });
     try {
-      expect(process.env.OPENCLAW_HOME).toBe(state.home);
-      expect(resolveStateDir()).toBe(state.stateDir);
-      expect(resolveConfigPath()).toBe(state.configPath);
-      for (const resolved of [state.home, resolveStateDir(), resolveConfigPath()]) {
-        expect(isPathInside(state.root, resolved)).toBe(true);
-      }
+      expectIsolatedState(state);
       await saveProviderKey("initial-provider-credential");
       const { client, server } = await startGatewayWithClient({
         cfg,
@@ -131,17 +142,7 @@ describe("models.authRefresh", () => {
   });
 
   it("publishes saved credentials and persisted removals before acknowledging an administrator", async () => {
-    const state = await createOpenClawTestState({
-      label: "models-auth-refresh",
-      env: {
-        OPENCLAW_SKIP_CHANNELS: "1",
-        OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-        OPENCLAW_SKIP_CRON: "1",
-        OPENCLAW_SKIP_CANVAS_HOST: "1",
-        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-        OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      },
-    });
+    const state = await createModelsTestState("models-auth-refresh");
     const token = "auth-refresh-integration-token";
     const cfg = {
       agents: { entries: { main: { workspace: state.workspaceDir } } },
@@ -150,12 +151,7 @@ describe("models.authRefresh", () => {
     };
     await state.writeConfig(cfg);
     try {
-      expect(process.env.OPENCLAW_HOME).toBe(state.home);
-      expect(resolveStateDir()).toBe(state.stateDir);
-      expect(resolveConfigPath()).toBe(state.configPath);
-      for (const resolved of [state.home, resolveStateDir(), resolveConfigPath()]) {
-        expect(isPathInside(state.root, resolved)).toBe(true);
-      }
+      expectIsolatedState(state);
       const { client, server, port } = await startGatewayWithClient({
         cfg,
         configPath: state.configPath,
@@ -188,18 +184,7 @@ describe("models.authRefresh", () => {
         await expect(
           client.request("models.authRefresh", { agentId: "main", operation: "login" }),
         ).resolves.toEqual({ refreshed: true });
-        await expect(client.request("models.authStatus", { agentId: "main" })).resolves.toEqual(
-          expect.objectContaining({
-            providers: expect.arrayContaining([
-              expect.objectContaining({
-                provider: "auth-refresh-shared",
-                profiles: expect.arrayContaining([
-                  expect.objectContaining({ profileId: "auth-refresh-shared:proof" }),
-                ]),
-              }),
-            ]),
-          }),
-        );
+        await expectProfile(client, "auth-refresh-shared", "auth-refresh-shared:proof");
         const agentDatabasePath = await state.writeAuthProfiles({
           version: 1,
           profiles: {
@@ -213,41 +198,8 @@ describe("models.authRefresh", () => {
         await expect(
           client.request("models.authRefresh", { agentId: "main", operation: "login" }),
         ).resolves.toEqual({ refreshed: true });
-        await expect(client.request("models.authStatus", { agentId: "main" })).resolves.toEqual(
-          expect.objectContaining({
-            providers: expect.arrayContaining([
-              expect.objectContaining({
-                provider: "auth-refresh-proof",
-                profiles: expect.arrayContaining([
-                  expect.objectContaining({ profileId: "auth-refresh-proof:local" }),
-                ]),
-              }),
-            ]),
-          }),
-        );
-        // A separate process supplies no Gateway write receipt; only explicit refresh can reload it.
-        const removal = await promisify(execFile)(
-          resolveTestNodeExecPath(),
-          [
-            "--input-type=module",
-            "--eval",
-            `
-              import { DatabaseSync } from "node:sqlite";
-              const database = new DatabaseSync(process.argv[1]);
-              try {
-                const result = database
-                  .prepare("DELETE FROM auth_profile_store WHERE store_key = ?")
-                  .run("primary");
-                process.stdout.write(String(result.changes));
-              } finally {
-                database.close();
-              }
-            `,
-            agentDatabasePath,
-          ],
-          { env: { ...state.env, NODE_OPTIONS: undefined } },
-        );
-        expect(removal.stdout).toBe("1");
+        await expectProfile(client, "auth-refresh-proof", "auth-refresh-proof:local");
+        await writeAuthStoreExternally(state, agentDatabasePath, null);
         await expect(
           client.request("models.authRefresh", { agentId: "main", operation: "logout" }),
         ).resolves.toEqual({ refreshed: true });

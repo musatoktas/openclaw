@@ -1,19 +1,37 @@
-import { once } from "node:events";
 import { createServer } from "node:http";
 import { text as readText } from "node:stream/consumers";
 import { expect, it, vi } from "vitest";
 import type { ModelsListResult } from "../../../packages/gateway-protocol/src/schema/agents-models-skills.js";
 import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers.e2e.js";
 import { waitForCatalogPublication } from "./models-auth-catalog.test-support.js";
+import {
+  closeModelsEndpoint,
+  createModelsTestState,
+  listenModelsEndpoint,
+} from "./models-integration.test-support.js";
 
 type DispatchRequest = {
   authorization: string | undefined;
   requestHeader: string | string[] | undefined;
   body: { model: string; max_tokens: number; messages: unknown[] };
 };
+
+function expectDispatch(
+  requests: DispatchRequest[],
+  index: number,
+  model: string,
+  account = "account-a-key",
+  requestHeader = "initial-transport",
+) {
+  expect(requests).toHaveLength(index + 1);
+  expect(requests[index]).toMatchObject({
+    authorization: `Bearer ${account}`,
+    requestHeader,
+    body: { model, max_tokens: 1536 },
+  });
+}
 
 async function withDispatchLifecycle(
   signal: AbortSignal,
@@ -30,17 +48,8 @@ async function withDispatchLifecycle(
     send: (model: string, name: string) => Promise<{ status: string; error?: string }>;
   }) => Promise<void>,
 ) {
-  const state = await createOpenClawTestState({
-    label: "models-dispatch-lifecycle",
-    env: {
-      OPENCLAW_TEST_MINIMAL_GATEWAY: undefined,
-      OPENCLAW_SKIP_CHANNELS: "1",
-      OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-      OPENCLAW_SKIP_CRON: "1",
-      OPENCLAW_SKIP_CANVAS_HOST: "1",
-      OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-    },
+  const state = await createModelsTestState("models-dispatch-lifecycle", {
+    env: { OPENCLAW_TEST_MINIMAL_GATEWAY: undefined },
   });
   const requests: DispatchRequest[] = [];
   const discoveryAccounts: (string | undefined)[] = [];
@@ -121,13 +130,7 @@ async function withDispatchLifecycle(
     });
   };
   try {
-    endpoint.listen(0, "127.0.0.1");
-    await once(endpoint, "listening");
-    const address = endpoint.address();
-    if (!address || typeof address === "string") {
-      throw new Error("Lifecycle fixture did not bind a TCP port");
-    }
-    const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+    const baseUrl = `${await listenModelsEndpoint(endpoint)}/v1`;
     await state.writeJson("catalog-plugin/openclaw.plugin.json", {
       id: "opencode",
       providers: ["opencode"],
@@ -307,9 +310,7 @@ async function withDispatchLifecycle(
     } finally {
       endpoint.closeAllConnections();
       try {
-        await new Promise<void>((resolve, reject) => {
-          endpoint.close((error) => (error ? reject(error) : resolve()));
-        });
+        await closeModelsEndpoint(endpoint);
         await Promise.all(pending);
       } finally {
         await state.cleanup();
@@ -409,12 +410,7 @@ it("models.list retains executable rows on failed refresh and replaces them afte
     await expect(fixture.send("account-a-only", "after-failure")).resolves.toMatchObject({
       status: "ok",
     });
-    expect(fixture.requests).toHaveLength(2);
-    expect(fixture.requests[1]).toMatchObject({
-      authorization: "Bearer account-a-key",
-      requestHeader: "initial-transport",
-      body: { model: "account-a-only", max_tokens: 1536 },
-    });
+    expectDispatch(fixture.requests, 1, "account-a-only");
 
     fixture.advertised.set("account-a-key", ["after-restart"]);
     fixture.setDiscoveryAvailable(true);
@@ -426,12 +422,7 @@ it("models.list retains executable rows on failed refresh and replaces them afte
     await expect(fixture.send("after-restart", "first-after-restart")).resolves.toMatchObject({
       status: "ok",
     });
-    expect(fixture.requests).toHaveLength(3);
-    expect(fixture.requests[2]).toMatchObject({
-      authorization: "Bearer account-a-key",
-      requestHeader: "initial-transport",
-      body: { model: "after-restart", max_tokens: 1536 },
-    });
+    expectDispatch(fixture.requests, 2, "after-restart");
     await expect(fixture.send("account-a-only", "withdrawn-after-restart")).resolves.toMatchObject({
       status: "error",
       error: expect.stringContaining("This model was not found."),
@@ -478,12 +469,7 @@ it("models.authRefresh revokes old executable rows before discovery and config.p
     await expect(fixture.send("account-b-only", "after-replacement")).resolves.toMatchObject({
       status: "ok",
     });
-    expect(fixture.requests).toHaveLength(2);
-    expect(fixture.requests[1]).toMatchObject({
-      authorization: "Bearer account-b-key",
-      requestHeader: "initial-transport",
-      body: { model: "account-b-only", max_tokens: 1536 },
-    });
+    expectDispatch(fixture.requests, 1, "account-b-only", "account-b-key");
 
     const config = await fixture.client.request<{ hash: string }>("config.get", {});
     await fixture.client.request("config.patch", {
@@ -526,11 +512,6 @@ it("models.authRefresh revokes old executable rows before discovery and config.p
     await expect(fixture.send("account-b-only", "after-config-reload")).resolves.toMatchObject({
       status: "ok",
     });
-    expect(fixture.requests).toHaveLength(3);
-    expect(fixture.requests[2]).toMatchObject({
-      authorization: "Bearer account-b-key",
-      requestHeader: "reloaded-transport",
-      body: { model: "account-b-only", max_tokens: 1536 },
-    });
+    expectDispatch(fixture.requests, 2, "account-b-only", "account-b-key", "reloaded-transport");
   });
 }, 180_000);
