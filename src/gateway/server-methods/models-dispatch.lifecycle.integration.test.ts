@@ -3,13 +3,14 @@ import { text as readText } from "node:stream/consumers";
 import { expect, it, vi } from "vitest";
 import type { ModelsListResult } from "../../../packages/gateway-protocol/src/schema/agents-models-skills.js";
 import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers.e2e.js";
 import { waitForCatalogPublication } from "./models-auth-catalog.test-support.js";
 import {
   closeModelsEndpoint,
   createModelsTestState,
   listenModelsEndpoint,
+  modelsTestConfig,
+  settleModelsWork,
+  startModelsGateway,
 } from "./models-integration.test-support.js";
 
 type DispatchRequest = {
@@ -36,7 +37,7 @@ function expectDispatch(
 async function withDispatchLifecycle(
   signal: AbortSignal,
   run: (fixture: {
-    client: Awaited<ReturnType<typeof startGatewayWithClient>>["client"];
+    client: Awaited<ReturnType<typeof startModelsGateway>>["client"];
     requests: DispatchRequest[];
     discoveryAccounts: (string | undefined)[];
     advertised: Map<string, string[]>;
@@ -48,7 +49,7 @@ async function withDispatchLifecycle(
     send: (model: string, name: string) => Promise<{ status: string; error?: string }>;
   }) => Promise<void>,
 ) {
-  const state = await createModelsTestState("models-dispatch-lifecycle", {
+  await using state = await createModelsTestState("models-dispatch-lifecycle", {
     env: { OPENCLAW_TEST_MINIMAL_GATEWAY: undefined },
   });
   const requests: DispatchRequest[] = [];
@@ -122,7 +123,7 @@ async function withDispatchLifecycle(
       response.destroy(error instanceof Error ? error : new Error(String(error)));
     });
   });
-  let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
+  let gateway: Awaited<ReturnType<typeof startModelsGateway>> | undefined;
   const saveAccount = async (key: string) => {
     await state.writeAuthProfiles({
       version: 1,
@@ -172,7 +173,7 @@ async function withDispatchLifecycle(
       };`,
     );
     const token = "dispatch-lifecycle-gateway-token";
-    const cfg = {
+    const cfg = modelsTestConfig(state, token, {
       models: {
         providers: {
           opencode: {
@@ -191,7 +192,6 @@ async function withDispatchLifecycle(
           heartbeat: { every: "0m" },
           modelPolicy: { allow: ["opencode/*"] },
         },
-        entries: { main: { workspace: state.workspaceDir } },
       },
       tools: { profile: "minimal" },
       plugins: {
@@ -199,18 +199,11 @@ async function withDispatchLifecycle(
         load: { paths: [pluginPath] },
         slots: { memory: "none" },
       },
-      gateway: { mode: "local", auth: { mode: "token", token } },
-    } satisfies OpenClawConfig;
+    });
     await state.writeConfig(cfg);
     await saveAccount("account-a-key");
     const start = async () => {
-      const started = await startGatewayWithClient({
-        cfg,
-        configPath: state.configPath,
-        token,
-        scopes: ["operator.admin"],
-        hotReloadRecovery,
-      });
+      const started = await startModelsGateway(state, cfg, token, { hotReloadRecovery });
       gateway = started;
       await started.server.startupSettled;
       return started;
@@ -246,8 +239,7 @@ async function withDispatchLifecycle(
       },
       saveAccount,
       restart: async () => {
-        await disconnectGatewayClient(active.client);
-        await active.server.close();
+        await active.close();
         gateway = undefined;
         active = await start();
       },
@@ -285,15 +277,13 @@ async function withDispatchLifecycle(
           const history = await active.client.request<{ messages: unknown[] }>("chat.history", {
             sessionKey: session.key,
           });
-          expect(history.messages).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({
-                role: "assistant",
-                content: expect.arrayContaining([
-                  expect.objectContaining({ type: "text", text: "LIFECYCLE_DISPATCH_REPLY" }),
-                ]),
-              }),
-            ]),
+          expect(history.messages).toContainEqual(
+            expect.objectContaining({
+              role: "assistant",
+              content: expect.arrayContaining([
+                expect.objectContaining({ type: "text", text: "LIFECYCLE_DISPATCH_REPLY" }),
+              ]),
+            }),
           );
         }
         return completed;
@@ -303,18 +293,11 @@ async function withDispatchLifecycle(
   } finally {
     heldDiscovery?.release.resolve();
     try {
-      if (gateway) {
-        await disconnectGatewayClient(gateway.client);
-        await gateway.server.close();
-      }
+      await gateway?.close();
     } finally {
       endpoint.closeAllConnections();
-      try {
-        await closeModelsEndpoint(endpoint);
-        await Promise.all(pending);
-      } finally {
-        await state.cleanup();
-      }
+      await closeModelsEndpoint(endpoint);
+      await Promise.all(pending);
     }
   }
 }
@@ -344,21 +327,15 @@ it(
       });
       fixture.discoveryAccounts.length = 0;
       const held = fixture.holdDiscovery();
-      const pending = fixture.client
-        .request<ModelsListResult>("models.list", {
+      const pending = settleModelsWork(
+        fixture.client.request<ModelsListResult>("models.list", {
           agentId: "main",
           sessionKey: selected.key,
           provider: "opencode",
           view: "all",
           refresh: true,
-        })
-        .then(
-          (result) => ({ result, error: undefined }),
-          (error: unknown) => ({
-            result: undefined,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
+        }),
+      );
       try {
         await withTestTimeout(held.started, 30_000, "Selected session discovery did not start");
         expect(fixture.discoveryAccounts).toEqual(["account-a-key"]);

@@ -1460,7 +1460,7 @@ describe("models.authLogout", () => {
   ])("rejects incompatible logout selectors: %j", async (selection) => {
     const opts = createLogoutOptions({ provider: "openrouter", ...selection });
     await logoutHandler(opts);
-    expectInvalid(opts);
+    expectInvalid(opts, {});
     expect(mocks.ensureAuthProfileStoreWithoutExternalProfilesAsync).not.toHaveBeenCalled();
     expect(mocks.removeModelAuthCredentials).not.toHaveBeenCalled();
   });

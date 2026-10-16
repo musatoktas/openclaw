@@ -4,17 +4,23 @@ import type { Server } from "node:http";
 import { promisify } from "node:util";
 import { expect } from "vitest";
 import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveTestNodeExecPath } from "../../test-utils/node-process.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
+import {
+  connectGatewayClient,
+  disconnectGatewayClient,
+  startGatewayWithClient,
+} from "../test-helpers.e2e.js";
 
-export function createModelsTestState(
+export async function createModelsTestState(
   label: string,
   options: Parameters<typeof createOpenClawTestState>[0] = {},
 ) {
-  return createOpenClawTestState({
+  const state = await createOpenClawTestState({
     ...options,
     label,
     env: {
@@ -27,6 +33,60 @@ export function createModelsTestState(
       ...options.env,
     },
   });
+  return Object.assign(state, { [Symbol.asyncDispose]: () => state.cleanup() });
+}
+
+export async function startModelsGateway(
+  state: OpenClawTestState,
+  cfg: Parameters<typeof startGatewayWithClient>[0]["cfg"],
+  token: string,
+  options: Pick<Parameters<typeof startGatewayWithClient>[0], "hotReloadRecovery"> = {},
+) {
+  const gateway = await startGatewayWithClient({
+    scopes: ["operator.admin"],
+    ...options,
+    cfg,
+    token,
+    configPath: state.configPath,
+  });
+  let closed = false;
+  const close = async () => {
+    if (!closed) {
+      await disconnectGatewayClient(gateway.client);
+      await gateway.server.close();
+      closed = true;
+    }
+  };
+  return Object.assign(gateway, { close, [Symbol.asyncDispose]: close });
+}
+
+export function modelsTestConfig(
+  state: OpenClawTestState,
+  token: string,
+  overrides: OpenClawConfig = {},
+): OpenClawConfig {
+  return {
+    plugins: { enabled: false },
+    ...overrides,
+    agents: { entries: { main: { workspace: state.workspaceDir } }, ...overrides.agents },
+    gateway: { mode: "local", auth: { mode: "token", token }, ...overrides.gateway },
+  };
+}
+
+export function settleModelsWork<T>(work: Promise<T>) {
+  return work.then(
+    (result) => ({ result, error: undefined }),
+    (error: unknown) => ({ result: undefined, error }),
+  );
+}
+
+export async function connectModelsReader(port: number, token: string) {
+  const client = await connectGatewayClient({
+    url: `ws://127.0.0.1:${port}`,
+    token,
+    scopes: ["operator.read"],
+  });
+  return Object.assign(client, { [Symbol.asyncDispose]: () => disconnectGatewayClient(client) });
 }
 
 export async function listenModelsEndpoint(server: Server) {
