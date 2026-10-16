@@ -68,6 +68,20 @@ function stalledResponse(headers?: HeadersInit) {
   return new Response(new ReadableStream({ start() {} }), { headers });
 }
 
+function spawnPrompt(claudeBin: string, env: NodeJS.ProcessEnv = {}, capture = false) {
+  return spawn(process.execPath, resolveRuntimeWorkerArgv(promptProbeUrl), {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLAUDE_BIN: claudeBin,
+      OPENCLAW_PROMPT_TRANSPORT: "direct",
+      OPENCLAW_PROMPT_TIMEOUT_MS: "10000",
+      ...env,
+    },
+    stdio: capture ? ["ignore", "pipe", "pipe"] : "ignore",
+  });
+}
+
 function gatewayLeaderScript(descendantPidPath: string) {
   const descendantScript = [
     "process.on('SIGINT', () => {});",
@@ -201,9 +215,13 @@ async function promptFixture(prefix: string, mode?: Parameters<typeof writeFakeP
 }
 
 async function logFixture(contents: string) {
-  const logPath = path.join(await tempDir("openclaw-prompt-probe-log-"), "gateway.log");
-  await fs.writeFile(logPath, contents, "utf8");
-  return logPath;
+  return writeFixture(await tempDir("openclaw-prompt-probe-log-"), "gateway.log", contents);
+}
+
+async function writeFixture(root: string, name: string, contents: string | string[]) {
+  const filename = path.join(root, name);
+  await fs.writeFile(filename, Array.isArray(contents) ? contents.join("\n") : contents, "utf8");
+  return filename;
 }
 
 function quotePosixShellArg(value: string): string {
@@ -221,41 +239,33 @@ async function writeFakePromptCli(
   descendantPidPath: string,
   mode: "blocking" | "leader-exit" | "escaped-output" = "blocking",
 ): Promise<string> {
-  const descendantPath = path.join(root, "fake-prompt-descendant.mjs");
-  await fs.writeFile(
-    descendantPath,
-    [
-      'import fs from "node:fs";',
-      fixtureReceiptClientSource(receipts.endpoint),
-      'process.on("SIGINT", () => {});',
-      'process.on("SIGTERM", () => {});',
-      "fs.writeFileSync(process.argv[2], String(process.pid));",
-      "setInterval(() => {}, 1000);",
-      ...(mode === "escaped-output" ? ['fs.writeFileSync(process.argv[3], "ready");'] : []),
-      'sendReceipt(process.argv[2], "ready");',
-      "",
-    ].join("\n"),
-  );
+  const descendantPath = await writeFixture(root, "fake-prompt-descendant.mjs", [
+    'import fs from "node:fs";',
+    fixtureReceiptClientSource(receipts.endpoint),
+    'process.on("SIGINT", () => {});',
+    'process.on("SIGTERM", () => {});',
+    "fs.writeFileSync(process.argv[2], String(process.pid));",
+    "setInterval(() => {}, 1000);",
+    ...(mode === "escaped-output" ? ['fs.writeFileSync(process.argv[3], "ready");'] : []),
+    'sendReceipt(process.argv[2], "ready");',
+    "",
+  ]);
 
   if (mode === "escaped-output") {
-    const leaderPath = path.join(root, "fake-prompt-leader.mjs");
-    await fs.writeFile(
-      leaderPath,
-      [
-        'import { spawn } from "node:child_process";',
-        'import fs from "node:fs";',
-        `const child = spawn(${JSON.stringify(testNodeExecPath)}, ${JSON.stringify([
-          descendantPath,
-          descendantPidPath,
-          path.join(root, "escaped.ready"),
-        ])}, { detached: true, stdio: ["ignore", "inherit", "inherit"] });`,
-        `fs.appendFileSync(${JSON.stringify(path.join(root, "launches.jsonl"))}, JSON.stringify({ pid: child.pid, args: process.argv.slice(2) }) + "\\n");`,
-        `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(child.pid));`,
-        "child.unref();",
-        "setInterval(() => {}, 1000);",
-        "",
-      ].join("\n"),
-    );
+    const leaderPath = await writeFixture(root, "fake-prompt-leader.mjs", [
+      'import { spawn } from "node:child_process";',
+      'import fs from "node:fs";',
+      `const child = spawn(${JSON.stringify(testNodeExecPath)}, ${JSON.stringify([
+        descendantPath,
+        descendantPidPath,
+        path.join(root, "escaped.ready"),
+      ])}, { detached: true, stdio: ["ignore", "inherit", "inherit"] });`,
+      `fs.appendFileSync(${JSON.stringify(path.join(root, "launches.jsonl"))}, JSON.stringify({ pid: child.pid, args: process.argv.slice(2) }) + "\\n");`,
+      `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(child.pid));`,
+      "child.unref();",
+      "setInterval(() => {}, 1000);",
+      "",
+    ]);
     return writeShell(root, "fake-prompt-cli.sh", [
       `exec ${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(leaderPath)} "$@"`,
     ]);
@@ -267,13 +277,7 @@ async function writeFakePromptCli(
   ]);
 }
 
-type CliResult = {
-  status: number | null;
-  stderr: string;
-  stdout: string;
-};
-
-function runCli(scriptPath: string, args: string[]): Promise<CliResult> {
+function runCli(scriptPath: string, args: string[]) {
   const child = spawn(testNodeExecPath, ["--import", "tsx", scriptPath, ...args], {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
@@ -412,15 +416,33 @@ describe("script-specific dev tooling hardening", () => {
     expect(signal?.aborted).toBe(true);
   });
 
-  it("times out stalled Discord smoke response body reads", async () => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-    const request = discordRequest({
-      fetchImpl: fetchResponse(stalledResponse()),
-    });
-
-    const rejection = expect(request).rejects.toThrow(
+  it.each([
+    [
+      "Discord smoke",
+      () => discordRequest({ fetchImpl: fetchResponse(stalledResponse()) }),
       /Discord API GET \/channels\/123\/messages exceeded timeout/u,
-    );
+    ],
+    [
+      "OpenAI realtime smoke",
+      () =>
+        realtime.createOpenAIClientSecret("test-key", {
+          timeoutMs: 5,
+          fetchImpl: fetchResponse(stalledResponse()),
+        }),
+      /OpenAI Realtime client secret request exceeded timeout/u,
+    ],
+    [
+      "Claude usage",
+      () =>
+        claude.fetchAnthropicOAuthUsage("test-token", {
+          timeoutMs: 5,
+          fetchImpl: fetchResponse(stalledResponse({ "content-type": "application/json" })),
+        }),
+      /Anthropic OAuth usage request exceeded timeout/u,
+    ],
+  ] as const)("times out stalled %s response body reads", async (_name, request, error) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const rejection = expect(request()).rejects.toThrow(error);
     await vi.advanceTimersByTimeAsync(5);
     await rejection;
   });
@@ -496,31 +518,29 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("restarts TUI PTY mirror reads when the mirror file is truncated", async () => {
-    const tempRoot = await tempDir("openclaw-tui-watch-test-");
-    const mirrorPath = path.join(tempRoot, "mirror.ansi");
-    await fs.writeFile(mirrorPath, "fresh", "utf8");
-
+    const root = await tempDir("openclaw-tui-watch-test-");
+    const mirrorPath = await writeFixture(root, "mirror.ansi", "fresh");
     const result = await tui.readNewMirrorData(mirrorPath, 10, 1024);
-
-    expect(result.chunk.toString("utf8")).toBe("fresh");
-    expect(result.offset).toBe(5);
+    expect({ text: result.chunk.toString("utf8"), offset: result.offset }).toEqual({
+      text: "fresh",
+      offset: 5,
+    });
   });
 
   it("drains all pending TUI PTY mirror chunks after the child exits", async () => {
-    const tempRoot = await tempDir("openclaw-tui-watch-test-");
-    const mirrorPath = path.join(tempRoot, "mirror.ansi");
-    await fs.writeFile(mirrorPath, "first-second-third", "utf8");
+    const root = await tempDir("openclaw-tui-watch-test-");
+    const mirrorPath = await writeFixture(root, "mirror.ansi", "first-second-third");
     const chunks: string[] = [];
-
     const offset = await tui.drainNewMirrorData(
       mirrorPath,
       0,
       (chunk: Buffer) => chunks.push(chunk.toString("utf8")),
       6,
     );
-
-    expect(chunks).toEqual(["first-", "second", "-third"]);
-    expect(offset).toBe("first-second-third".length);
+    expect({ chunks, offset }).toEqual({
+      chunks: ["first-", "second", "-third"],
+      offset: "first-second-third".length,
+    });
   });
 
   it("keeps only diagnostic tails from noisy TUI PTY child output", () => {
@@ -534,51 +554,20 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it.each([
-    {
-      name: "OpenAI realtime smoke",
-      request: realtime.createOpenAIClientSecret,
-      credential: "test-key",
-      headers: undefined,
-      error: /OpenAI Realtime client secret request exceeded timeout/u,
-    },
-    {
-      name: "Claude usage",
-      request: claude.fetchAnthropicOAuthUsage,
-      credential: "test-token",
-      headers: { "content-type": "application/json" },
-      error: /Anthropic OAuth usage request exceeded timeout/u,
-    },
-  ])(
-    "times out stalled $name response body reads",
-    async ({ request, credential, headers, error }) => {
-      const pending = request(credential, {
-        timeoutMs: 5,
-        fetchImpl: fetchResponse(stalledResponse(headers)),
-      });
-
-      await expect(pending).rejects.toThrow(error);
-    },
-  );
-
-  it.each([
     [
-      "OpenAI realtime",
       realtime.resolveOpenAIHttpTimeoutMs,
-      "42",
       42,
       "2s",
       /OPENCLAW_REALTIME_OPENAI_HTTP_TIMEOUT_MS must be an integer/u,
     ],
     [
-      "Claude usage",
       claude.resolveFetchTimeoutMs,
-      "123",
       123,
       "1.5",
       /OPENCLAW_DEBUG_CLAUDE_USAGE_FETCH_TIMEOUT_MS must be an integer/u,
     ],
-  ] as const)("validates %s timeout values", (_label, resolve, valid, expected, invalid, error) => {
-    expect(resolve(valid)).toBe(expected);
+  ] as const)("validates timeout resolver %j", (resolve, expected, invalid, error) => {
+    expect(resolve(String(expected))).toBe(expected);
     expect(() => resolve(invalid)).toThrow(error);
   });
 
@@ -748,7 +737,7 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it.runIf(process.platform !== "win32")(
-    "rejects Anthropic direct prompt success while its descendant remains active",
+    "rejects direct prompt success with active descendants",
     async ({ signal }) => {
       const { pidPath: descendantPidPath, claudeBin } = await promptFixture(
         "openclaw-direct-normal-exit-",
@@ -790,28 +779,24 @@ describe("script-specific dev tooling hardening", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "reports Anthropic direct cleanup uncertainty on parent signal",
+    "reports direct cleanup uncertainty on parent signal",
     async ({ signal }) => {
       const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-unjoined-"));
       const owner = createVitestResourceOwner(tempRoot);
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
       const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath, "escaped-output");
-      const probe = spawn(process.execPath, resolveRuntimeWorkerArgv(promptProbeUrl), {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          CLAUDE_BIN: fakeClaudeBin,
-          OPENCLAW_PROMPT_TRANSPORT: "direct",
+      const probe = spawnPrompt(
+        fakeClaudeBin,
+        {
           OPENCLAW_PROMPT_CAPTURE: "0",
           OPENCLAW_PROMPT_KEEP_TMP: "0",
-          OPENCLAW_PROMPT_TIMEOUT_MS: "10000",
           OPENCLAW_PROMPT_LIST_JSON: JSON.stringify(["cleanup uncertainty", "must not run"]),
           TMPDIR: tempRoot,
           TMP: tempRoot,
           TEMP: tempRoot,
         },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+        true,
+      );
       let descendantPid = 0;
       const { output, closed } = captureChild(probe);
 
@@ -896,7 +881,7 @@ describe("script-specific dev tooling hardening", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "returns a terminal result after an Anthropic direct prompt timeout",
+    "returns a terminal result after a direct prompt timeout",
     async () => {
       const tempRoot = await tempDir("openclaw-direct-prompt-tree-");
       const fakeClaudeBin = await writeShell(tempRoot, "blocking-prompt-cli.sh", [
@@ -917,21 +902,13 @@ describe("script-specific dev tooling hardening", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "cleans Anthropic direct prompt descendants on parent signal",
+    "cleans direct prompt descendants on parent signal",
     async ({ signal }) => {
       const { pidPath: descendantPidPath, claudeBin } = await promptFixture(
         "openclaw-direct-parent-signal-",
       );
-      const probe = spawn(process.execPath, resolveRuntimeWorkerArgv(promptProbeUrl), {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          CLAUDE_BIN: claudeBin,
-          OPENCLAW_PROMPT_TEXT: "parent signal cleanup proof",
-          OPENCLAW_PROMPT_TIMEOUT_MS: "10000",
-          OPENCLAW_PROMPT_TRANSPORT: "direct",
-        },
-        stdio: "ignore",
+      const probe = spawnPrompt(claudeBin, {
+        OPENCLAW_PROMPT_TEXT: "parent signal cleanup proof",
       });
 
       await withDescendantFixture(probe, descendantPidPath, signal, async ({ ready, closed }) => {
@@ -977,7 +954,7 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it.runIf(process.platform !== "win32")(
-    "cleans Anthropic prompt gateway descendants after leader exit",
+    "cleans gateway descendants after leader exit",
     async ({ signal }) => {
       const tempRoot = await tempDir("openclaw-prompt-gateway-tree-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
@@ -1013,38 +990,33 @@ describe("script-specific dev tooling hardening", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "cleans Anthropic prompt gateway descendants when the child attaches after parent signal",
+    "cleans gateway descendants attached after parent signal",
     async ({ signal }) => {
       const tempRoot = await tempDir("openclaw-prompt-parent-signal-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
-      const runnerPath = path.join(tempRoot, "parent-signal-runner.mjs");
       const leaderScript = gatewayLeaderScript(descendantPidPath);
-      await fs.writeFile(
-        runnerPath,
-        [
-          "import childProcess from 'node:child_process';",
-          "import fs from 'node:fs';",
-          `const { testing } = await import(${JSON.stringify(promptProbeUrl.href)});`,
-          "const signalController = testing.createPromptProbeParentSignalController();",
-          `const child = childProcess.spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(leaderScript)}], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });`,
-          "let stopPromise;",
-          "const stopGateway = () => {",
-          "  stopPromise ??= testing.stopGatewayPromptChild(child, { close: async () => {} }, 50, 100);",
-          "  return stopPromise;",
-          "};",
-          "process.on('SIGTERM', () => {",
-          "  signalController.attach({",
-          "    stop: stopGateway,",
-          "    forceKill: () => {",
-          "      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }",
-          "    },",
-          "  });",
-          "});",
-          "child.once('message', pid => process.send(pid));",
-          "setInterval(() => {}, 1000);",
-        ].join("\n"),
-        "utf8",
-      );
+      const runnerPath = await writeFixture(tempRoot, "parent-signal-runner.mjs", [
+        "import childProcess from 'node:child_process';",
+        "import fs from 'node:fs';",
+        `const { testing } = await import(${JSON.stringify(promptProbeUrl.href)});`,
+        "const signalController = testing.createPromptProbeParentSignalController();",
+        `const child = childProcess.spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(leaderScript)}], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });`,
+        "let stopPromise;",
+        "const stopGateway = () => {",
+        "  stopPromise ??= testing.stopGatewayPromptChild(child, { close: async () => {} }, 50, 100);",
+        "  return stopPromise;",
+        "};",
+        "process.on('SIGTERM', () => {",
+        "  signalController.attach({",
+        "    stop: stopGateway,",
+        "    forceKill: () => {",
+        "      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }",
+        "    },",
+        "  });",
+        "});",
+        "child.once('message', pid => process.send(pid));",
+        "setInterval(() => {}, 1000);",
+      ]);
       const runner = spawn(
         process.execPath,
         [...resolveRuntimeWorkerArgv(promptProbeUrl).slice(0, -1), runnerPath],

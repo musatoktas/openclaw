@@ -3,13 +3,12 @@ import { afterEach, expect, it, vi } from "vitest";
 
 const fixture = vi.hoisted(() => ({
   now: 1_800_000_000_000,
-  uuid: "00000000-0000-4000-8000-000000000188",
   entries: vi.fn(),
 }));
 
 vi.mock("node:crypto", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:crypto")>()),
-  randomUUID: () => fixture.uuid,
+  randomUUID: () => "00000000-0000-4000-8000-000000000188",
 }));
 vi.mock("../../src/plugin-state/plugin-state-store.ts", () => ({
   createPluginStateKeyedStore: () => ({ entries: fixture.entries }),
@@ -46,6 +45,11 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
   const auth = `Bot synthetic-${driver === "token" ? "driver" : "bot"}`;
   const refusal = () =>
     Response.json({ message: "synthetic refusal" }, { status: 403, statusText: "Forbidden" });
+  const message = {
+    content: "<@mentioned-user> Synthetic ACP instruction",
+    allowed_mentions: { parse: [], users: ["mentioned-user"] },
+  };
+  const sendPath = driver === "token" ? "/channels/parent/messages" : `${webhook}?wait=true`;
   const exchanges: Array<[Request, Response]> = [
     [
       ["GET", "/users/@me", auth, undefined],
@@ -60,15 +64,7 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
       ]);
     }
     exchanges.push([
-      [
-        "POST",
-        driver === "token" ? "/channels/parent/messages" : `${webhook}?wait=true`,
-        driver === "token" ? auth : null,
-        {
-          content: "<@mentioned-user> Synthetic ACP instruction",
-          allowed_mentions: { parse: [], users: ["mentioned-user"] },
-        },
-      ],
+      ["POST", sendPath, driver === "token" ? auth : null, message],
       failure === "send" ? refusal() : Response.json({ id: "sent", author: { id: sender } }),
     ]);
     if (failure !== "send") {
@@ -86,22 +82,19 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
   }
   const expectedRequests = exchanges.map(([request]) => request);
   const actualRequests: Request[] = [];
-  vi.stubGlobal(
-    "fetch",
-    vi.fn<typeof fetch>(async (input, init) => {
-      const incoming = new globalThis.Request(input, init);
-      const url = new URL(incoming.url);
-      const exchange = exchanges.shift();
-      expect(exchange, "unexpected Discord request").toBeDefined();
-      actualRequests.push([
-        incoming.method,
-        `${url.pathname}${url.search}`.replace(/^\/api\/v10/u, ""),
-        incoming.headers.get("Authorization"),
-        incoming.body === null ? undefined : await incoming.json(),
-      ]);
-      return exchange![1];
-    }),
-  );
+  const fetchFixture: typeof fetch = async (input, init) => {
+    const incoming = new globalThis.Request(input, init);
+    const url = new URL(incoming.url);
+    const exchange = exchanges.shift();
+    actualRequests.push([
+      incoming.method,
+      `${url.pathname}${url.search}`.replace(/^\/api\/v10/u, ""),
+      incoming.headers.get("Authorization"),
+      incoming.body === null ? undefined : await incoming.json(),
+    ]);
+    return exchange![1];
+  };
+  vi.stubGlobal("fetch", fetchFixture);
   const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
   const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
   const exited = new Error("synthetic process exit");
@@ -124,16 +117,13 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
     }).flatMap(([flag, value]) => [`--${flag}`, value]),
     "--json",
   ];
-  await expect(import("../../scripts/dev/discord-acp-plain-language-smoke.ts")).rejects.toBe(
-    exited,
-  );
-  expect(exit).toHaveBeenCalledOnce();
+  const execution = import("../../scripts/dev/discord-acp-plain-language-smoke.ts");
+  await expect(execution).rejects.toBe(exited);
   expect(vi.getTimerCount()).toBe(0);
-  expect(exchanges).toEqual([]);
   // Assert after main returns so its API-error handling cannot swallow a mismatch.
   expect(actualRequests).toEqual(expectedRequests);
   return {
-    exitCode: exit.mock.calls[0]?.[0],
+    exitCodes: exit.mock.calls.map(([code]) => code),
     stdout: stdout.mock.calls.map(([chunk]) => String(chunk)).join(""),
     stderr: stderr.mock.calls.map(([chunk]) => String(chunk)).join(""),
   };
@@ -149,7 +139,7 @@ it.each([
   "%s driver completes or reports %s failure and cleans up owned webhooks",
   async (driver, failure) => {
     const result = await runDriver(driver, failure);
-    expect(result).toMatchObject({ exitCode: failure ? 1 : 0, stderr: "" });
+    expect(result).toMatchObject({ exitCodes: [failure ? 1 : 0], stderr: "" });
     if (!failure) {
       expect(result.stdout).toBe(
         jsonOutput({
@@ -167,11 +157,8 @@ it.each([
         }),
       );
     } else {
-      const expected = {
-        ok: false,
-        stage: failure === "identity" ? "discord-api" : "send-message",
-        smokeId,
-      };
+      const stage = failure === "identity" ? "discord-api" : "send-message";
+      const expected = { ok: false, stage, smokeId };
       if (failure === "identity") {
         expect(JSON.parse(result.stdout)).toEqual({
           ...expected,
