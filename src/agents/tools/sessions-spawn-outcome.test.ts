@@ -217,7 +217,11 @@ it("rejects a sandbox cwd before reserving or creating a child", async () => {
         },
       },
     );
-    expect(result.details).toMatchObject({ status: "forbidden" });
+    expect(result.details).toMatchObject({
+      status: "forbidden",
+      error:
+        "cwd override is not supported outside the target agent workspace for sandboxed visible session runs",
+    });
     expect(callGateway).not.toHaveBeenCalled();
     observeRecoveredSpawn(result, false);
   });

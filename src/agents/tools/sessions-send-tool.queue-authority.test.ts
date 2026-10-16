@@ -170,14 +170,12 @@ it.each([
       const instance = createOperationalRunInstanceRef("queue-source-run");
       const authority = claimAgentRunDelegatedAuthority(instance);
       // Resolution is read-only; the real queue and SQLite transcript perform every effect.
-      const callGateway = vi
-        .fn()
-        .mockImplementation(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-          if (request.method !== "sessions.resolve") {
-            throw new Error(`Unexpected Gateway dispatch: ${request.method}`);
-          }
-          return { key: sessionKey, agentId: targetAgentId };
-        });
+      const callGateway = vi.fn(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+        if (request.method !== "sessions.resolve") {
+          throw new Error(`Unexpected Gateway dispatch: ${request.method}`);
+        }
+        return { key: sessionKey, agentId: targetAgentId };
+      });
       const scheduler = createTestGatewayScheduler();
       const questions = new QuestionManager(scheduler);
       const unregisterClosed = registerAgentRunDelegatedAuthorityClosedHandler((closed) =>
@@ -289,12 +287,10 @@ it.each([
           tools: [tool],
         });
         const [available] = applyDelegationCapability([wrap(tool)], capability);
-        expect(
-          available,
-          "authorized requester follow-through must retain sessions_send on fallback",
-        ).toBeDefined();
         if (!available) {
-          throw new Error("Fallback removed the authorized continuation tool");
+          throw new Error(
+            "Authorized requester follow-through must retain sessions_send on fallback",
+          );
         }
         tool = available;
       }
@@ -358,10 +354,13 @@ it.each([
         }
         resumePreparation.resolve();
         const result = await pending;
+        expect(result.details).toMatchObject(
+          rejected
+            ? { status: source === "ask-revoked" ? "forbidden" : "error" }
+            : { status: "accepted", targetDisposition: "steered" },
+        );
+        expect(queued).toHaveBeenCalledTimes(rejected ? 0 : 1);
         if (rejected) {
-          expect(result.details).toMatchObject({
-            status: source === "ask-revoked" ? "forbidden" : "error",
-          });
           expect(JSON.stringify(result)).toContain(
             source === "ask-revoked"
               ? "authority"
@@ -371,13 +370,6 @@ it.each([
                   ? "guarded_injection_unsupported"
                   : "Message injection authority is no longer current",
           );
-          expect(queued).not.toHaveBeenCalled();
-        } else {
-          expect(result.details).toMatchObject({
-            status: "accepted",
-            targetDisposition: "steered",
-          });
-          expect(queued).toHaveBeenCalledOnce();
         }
         // Acceptance transfers ownership: closing the sender cannot withdraw accepted guidance.
         releaseAgentRunDelegatedAuthority(authority);
@@ -399,9 +391,6 @@ it.each([
             (entry) => entry.role === "user" && JSON.stringify(entry).includes(message),
           );
         expect(delivered).toHaveLength(rejected ? 0 : 1);
-        expect(
-          callGateway.mock.calls.every(([request]) => request.method === "sessions.resolve"),
-        ).toBe(true);
       } finally {
         resumePreparation.resolve();
         releaseAgentRunDelegatedAuthority(authority);

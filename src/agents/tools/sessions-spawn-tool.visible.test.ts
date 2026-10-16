@@ -116,35 +116,42 @@ it.each([true, false])(
   },
 );
 
-it.each(["subagent", "acp"])("refuses another agent before dispatching %s", async (runtime) => {
-  const tool = createSessionsSpawnTool({
-    agentSessionKey: "agent:main:main",
-    senderIsOwner: true,
-    config: {
-      agents: {
-        entries: {
-          main: { subagents: { allowAgents: ["other"], delegateToolsTo: ["other"] } },
-          other: {},
+it.each(["subagent", "acp", "visible"])(
+  "enforces sender-only restrictions before %s dispatch",
+  async (runtime) => {
+    const registerRun = vi.fn();
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+      senderIsOwner: runtime === "visible" ? undefined : true,
+      config: {
+        agents: {
+          entries: {
+            main: { subagents: { allowAgents: ["other"], delegateToolsTo: ["other"] } },
+            other: {},
+          },
         },
       },
-    },
-    delegatedToolDenyFloor: { policyAgentId: "main", deny: [] },
-    inheritedToolPolicySource: "sender",
-    inheritedToolAllowlist: ["read", "sessions_spawn"],
-  });
-  const result = await tool.execute("restricted-cross-agent", {
-    task: "inspect",
-    runtime,
-    agentId: "other",
-  });
-  expect(result.details).toMatchObject({
-    status: "forbidden",
-    error: "This sender may only start hidden helpers of the same agent.",
-  });
-  expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
-  expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
-  expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
-});
+      delegatedToolDenyFloor: { policyAgentId: "main", deny: [] },
+      inheritedToolPolicySource: "sender",
+      inheritedToolAllowlist: ["read", "sessions_spawn"],
+      registerRun,
+    });
+    const result = await tool.execute("restricted-cross-agent", {
+      task: "inspect",
+      runtime: runtime === "visible" ? undefined : runtime,
+      agentId: runtime === "visible" ? undefined : "other",
+      ...(runtime === "visible" ? { visible: true } : {}),
+    });
+    expect(result.details).toMatchObject({
+      status: "forbidden",
+      error: "This sender may only start hidden helpers of the same agent.",
+    });
+    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
+    expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
+    expect(registerRun).not.toHaveBeenCalled();
+  },
+);
 
 it("carries only host invocation intent to creation and reports the exact committed publication", async () => {
   const key = "agent:main:main";
@@ -213,80 +220,67 @@ it("keeps visible child quotas separate for agents sharing a bare requester key"
   expect(result.details).toMatchObject({ status: "accepted", runId: "quota-child-run" });
 });
 
-it.each([undefined, "sender"] as const)(
-  "applies visible spawn policy for source %s",
-  async (source) => {
-    hoisted.inProcessCreationMock.mockResolvedValue({
-      ...created("restricted-child"),
-      runId: "run-visible-restricted",
-    });
-    const registerRun = vi.fn();
-    const tool = makeTool({
-      config: {
-        agents: {
-          defaults: primary,
-          entries: { main: { identity: { name: "Roboclaw" } } },
-        },
-        gateway: {
-          publicOrigin: "https://openclaw.example",
-          controlUi: { basePath: "/control" },
-        },
+it("reports visible spawn policy and its committed receipt", async () => {
+  hoisted.inProcessCreationMock.mockResolvedValue({
+    ...created("restricted-child"),
+    runId: "run-visible-restricted",
+  });
+  const registerRun = vi.fn();
+  const tool = makeTool({
+    config: {
+      agents: {
+        defaults: primary,
+        entries: { main: { identity: { name: "Roboclaw" } } },
       },
-      inheritedToolPolicySource: source,
-      inheritedToolAllowlist: ["read", "sessions_spawn"],
-      inheritedToolDenylist: ["exec"],
-      registerRun,
-    });
-
-    const result = await tool.execute("visible-restricted", {
-      task: "inspect",
-      label: "Track upstream fix",
-      visible: true,
-    });
-
-    if (source === "sender") {
-      expect(result.details).toMatchObject({
-        status: "forbidden",
-        error: "This sender may only start hidden helpers of the same agent.",
-      });
-      expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
-      expect(registerRun).not.toHaveBeenCalled();
-      return;
-    }
-    expect(result.details).toMatchObject({
-      status: "accepted",
-      childSessionKey: "agent:main:dashboard:restricted-child",
-      runId: "run-visible-restricted",
-      sessionUrl: "https://openclaw.example/control/chat/main/dashboard/restricted-child",
-      label: "Track upstream fix",
-      owner: { type: "agent", id: "main", label: "Roboclaw" },
-    });
-    expect(hoisted.inProcessCreationMock).toHaveBeenCalledWith(
-      "sessions.create",
-      expect.objectContaining({
-        agentId: "main",
-        label: "Track upstream fix",
-        parentSessionKey: "agent:main:main",
-        spawnDepth: 1,
-      }),
-      {
-        via: "spawn",
-        actor: { type: "agent", id: "main" },
-        requesterSessionKey: "agent:main:main",
-        requesterSenderIsOwner: false,
-        completionOwnerSessionKey: "agent:main:main",
-        spawnModelAutoSelection: { model: "mock-provider/primary", hasFallbackOrigin: false },
-        inheritedToolPolicy: {
-          version: 1,
-          allow: ["read", "sessions_spawn"],
-          deny: ["exec"],
-        },
+      gateway: {
+        publicOrigin: "https://openclaw.example",
+        controlUi: { basePath: "/control" },
       },
-      undefined,
-    );
-    expectRegisteredSubagentRun(registerRun, {
-      childSessionKey: "agent:main:dashboard:restricted-child",
-      runId: "run-visible-restricted",
-    });
-  },
-);
+    },
+    inheritedToolAllowlist: ["read", "sessions_spawn"],
+    inheritedToolDenylist: ["exec"],
+    registerRun,
+  });
+
+  const result = await tool.execute("visible-restricted", {
+    task: "inspect",
+    label: "Track upstream fix",
+    visible: true,
+  });
+
+  expect(result.details).toMatchObject({
+    status: "accepted",
+    childSessionKey: "agent:main:dashboard:restricted-child",
+    runId: "run-visible-restricted",
+    sessionUrl: "https://openclaw.example/control/chat/main/dashboard/restricted-child",
+    label: "Track upstream fix",
+    owner: { type: "agent", id: "main", label: "Roboclaw" },
+  });
+  expect(hoisted.inProcessCreationMock).toHaveBeenCalledWith(
+    "sessions.create",
+    expect.objectContaining({
+      agentId: "main",
+      label: "Track upstream fix",
+      parentSessionKey: "agent:main:main",
+      spawnDepth: 1,
+    }),
+    {
+      via: "spawn",
+      actor: { type: "agent", id: "main" },
+      requesterSessionKey: "agent:main:main",
+      requesterSenderIsOwner: false,
+      completionOwnerSessionKey: "agent:main:main",
+      spawnModelAutoSelection: { model: "mock-provider/primary", hasFallbackOrigin: false },
+      inheritedToolPolicy: {
+        version: 1,
+        allow: ["read", "sessions_spawn"],
+        deny: ["exec"],
+      },
+    },
+    undefined,
+  );
+  expectRegisteredSubagentRun(registerRun, {
+    childSessionKey: "agent:main:dashboard:restricted-child",
+    runId: "run-visible-restricted",
+  });
+});

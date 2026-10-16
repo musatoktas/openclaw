@@ -46,7 +46,6 @@ const config = {
 } satisfies OpenClawConfig;
 let state: OpenClawTestState;
 let actor: SessionActorStorageBinding;
-const owners: ReturnType<typeof memorySessionActorOwners.get>[] = [];
 const handles: SessionActorStorageBinding[] = [];
 
 beforeAll(async () => {
@@ -65,7 +64,6 @@ beforeAll(async () => {
       agentId,
       path: resolveIncognitoOpenClawAgentSqlitePath({ agentId, env: state.env }),
     });
-    owners.push(owner);
     const handle = await owner.acquire({ database: owner.identity, sessionKey }, lifetime);
     const binding = { actor: handle, authority, agentId, path: owner.path };
     handles.push(binding);
@@ -86,9 +84,6 @@ beforeAll(async () => {
 afterAll(async () => {
   for (const binding of handles) {
     await binding.actor.release();
-  }
-  for (const owner of owners) {
-    memorySessionActorOwners.closeDatabase(owner);
   }
   await state.cleanup();
 });
@@ -178,22 +173,13 @@ it.each([
           ? { status: "accepted", sessionKey: targetKey, delivery: { status: "skipped" } }
           : { status: "error", error: expect.stringMatching(/changed|no longer current/) },
       );
-      expect(
-        callGateway.mock.calls.filter(([request]) => request.method === "agent"),
-      ).toMatchObject([
-        [
-          {
-            params: {
-              sessionKey: targetKey,
-              agentId: "research",
-              inputProvenance: {
-                sourceSessionKey: requesterKey,
-                sourceRole: "subagent",
-              },
-            },
-          },
-        ],
-      ]);
+      const dispatches = callGateway.mock.calls.filter(([request]) => request.method === "agent");
+      expect(dispatches).toHaveLength(1);
+      expect(dispatches[0]?.[0].params).toMatchObject({
+        sessionKey: targetKey,
+        agentId: "research",
+        inputProvenance: { sourceSessionKey: requesterKey, sourceRole: "subagent" },
+      });
       expect(requesterSql).toEqual([]);
       expect(memorySessionActorOwners.list()).toEqual(beforeOwners);
     } finally {

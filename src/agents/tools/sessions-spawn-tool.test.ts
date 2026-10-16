@@ -74,11 +74,9 @@ function registerAcpBackendForTest(healthy = true) {
     id: "acpx",
     healthy: () => healthy,
     runtime: {
-      ensureSession: vi.fn(async () => ({
-        sessionKey: "agent:codex:acp:1",
-        backend: "acpx",
-        runtimeSessionName: "codex",
-      })),
+      ensureSession: vi.fn(async () => {
+        throw new Error("Only the mocked ACP dispatcher may create this session");
+      }),
       async *runTurn() {},
       cancel: vi.fn(async () => {}),
       close: vi.fn(async () => {}),
@@ -546,14 +544,11 @@ it("rejects cross-agent visible transcript forks", async () => {
   expect(callGateway).not.toHaveBeenCalled();
 });
 
-it.each([false, true])("enforces sandbox workspace containment (inside=%s)", async (inside) => {
+it("admits a visible cwd inside the sandbox workspace", async () => {
   await withTestDir({ prefix: "openclaw-visible-sandbox-cwd-" }, async (dir) => {
     const workspace = path.join(dir, "workspace");
-    const cwd = inside ? path.join(workspace, "packages", "app") : path.join(dir, "outside");
-    const callGateway = mockGateway();
-    if (inside) {
-      vi.mocked(callGateway).mockResolvedValue(visibleCreated);
-    }
+    const cwd = path.join(workspace, "packages", "app");
+    const callGateway = mockGateway(visibleCreated);
     const result = await spawnVisible(
       {
         callGateway,
@@ -563,21 +558,12 @@ it.each([false, true])("enforces sandbox workspace containment (inside=%s)", asy
       },
       { cwd },
     );
-    if (inside) {
-      expect(result.details).toMatchObject({
-        status: "accepted",
-        owner: { type: "agent", id: "main" },
-      });
-      expect(result.details).not.toHaveProperty("sessionUrl");
-      expect(callGateway).toHaveBeenCalledWith("sessions.create", expect.objectContaining({ cwd }));
-    } else {
-      expect(result.details).toMatchObject({
-        status: "forbidden",
-        error:
-          "cwd override is not supported outside the target agent workspace for sandboxed visible session runs",
-      });
-      expect(callGateway).not.toHaveBeenCalled();
-    }
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      owner: { type: "agent", id: "main" },
+    });
+    expect(result.details).not.toHaveProperty("sessionUrl");
+    expect(callGateway).toHaveBeenCalledWith("sessions.create", expect.objectContaining({ cwd }));
   });
 });
 

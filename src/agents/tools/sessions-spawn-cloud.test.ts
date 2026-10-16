@@ -130,11 +130,9 @@ it("routes explicit local placement to ACP without creating a cloud session", as
   acpRuntimeRegistry.registerAcpRuntimeBackend({
     id: "placement-test",
     runtime: {
-      ensureSession: vi.fn(async () => ({
-        sessionKey: "agent:reviewer:acp:local",
-        backend: "placement-test",
-        runtimeSessionName: "reviewer",
-      })),
+      ensureSession: vi.fn(async () => {
+        throw new Error("Only the mocked ACP dispatcher may create this session");
+      }),
       async *runTurn() {},
       cancel: vi.fn(async () => {}),
       close: vi.fn(async () => {}),
@@ -226,15 +224,10 @@ it.each([
   const success = failure === "success";
   const os = "windows/wsl2";
   const task = success
-    ? [
-        "Run the platform tests and investigate any failures.",
-        "Preserve the full task and report the relevant test evidence. ".repeat(30),
-        "Include this final paragraph in the cloud worker assignment.",
-      ].join("\n\n")
+    ? `Start\n\n${"Full worker assignment. ".repeat(80)}\n\nEnd`
     : "Test remotely";
   const placement = { state: "active", ...(success ? { environmentId: "cloud-box" } : {}) };
-  const dir = sessionDirs.make();
-  const storePath = path.join(dir, "sessions.json");
+  const storePath = path.join(sessionDirs.make(), "sessions.json");
   const key = "agent:main:dashboard:cloud-child";
   const controller = new AbortController();
   const callGateway = vi.fn(async (method: string, request: Record<string, unknown>) => {
