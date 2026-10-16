@@ -94,24 +94,22 @@ afterAll(async () => {
 });
 
 function gateway(beforeAdmission?: () => Promise<void>) {
-  return vi
-    .fn()
-    .mockImplementation(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-      switch (request.method) {
-        case "sessions.resolve":
-          return { key: targetKey, agentId: "research" };
-        case "sessions.list":
-          return { sessions: [targetSession] };
-        case "sessions.describe":
-          return { session: targetSession };
-        case "agent":
-          await beforeAdmission?.();
-          request.assertDispatchCurrent?.();
-          return { runId: "accepted-private-request", status: "accepted" };
-        default:
-          throw new Error(`Unexpected Gateway request: ${request.method}`);
-      }
-    });
+  return vi.fn(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+    switch (request.method) {
+      case "sessions.resolve":
+        return { key: targetKey, agentId: "research" };
+      case "sessions.list":
+        return { sessions: [targetSession] };
+      case "sessions.describe":
+        return { session: targetSession };
+      case "agent":
+        await beforeAdmission?.();
+        request.assertDispatchCurrent?.();
+        return { runId: "accepted-private-request", status: "accepted" };
+      default:
+        throw new Error(`Unexpected Gateway request: ${request.method}`);
+    }
+  });
 }
 
 it.each([
@@ -180,18 +178,20 @@ it.each([
           ? { status: "accepted", sessionKey: targetKey, delivery: { status: "skipped" } }
           : { status: "error", error: expect.stringMatching(/changed|no longer current/) },
       );
-      expect(callGateway.mock.calls.filter(([request]) => request.method === "agent")).toEqual([
+      expect(
+        callGateway.mock.calls.filter(([request]) => request.method === "agent"),
+      ).toMatchObject([
         [
-          expect.objectContaining({
-            params: expect.objectContaining({
+          {
+            params: {
               sessionKey: targetKey,
               agentId: "research",
-              inputProvenance: expect.objectContaining({
+              inputProvenance: {
                 sourceSessionKey: requesterKey,
                 sourceRole: "subagent",
-              }),
-            }),
-          }),
+              },
+            },
+          },
         ],
       ]);
       expect(requesterSql).toEqual([]);

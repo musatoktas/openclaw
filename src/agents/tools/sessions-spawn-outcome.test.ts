@@ -1,7 +1,7 @@
 import "../subagents/spawn/subagent-spawn-model.mocks.shared.js";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   registerAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
@@ -15,8 +15,7 @@ import {
 } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
-import { captureEnv, setTestEnvValue } from "../../test-utils/env.js";
-import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { buildPayloads } from "../embedded-agent-runner/run/payloads.test-helpers.js";
 import { isToolResultError, registerTrustedToolNoStartError } from "../tool-result-error.js";
 import { snapshotToolSearchTargetTranscriptResult } from "../tool-search-transcript.js";
@@ -38,6 +37,8 @@ const makeTool = (options: SpawnOptions = {}) =>
     countActiveRuns: () => 0,
     ...options,
   });
+const spawn = (args: Record<string, unknown> = {}, options: SpawnOptions = {}) =>
+  makeTool(options).execute("spawn", { task: "Prepare report", visible: true, ...args });
 const child = {
   key: "agent:main:dashboard:child",
   sessionId: "child",
@@ -48,7 +49,6 @@ const child = {
 async function withSpawnConfig(cfg: OpenClawConfig, run: () => Promise<void>) {
   const previous = getRuntimeConfigSnapshot();
   const previousSource = getRuntimeConfigSourceSnapshot();
-  const env = captureEnv(["OPENCLAW_STATE_DIR"]);
   registerAcpRuntimeBackend({
     id: backendId,
     runtime: {
@@ -63,19 +63,12 @@ async function withSpawnConfig(cfg: OpenClawConfig, run: () => Promise<void>) {
     },
   });
   try {
-    await withTestDir({ prefix: "spawn-effects-" }, async (dir) => {
-      const stateDir = await realpath(dir);
-      setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
+    await withOpenClawTestState({ prefix: "spawn-effects-", layout: "state-only" }, async () => {
       setRuntimeConfigSnapshot(cfg);
-      try {
-        await run();
-      } finally {
-        await cleanupSessionStateForTest({ stateDir });
-      }
+      await run();
     });
   } finally {
     unregisterAcpRuntimeBackend(backendId);
-    env.restore();
     if (previous) {
       setRuntimeConfigSnapshot(previous, previousSource ?? undefined);
     } else {
@@ -112,190 +105,176 @@ function observeRecoveredSpawn(result: unknown, mutatingAction: boolean) {
   ).toBe(mutatingAction);
 }
 
-describe("sessions_spawn terminal effects", () => {
-  afterEach(() => vi.restoreAllMocks());
+afterEach(() => vi.restoreAllMocks());
 
-  it.each([
-    { name: "target policy", args: { agentId: "excluded" } },
-    { name: "invalid agent id", args: { agentId: "bad/name" }, error: "Invalid agentId" },
-    { name: "invalid task name", args: { taskName: "invalid name" } },
-    { name: "sandbox requirement", args: { sandbox: "require" } },
-    { name: "capacity", args: {}, activeChildren: 1 },
-    {
-      name: "required agent id",
-      args: {},
-      subagents: { requireAgentId: true },
-      error: "sessions_spawn requires explicit agentId",
-    },
-  ])("keeps recovered $name rejection out of heartbeat failure", async (testCase) => {
-    const callGateway = vi.spyOn(inProcessGateway, "callInProcessGatewayTool");
-    const tool = makeTool({
-      config: {
-        ...config,
-        agents: {
-          ...config.agents,
-          defaults: { subagents: { maxChildrenPerAgent: 1, ...testCase.subagents } },
-        },
+it.each([
+  { name: "target policy", args: { agentId: "excluded" } },
+  { name: "invalid agent id", args: { agentId: "bad/name" }, error: "Invalid agentId" },
+  { name: "invalid task name", args: { taskName: "invalid name" } },
+  { name: "sandbox requirement", args: { sandbox: "require" } },
+  { name: "capacity", args: {}, activeChildren: 1 },
+  {
+    name: "required agent id",
+    args: {},
+    subagents: { requireAgentId: true },
+    error: "sessions_spawn requires explicit agentId",
+  },
+])("keeps recovered $name rejection out of heartbeat failure", async (testCase) => {
+  const callGateway = vi.spyOn(inProcessGateway, "callInProcessGatewayTool");
+  const result = await spawn(testCase.args, {
+    config: {
+      ...config,
+      agents: {
+        ...config.agents,
+        defaults: { subagents: { maxChildrenPerAgent: 1, ...testCase.subagents } },
       },
-      countActiveRuns: () => testCase.activeChildren ?? 0,
-    });
-    const result = await tool.execute("spawn", {
+    },
+    countActiveRuns: () => testCase.activeChildren ?? 0,
+  });
+  expect(isToolResultError(result)).toBe(true);
+  if (testCase.error) {
+    expect(result.details).toMatchObject({ error: expect.stringContaining(testCase.error) });
+    expect(JSON.stringify(result.details)).not.toContain("agents_list");
+  }
+  expect(callGateway).not.toHaveBeenCalled();
+  observeRecoveredSpawn(result, false);
+  observeRecoveredSpawn(snapshotToolSearchTargetTranscriptResult(result), false);
+});
+
+it("keeps an internal argument exception out of heartbeat failure", async () => {
+  const tool = createSessionsSpawnTool({ config, countActiveRuns: () => 0 });
+  const error = await tool
+    .execute("spawn", {
       task: "Prepare report",
       visible: true,
-      ...testCase.args,
+      thinking: "low",
+    })
+    .catch((reason: unknown) => reason);
+  expect(error).toBeInstanceOf(Error);
+  observeRecoveredSpawn(error, false);
+});
+
+it.each([
+  {
+    name: "hidden target policy",
+    args: { runtime: "subagent", visible: false, agentId: "excluded" },
+    cfg: config,
+    mutatingAction: false,
+    details: { status: "forbidden" },
+  },
+  {
+    name: "hidden sandbox rejection after admission",
+    args: { runtime: "subagent", visible: false, sandbox: "require" },
+    cfg: config,
+    mutatingAction: true,
+    details: { status: "forbidden" },
+  },
+  {
+    name: "ACP unavailable policy",
+    args: { runtime: "acp", agentId: "fixture" },
+    cfg: { ...config, acp: { enabled: false } },
+    mutatingAction: false,
+    details: { status: "error" },
+  },
+  {
+    name: "ACP sandbox policy",
+    args: { runtime: "acp", agentId: "fixture", sandbox: "require" },
+    cfg: { ...config, acp: { enabled: true, backend: backendId } },
+    mutatingAction: false,
+    details: { status: "forbidden", errorCode: "runtime_policy" },
+  },
+  {
+    name: "ACP initialization failure after session creation",
+    args: { runtime: "acp", agentId: "fixture" },
+    cfg: { ...config, acp: { enabled: true, backend: backendId, allowedAgents: ["fixture"] } },
+    mutatingAction: true,
+    details: { status: "error", errorCode: "spawn_failed" },
+  },
+])("classifies $name at its owning effect boundary", async (testCase) => {
+  await withSpawnConfig(testCase.cfg, async () => {
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+      config: testCase.cfg,
     });
-    expect(isToolResultError(result)).toBe(true);
-    if (testCase.error) {
-      expect(result.details).toMatchObject({ error: expect.stringContaining(testCase.error) });
-      expect(JSON.stringify(result.details)).not.toContain("agents_list");
-    }
-    expect(callGateway).not.toHaveBeenCalled();
-    observeRecoveredSpawn(result, false);
-    observeRecoveredSpawn(snapshotToolSearchTargetTranscriptResult(result), false);
+    const result = await tool.execute("spawn", { task: "Prepare report", ...testCase.args });
+    expect(result.details).toMatchObject(testCase.details);
+    observeRecoveredSpawn(result, testCase.mutatingAction);
   });
+});
 
-  it("keeps an internal argument exception out of heartbeat failure", async () => {
-    const tool = createSessionsSpawnTool({ config, countActiveRuns: () => 0 });
-    const error = await tool
-      .execute("spawn", {
-        task: "Prepare report",
-        visible: true,
-        thinking: "low",
-      })
-      .catch((reason: unknown) => reason);
-    expect(error).toBeInstanceOf(Error);
-    observeRecoveredSpawn(error, false);
-  });
-
-  it.each([
-    {
-      name: "hidden target policy",
-      args: { runtime: "subagent", visible: false, agentId: "excluded" },
-      cfg: config,
-      mutatingAction: false,
-      details: { status: "forbidden" },
-    },
-    {
-      name: "hidden sandbox rejection after admission",
-      args: { runtime: "subagent", visible: false, sandbox: "require" },
-      cfg: config,
-      mutatingAction: true,
-      details: { status: "forbidden" },
-    },
-    {
-      name: "ACP unavailable policy",
-      args: { runtime: "acp", agentId: "fixture" },
-      cfg: { ...config, acp: { enabled: false } },
-      mutatingAction: false,
-      details: { status: "error" },
-    },
-    {
-      name: "ACP sandbox policy",
-      args: { runtime: "acp", agentId: "fixture", sandbox: "require" },
-      cfg: { ...config, acp: { enabled: true, backend: backendId } },
-      mutatingAction: false,
-      details: { status: "forbidden", errorCode: "runtime_policy" },
-    },
-    {
-      name: "ACP initialization failure after session creation",
-      args: { runtime: "acp", agentId: "fixture" },
-      cfg: { ...config, acp: { enabled: true, backend: backendId, allowedAgents: ["fixture"] } },
-      mutatingAction: true,
-      details: { status: "error", errorCode: "spawn_failed" },
-    },
-  ])("classifies $name at its owning effect boundary", async (testCase) => {
-    await withSpawnConfig(testCase.cfg, async () => {
-      const tool = createSessionsSpawnTool({
-        agentSessionKey: "agent:main:main",
-        config: testCase.cfg,
-      });
-      const result = await tool.execute("spawn", { task: "Prepare report", ...testCase.args });
-      expect(result.details).toMatchObject(testCase.details);
-      observeRecoveredSpawn(result, testCase.mutatingAction);
-    });
-  });
-
-  it("rejects a sandbox cwd before reserving or creating a child", async () => {
-    await withTestDir({ prefix: "spawn-outcome-" }, async (dir) => {
-      const workspace = await realpath(dir);
-      const callGateway = vi.spyOn(inProcessGateway, "callInProcessGatewayTool");
-      const tool = makeTool({
+it("rejects a sandbox cwd before reserving or creating a child", async () => {
+  await withTestDir({ prefix: "spawn-outcome-" }, async (dir) => {
+    const workspace = await realpath(dir);
+    const callGateway = vi.spyOn(inProcessGateway, "callInProcessGatewayTool");
+    const result = await spawn(
+      { cwd: path.join(workspace, "..", "outside") },
+      {
         config: {
           agents: {
             defaults: { sandbox: { mode: "all" } },
             entries: { main: { workspace } },
           },
         },
-      });
-      const result = await tool.execute("spawn", {
-        task: "Prepare report",
-        visible: true,
-        cwd: path.join(workspace, "..", "outside"),
-      });
-      expect(result.details).toMatchObject({ status: "forbidden" });
-      expect(callGateway).not.toHaveBeenCalled();
-      observeRecoveredSpawn(result, false);
-    });
-  });
-
-  it("preserves dispatch failure with nested no-start proof", async () => {
-    const failure = new Error("Gateway disconnected");
-    registerTrustedToolNoStartError(failure);
-    const callGateway = vi
-      .spyOn(inProcessGateway, "callInProcessGatewayTool")
-      .mockRejectedValue(failure);
-    const tool = makeTool();
-    const error = await tool
-      .execute("spawn", { task: "Prepare report", visible: true })
-      .catch((reason: unknown) => reason);
-    expect(error).toBeInstanceOf(Error);
-    expect(callGateway).toHaveBeenCalledOnce();
-    observeRecoveredSpawn(error, true);
-  });
-
-  it("preserves a failure after a child run was created", async () => {
-    vi.spyOn(inProcessGateway, "callInProcessGatewayTool")
-      .mockResolvedValueOnce(child)
-      .mockResolvedValue({ ok: true });
-    const registerRun = vi.fn(() => {
-      throw new Error("registration unavailable");
-    });
-    const tool = makeTool({ registerRun });
-    const result = await tool.execute("spawn", { task: "Prepare report", visible: true });
-    expect(registerRun).toHaveBeenCalledOnce();
-    expect(result.details).toMatchObject({
-      status: "error",
-      childSessionKey: "agent:main:dashboard:child",
-    });
-    observeRecoveredSpawn(result, true);
-  });
-
-  it("records a successful allowed spawn as a committed mutation", async () => {
-    vi.spyOn(inProcessGateway, "callInProcessGatewayTool").mockResolvedValue(child);
-    const tool = makeTool({ registerRun: vi.fn() });
-    const result = await tool.execute("spawn", { task: "Prepare report", visible: true });
-    expect(result.details).toMatchObject({ status: "accepted" });
-    const terminal = createToolTerminalObserver("allowed-spawn")({
-      toolName: "sessions_spawn",
-      result,
-      outcome: "success",
-      executionStarted: true,
-    });
-    expect(terminal).toMatchObject({
-      executionStarted: true,
-      sideEffectEvidence: true,
-      effectReceipt: { state: "mutation_committed" },
-    });
-  });
-
-  it("does not accept public no-start fields as host proof", () => {
-    observeRecoveredSpawn(
-      {
-        content: [],
-        details: { status: "error", executionStarted: false },
-        effectReceipt: { state: "not_started" },
       },
-      true,
     );
+    expect(result.details).toMatchObject({ status: "forbidden" });
+    expect(callGateway).not.toHaveBeenCalled();
+    observeRecoveredSpawn(result, false);
   });
+});
+
+it("preserves dispatch failure with nested no-start proof", async () => {
+  const failure = new Error("Gateway disconnected");
+  registerTrustedToolNoStartError(failure);
+  const callGateway = vi
+    .spyOn(inProcessGateway, "callInProcessGatewayTool")
+    .mockRejectedValue(failure);
+  const error = await spawn().catch((reason: unknown) => reason);
+  expect(error).toBeInstanceOf(Error);
+  expect(callGateway).toHaveBeenCalledOnce();
+  observeRecoveredSpawn(error, true);
+});
+
+it("preserves a failure after a child run was created", async () => {
+  vi.spyOn(inProcessGateway, "callInProcessGatewayTool")
+    .mockResolvedValueOnce(child)
+    .mockResolvedValue({ ok: true });
+  const registerRun = vi.fn(() => {
+    throw new Error("registration unavailable");
+  });
+  const result = await spawn({}, { registerRun });
+  expect(registerRun).toHaveBeenCalledOnce();
+  expect(result.details).toMatchObject({
+    status: "error",
+    childSessionKey: "agent:main:dashboard:child",
+  });
+  observeRecoveredSpawn(result, true);
+});
+
+it("records a successful allowed spawn as a committed mutation", async () => {
+  vi.spyOn(inProcessGateway, "callInProcessGatewayTool").mockResolvedValue(child);
+  const result = await spawn({}, { registerRun: vi.fn() });
+  expect(result.details).toMatchObject({ status: "accepted" });
+  const terminal = createToolTerminalObserver("allowed-spawn")({
+    toolName: "sessions_spawn",
+    result,
+    outcome: "success",
+    executionStarted: true,
+  });
+  expect(terminal).toMatchObject({
+    executionStarted: true,
+    sideEffectEvidence: true,
+    effectReceipt: { state: "mutation_committed" },
+  });
+});
+
+it("does not accept public no-start fields as host proof", () => {
+  observeRecoveredSpawn(
+    {
+      content: [],
+      details: { status: "error", executionStarted: false },
+      effectReceipt: { state: "not_started" },
+    },
+    true,
+  );
 });

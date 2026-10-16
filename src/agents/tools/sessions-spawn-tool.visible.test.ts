@@ -1,5 +1,5 @@
 import "./sessions-spawn-tool.mocks.test-support.js";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, expect, it, vi } from "vitest";
 import {
   bindChildSessionPublication,
   admitChildSessionPublication,
@@ -35,35 +35,32 @@ const created = (name: string, agent = "main") => ({
 });
 const primary = { model: "mock-provider/primary" };
 
-describe("sessions_spawn visible work receipts", () => {
-  beforeAll(async () => {
-    ({ createSessionsSpawnTool } = await import("./sessions-spawn-tool.js"));
-  });
+beforeAll(async () => {
+  ({ createSessionsSpawnTool } = await import("./sessions-spawn-tool.js"));
+});
 
-  beforeEach(() => {
-    hoisted.prepareModelChoiceMock.mockReset().mockImplementation(supportedSpawnModelChoice);
-    hoisted.inProcessCreationMock.mockReset();
-    hoisted.spawnSubagentDirectMock.mockReset().mockResolvedValue({
-      status: "accepted",
-      childSessionKey: "agent:other:subagent:helper",
-      runId: "native-child",
-      context: "isolated",
-    });
-    hoisted.spawnAcpDirectMock.mockReset();
-  });
+beforeEach(() => {
+  hoisted.prepareModelChoiceMock.mockReset().mockImplementation(supportedSpawnModelChoice);
+  hoisted.inProcessCreationMock.mockReset();
+  hoisted.spawnSubagentDirectMock.mockReset();
+  hoisted.spawnAcpDirectMock.mockReset();
+});
 
-  it("delegates an explicitly granted coding target without the front-door local tool ceiling", async () => {
-    hoisted.inProcessCreationMock.mockResolvedValue({
-      ...created("coding-child", "worker"),
-      sessionId: "coding-child-session",
-    });
+it.each([true, false])(
+  "accepts only host-granted coding delegation (granted=%s)",
+  async (granted) => {
+    hoisted.inProcessCreationMock.mockResolvedValue(created("coding-child", "worker"));
+    const deny = granted ? ["exec", "write", "edit", "apply_patch"] : ["exec"];
     const config = {
       agents: {
         defaults: primary,
         entries: {
           main: {
-            tools: { deny: ["exec", "write", "edit", "apply_patch"] },
-            subagents: { allowAgents: ["worker"], delegateToolsTo: ["worker"] },
+            ...(granted ? { tools: { deny } } : {}),
+            subagents: {
+              allowAgents: ["worker"],
+              ...(granted ? { delegateToolsTo: ["worker"] } : {}),
+            },
           },
           worker: {},
         },
@@ -71,23 +68,40 @@ describe("sessions_spawn visible work receipts", () => {
     };
     const tool = makeTool({
       config,
-      senderIsOwner: true,
-      delegatedToolDenyFloor: prepareDelegatedToolDenyFloor(
-        resolveConversationCapabilityProfile({
-          config,
-          agentId: "main",
-          sessionKey: "agent:main:main",
-        }),
-      ),
-      inheritedToolDenylist: ["exec", "write", "edit", "apply_patch"],
+      ...(granted
+        ? {
+            senderIsOwner: true,
+            delegatedToolDenyFloor: prepareDelegatedToolDenyFloor(
+              resolveConversationCapabilityProfile({
+                config,
+                agentId: "main",
+                sessionKey: "agent:main:main",
+              }),
+            ),
+          }
+        : {}),
+      inheritedToolDenylist: deny,
     });
     const result = await tool.execute("authorized-coding-handoff", {
       task: "Implement and test the requested repository fix",
       agentId: "worker",
       visible: true,
+      ...(granted
+        ? {}
+        : {
+            delegateToolsTo: ["worker"],
+            delegatedToolDenyFloor: { deny: [] },
+            delegatedToolPolicy: { requesterAgentId: "main", targetAgentId: "worker", deny: [] },
+          }),
     });
     expect(result.details).toMatchObject({ status: "accepted" });
-    expect(hoisted.inProcessCreationMock.mock.calls[0]?.[2]).toMatchObject({
+    const creation = hoisted.inProcessCreationMock.mock.calls[0]?.[2];
+    if (!granted) {
+      expect(creation.inheritedToolPolicy).toMatchObject({ deny: ["exec"] });
+      expect(creation.inheritedToolPolicy.delegatedToolPolicy).toBeUndefined();
+      return;
+    }
+    expect(creation).toMatchObject({
       inheritedToolPolicy: {
         version: 1,
         allow: [],
@@ -99,208 +113,180 @@ describe("sessions_spawn visible work receipts", () => {
         }),
       },
     });
-  });
+  },
+);
 
-  it.each(["subagent", "acp"])("refuses another agent before dispatching %s", async (runtime) => {
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      senderIsOwner: true,
-      config: {
-        agents: {
-          entries: {
-            main: { subagents: { allowAgents: ["other"], delegateToolsTo: ["other"] } },
-            other: {},
-          },
+it.each(["subagent", "acp"])("refuses another agent before dispatching %s", async (runtime) => {
+  const tool = createSessionsSpawnTool({
+    agentSessionKey: "agent:main:main",
+    senderIsOwner: true,
+    config: {
+      agents: {
+        entries: {
+          main: { subagents: { allowAgents: ["other"], delegateToolsTo: ["other"] } },
+          other: {},
         },
       },
-      delegatedToolDenyFloor: { policyAgentId: "main", deny: [] },
-      inheritedToolPolicySource: "sender",
-      inheritedToolAllowlist: ["read", "sessions_spawn"],
-    });
-    const result = await tool.execute("restricted-cross-agent", {
-      task: "inspect",
-      runtime,
-      agentId: "other",
-    });
-    expect(result.details).toMatchObject({
-      status: "forbidden",
-      error: "This sender may only start hidden helpers of the same agent.",
-    });
-    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
-    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
-    expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
+    },
+    delegatedToolDenyFloor: { policyAgentId: "main", deny: [] },
+    inheritedToolPolicySource: "sender",
+    inheritedToolAllowlist: ["read", "sessions_spawn"],
+  });
+  const result = await tool.execute("restricted-cross-agent", {
+    task: "inspect",
+    runtime,
+    agentId: "other",
+  });
+  expect(result.details).toMatchObject({
+    status: "forbidden",
+    error: "This sender may only start hidden helpers of the same agent.",
+  });
+  expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
+  expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
+  expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
+});
+
+it("carries only host invocation intent to creation and reports the exact committed publication", async () => {
+  const key = "agent:main:main";
+  const context = {};
+  const run = { runId: "public-source", instanceId: "public-source-instance" };
+  bindChildSessionPublication(context, key, () => {});
+  admitChildSessionPublication(context, run, () => {});
+  const publication = readChildSessionPublication(run);
+  hoisted.inProcessCreationMock.mockResolvedValue({
+    ...created("public-child"),
+    publicRead: true,
+    entry: { sessionId: "public-child", updatedAt: 1 },
+  });
+  const tool = makeTool({
+    agentSessionKey: key,
+    config: { agents: { defaults: primary, entries: { main: {} } } },
+  });
+  const result = await withGatewayToolCallerIdentity(
+    { agentId: "main", sessionKey: key, operationalRunInstance: run },
+    () => tool.execute("public-spawn", { task: "inspect", visible: true }),
+  );
+  expect(hoisted.inProcessCreationMock.mock.calls[0]?.[2]).toMatchObject({
+    childSessionPublication: publication,
+  });
+  expect(hoisted.inProcessCreationMock.mock.calls[0]?.[1]).not.toHaveProperty(
+    "childSessionPublication",
+  );
+  expect(result.details).toMatchObject({ status: "accepted", publicRead: true });
+});
+
+it("keeps visible child quotas separate for agents sharing a bare requester key", async () => {
+  hoisted.prepareModelChoiceMock.mockResolvedValue({
+    kind: "automatic",
+    ref: { provider: "mock-provider", model: "primary" },
+  });
+  const otherAgentRun = createSubagentRunRecord({
+    runId: "other-agent-run",
+    childSessionKey: "agent:other:subagent:child",
+    requesterSessionKey: "global",
+    requesterAgentId: "other",
+    createdAt: Date.now(),
+  });
+  const runs = new Map([[otherAgentRun.runId, otherAgentRun]]);
+  hoisted.inProcessCreationMock.mockResolvedValue(created("quota-child"));
+  const tool = makeTool({
+    agentSessionKey: "global",
+    requesterAgentIdOverride: "main",
+    config: {
+      session: { scope: "global" },
+      agents: {
+        defaults: {
+          ...primary,
+          subagents: { maxChildrenPerAgent: 1 },
+        },
+        entries: { main: {}, other: {} },
+      },
+    },
+    countActiveRuns: (key, options) => countActiveRunsForSessionFromRuns(runs, key, options),
   });
 
-  it("does not accept a delegated ceiling or grant from model arguments", async () => {
+  const result = await tool.execute("visible-bare-key-quota", {
+    task: "inspect the repository",
+    visible: true,
+  });
+
+  expect(result.details).toMatchObject({ status: "accepted", runId: "quota-child-run" });
+});
+
+it.each([undefined, "sender"] as const)(
+  "applies visible spawn policy for source %s",
+  async (source) => {
     hoisted.inProcessCreationMock.mockResolvedValue({
-      ...created("ordinary-child", "worker"),
-      sessionId: "ordinary-child-session",
+      ...created("restricted-child"),
+      runId: "run-visible-restricted",
     });
+    const registerRun = vi.fn();
     const tool = makeTool({
       config: {
         agents: {
           defaults: primary,
-          entries: { main: { subagents: { allowAgents: ["worker"] } }, worker: {} },
+          entries: { main: { identity: { name: "Roboclaw" } } },
+        },
+        gateway: {
+          publicOrigin: "https://openclaw.example",
+          controlUi: { basePath: "/control" },
         },
       },
+      inheritedToolPolicySource: source,
+      inheritedToolAllowlist: ["read", "sessions_spawn"],
       inheritedToolDenylist: ["exec"],
+      registerRun,
     });
-    const result = await tool.execute("forged-delegation", {
+
+    const result = await tool.execute("visible-restricted", {
       task: "inspect",
-      agentId: "worker",
+      label: "Track upstream fix",
       visible: true,
-      delegateToolsTo: ["worker"],
-      delegatedToolDenyFloor: { deny: [] },
-      delegatedToolPolicy: { requesterAgentId: "main", targetAgentId: "worker", deny: [] },
     });
-    expect(result.details).toMatchObject({ status: "accepted" });
-    const creation = hoisted.inProcessCreationMock.mock.calls[0]?.[2];
-    expect(creation.inheritedToolPolicy).toMatchObject({ deny: ["exec"] });
-    expect(creation.inheritedToolPolicy.delegatedToolPolicy).toBeUndefined();
-  });
 
-  it("carries only host invocation intent to creation and reports the exact committed publication", async () => {
-    const key = "agent:main:main";
-    const context = {};
-    const run = { runId: "public-source", instanceId: "public-source-instance" };
-    bindChildSessionPublication(context, key, () => {});
-    admitChildSessionPublication(context, run, () => {});
-    const publication = readChildSessionPublication(run);
-    hoisted.inProcessCreationMock.mockResolvedValue({
-      ...created("public-child"),
-      publicRead: true,
-      entry: { sessionId: "public-child", updatedAt: 1 },
+    if (source === "sender") {
+      expect(result.details).toMatchObject({
+        status: "forbidden",
+        error: "This sender may only start hidden helpers of the same agent.",
+      });
+      expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
+      expect(registerRun).not.toHaveBeenCalled();
+      return;
+    }
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      childSessionKey: "agent:main:dashboard:restricted-child",
+      runId: "run-visible-restricted",
+      sessionUrl: "https://openclaw.example/control/chat/main/dashboard/restricted-child",
+      label: "Track upstream fix",
+      owner: { type: "agent", id: "main", label: "Roboclaw" },
     });
-    const tool = makeTool({
-      agentSessionKey: key,
-      config: { agents: { defaults: primary, entries: { main: {} } } },
-    });
-    const result = await withGatewayToolCallerIdentity(
-      { agentId: "main", sessionKey: key, operationalRunInstance: run },
-      () => tool.execute("public-spawn", { task: "inspect", visible: true }),
-    );
-    expect(hoisted.inProcessCreationMock.mock.calls[0]?.[2]).toMatchObject({
-      childSessionPublication: publication,
-    });
-    expect(hoisted.inProcessCreationMock.mock.calls[0]?.[1]).not.toHaveProperty(
-      "childSessionPublication",
-    );
-    expect(result.details).toMatchObject({ status: "accepted", publicRead: true });
-  });
-
-  it("keeps visible child quotas separate for agents sharing a bare requester key", async () => {
-    hoisted.prepareModelChoiceMock.mockResolvedValue({
-      kind: "automatic",
-      ref: { provider: "mock-provider", model: "primary" },
-    });
-    const otherAgentRun = createSubagentRunRecord({
-      runId: "other-agent-run",
-      childSessionKey: "agent:other:subagent:child",
-      requesterSessionKey: "global",
-      requesterAgentId: "other",
-      createdAt: Date.now(),
-    });
-    const runs = new Map([[otherAgentRun.runId, otherAgentRun]]);
-    hoisted.inProcessCreationMock.mockResolvedValue(created("quota-child"));
-    const tool = makeTool({
-      agentSessionKey: "global",
-      requesterAgentIdOverride: "main",
-      config: {
-        session: { scope: "global" },
-        agents: {
-          defaults: {
-            ...primary,
-            subagents: { maxChildrenPerAgent: 1 },
-          },
-          entries: { main: {}, other: {} },
+    expect(hoisted.inProcessCreationMock).toHaveBeenCalledWith(
+      "sessions.create",
+      expect.objectContaining({
+        agentId: "main",
+        label: "Track upstream fix",
+        parentSessionKey: "agent:main:main",
+        spawnDepth: 1,
+      }),
+      {
+        via: "spawn",
+        actor: { type: "agent", id: "main" },
+        requesterSessionKey: "agent:main:main",
+        requesterSenderIsOwner: false,
+        completionOwnerSessionKey: "agent:main:main",
+        spawnModelAutoSelection: { model: "mock-provider/primary", hasFallbackOrigin: false },
+        inheritedToolPolicy: {
+          version: 1,
+          allow: ["read", "sessions_spawn"],
+          deny: ["exec"],
         },
       },
-      countActiveRuns: (key, options) => countActiveRunsForSessionFromRuns(runs, key, options),
+      undefined,
+    );
+    expectRegisteredSubagentRun(registerRun, {
+      childSessionKey: "agent:main:dashboard:restricted-child",
+      runId: "run-visible-restricted",
     });
-
-    const result = await tool.execute("visible-bare-key-quota", {
-      task: "inspect the repository",
-      visible: true,
-    });
-
-    expect(result.details).toMatchObject({ status: "accepted", runId: "quota-child-run" });
-  });
-
-  it.each([undefined, "sender"] as const)(
-    "applies visible spawn policy for source %s",
-    async (source) => {
-      hoisted.inProcessCreationMock.mockResolvedValue({
-        ...created("restricted-child"),
-        runId: "run-visible-restricted",
-      });
-      const registerRun = vi.fn();
-      const tool = makeTool({
-        config: {
-          agents: {
-            defaults: primary,
-            entries: { main: { identity: { name: "Roboclaw" } } },
-          },
-          gateway: {
-            publicOrigin: "https://openclaw.example",
-            controlUi: { basePath: "/control" },
-          },
-        },
-        inheritedToolPolicySource: source,
-        inheritedToolAllowlist: ["read", "sessions_spawn"],
-        inheritedToolDenylist: ["exec"],
-        registerRun,
-      });
-
-      const result = await tool.execute("visible-restricted", {
-        task: "inspect",
-        label: "Track upstream fix",
-        visible: true,
-      });
-
-      if (source === "sender") {
-        expect(result.details).toMatchObject({
-          status: "forbidden",
-          error: "This sender may only start hidden helpers of the same agent.",
-        });
-        expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
-        expect(registerRun).not.toHaveBeenCalled();
-        return;
-      }
-      expect(result.details).toMatchObject({
-        status: "accepted",
-        childSessionKey: "agent:main:dashboard:restricted-child",
-        runId: "run-visible-restricted",
-        sessionUrl: "https://openclaw.example/control/chat/main/dashboard/restricted-child",
-        label: "Track upstream fix",
-        owner: { type: "agent", id: "main", label: "Roboclaw" },
-      });
-      expect(hoisted.inProcessCreationMock).toHaveBeenCalledWith(
-        "sessions.create",
-        expect.objectContaining({
-          agentId: "main",
-          label: "Track upstream fix",
-          parentSessionKey: "agent:main:main",
-          spawnDepth: 1,
-        }),
-        {
-          via: "spawn",
-          actor: { type: "agent", id: "main" },
-          requesterSessionKey: "agent:main:main",
-          requesterSenderIsOwner: false,
-          completionOwnerSessionKey: "agent:main:main",
-          spawnModelAutoSelection: { model: "mock-provider/primary", hasFallbackOrigin: false },
-          inheritedToolPolicy: {
-            version: 1,
-            allow: ["read", "sessions_spawn"],
-            deny: ["exec"],
-          },
-        },
-        undefined,
-      );
-      expectRegisteredSubagentRun(registerRun, {
-        childSessionKey: "agent:main:dashboard:restricted-child",
-        runId: "run-visible-restricted",
-      });
-    },
-  );
-});
+  },
+);
