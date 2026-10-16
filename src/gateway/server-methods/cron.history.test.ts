@@ -13,7 +13,6 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { cronRunLogEntryToDetail } from "../../cron/run-history-detail.js";
 import type { CronService } from "../../cron/service.js";
 import { cronStoreKey } from "../../cron/store/key.js";
 import * as cronReadOnly from "../../cron/store/read-only.js";
@@ -21,7 +20,6 @@ import {
   applyCronRunHistoryMaintenanceInDatabase,
   planCronRunHistoryMaintenance,
   readCronRunRecordsInDatabase,
-  recordCronRunInDatabase,
 } from "../../cron/store/run-history.kernel.js";
 import type { CronRunHistoryWrite } from "../../cron/store/run-history.types.js";
 import { prepareCronRunReceiptWriteSchema } from "../../cron/store/run-receipt-write-admission.js";
@@ -45,7 +43,13 @@ import { prepareGatewayRecipientProfile } from "../expected-profile.js";
 import { operatorSessionCap } from "../operator-role-policy.js";
 import { sharingPolicyClient } from "../session-sharing.test-utils.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
-import { callCron as invokeCron, createReadService } from "./cron-read.test-support.js";
+import {
+  callCron as invokeCron,
+  createReadService,
+  createHistoryJob,
+  historyRecord,
+  persistRuns as persistHistory,
+} from "./cron-read.test-support.js";
 import { disposeSessionReadContexts } from "./sessions-read-cache.test-support.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
@@ -59,14 +63,6 @@ const limitedConfig = (): OpenClawConfig => ({
     },
   },
 });
-
-function recordDetail(record: CronRunHistoryWrite) {
-  const detail = expectDefined(record.detail, "record detail");
-  if (typeof detail !== "object" || Array.isArray(detail)) {
-    throw new Error("Expected detail object");
-  }
-  return detail;
-}
 
 async function callCron(
   context: GatewayRequestHandlerOptions["context"],
@@ -109,7 +105,9 @@ function expectMessages(page: { payload?: CronHistoryResult }, ...contents: stri
   expect(page.payload?.messages).toMatchObject(contents.map((content) => ({ content })));
 }
 
-async function withHistoryState(run: () => Promise<void>) {
+async function withCronTranscript(
+  run: (fixture: Awaited<ReturnType<typeof setup>>) => Promise<void>,
+) {
   let registry: ReturnType<typeof captureActivePluginRegistrySnapshot> | undefined;
   try {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -117,7 +115,12 @@ async function withHistoryState(run: () => Promise<void>) {
       registry = captureActivePluginRegistrySnapshot();
       setActivePluginRegistry(createEmptyPluginRegistry());
       try {
-        await run();
+        const fixture = await setup();
+        try {
+          await run(fixture);
+        } finally {
+          fixture.cron.stop();
+        }
       } finally {
         await disposeSessionReadContexts();
       }
@@ -127,27 +130,6 @@ async function withHistoryState(run: () => Promise<void>) {
       restoreActivePluginRegistrySnapshot(registry);
     }
   }
-}
-
-function persistHistory(records: CronRunHistoryWrite[]) {
-  runOpenClawStateWriteTransaction(({ db }) => {
-    for (const record of records) {
-      recordCronRunInDatabase(db, record);
-    }
-  });
-}
-
-async function withCronTranscript(
-  run: (fixture: Awaited<ReturnType<typeof setup>>) => Promise<void>,
-) {
-  await withHistoryState(async () => {
-    const fixture = await setup();
-    try {
-      await run(fixture);
-    } finally {
-      fixture.cron.stop();
-    }
-  });
 }
 
 async function setup() {
@@ -199,44 +181,34 @@ async function setup() {
     requestHeartbeat() {},
     runIsolatedAgentJob: async () => ({ status: "ok" }),
   });
-  const created = await cron.add(
-    {
-      name: "History job",
-      agentId: "main",
-      owner: { agentId: "main", sessionKey: baseKey },
-      schedule: { kind: "every", everyMs: 60_000 },
-      enabled: false,
-      sessionTarget: "isolated",
-      wakeMode: "next-heartbeat",
-      payload: { kind: "agentTurn", message: "fixture" },
-      delivery: { mode: "none" },
-    },
-    { scheduledToolPolicy: { version: 1, mode: "trusted" } },
-  );
+  const created = await cron.add(createHistoryJob("main", baseKey, "History job"), {
+    scheduledToolPolicy: { version: 1, mode: "trusted" },
+  });
   const job = "job" in created ? created.job : created;
-  const record: CronRunHistoryWrite = {
-    storeKey: cronStoreKey(storePath),
-    jobId: job.id,
-    runId: "internal-old-run",
-    sessionKey: alias,
-    agentId: "main",
-    startedAt: 10,
-    endedAt: 20,
-    status: "succeeded",
-    detail: cronRunLogEntryToDetail(
-      {
-        jobId: job.id,
-        action: "finished",
-        ts: 20,
-        runAtMs: 10,
-        runId: "public-old-run",
-        sessionKey: alias,
-        sessionId: oldScope.sessionId,
-        status: "ok",
-      },
-      { storeKey: cronStoreKey(storePath) },
-    ),
-  };
+  const record = historyRecord(
+    {
+      jobId: job.id,
+      action: "finished",
+      ts: 20,
+      runAtMs: 10,
+      runId: "public-old-run",
+      sessionKey: alias,
+      sessionId: oldScope.sessionId,
+      status: "ok",
+    },
+    storePath,
+    "main",
+    "internal-old-run",
+  );
+  const detail = expectDefined(record.detail, "record detail");
+  if (typeof detail !== "object" || Array.isArray(detail)) {
+    throw new Error("Expected detail object");
+  }
+  const withDetail = (patch: typeof detail, fields: Partial<CronRunHistoryWrite> = {}) => ({
+    ...record,
+    ...fields,
+    detail: { ...detail, ...patch },
+  });
   persistHistory([record]);
   const context = await createHistoryReadContext({ cron, cronStorePath: storePath });
   const query = async (
@@ -257,31 +229,33 @@ async function setup() {
     latest,
     job,
     record,
-    context,
+    detail,
+    withDetail,
     query,
     profile,
   };
 }
 
-it("pages the exact archived Cron generation for a limited caller without main-thread SQL", async () => {
-  await withCronTranscript(
-    async ({ job, query, cron, storePath, profile, record, alias, oldScope }) => {
-      const detail = recordDetail(record);
+it("pages the exact archived Cron generation for a limited caller without main-thread SQL", () =>
+  withCronTranscript(
+    async ({ job, query, cron, storePath, profile, record, withDetail, alias, oldScope }) => {
       const recoveryMarker = "cron-recovery-only:";
       persistHistory(
-        Array.from({ length: 32 }, (_, index) => ({
-          ...record,
-          runId: index === 0 ? record.runId : `internal-payload-${index}`,
-          startedAt: index === 0 ? record.startedAt : 30 + index,
-          endedAt: index === 0 ? record.endedAt : 40 + index,
-          detail: {
-            ...detail,
-            runId: index === 0 ? "public-old-run" : `public-payload-${index}`,
-            runAtMs: index === 0 ? 10 : 30 + index,
-            scriptStateChanged: true,
-            scriptState: `${recoveryMarker}${index}:` + "x".repeat(64 * 1024),
-          },
-        })),
+        Array.from({ length: 32 }, (_, index) =>
+          withDetail(
+            {
+              runId: index === 0 ? "public-old-run" : `public-payload-${index}`,
+              runAtMs: index === 0 ? 10 : 30 + index,
+              scriptStateChanged: true,
+              scriptState: `${recoveryMarker}${index}:` + "x".repeat(64 * 1024),
+            },
+            {
+              runId: index === 0 ? record.runId : `internal-payload-${index}`,
+              startedAt: index === 0 ? record.startedAt : 30 + index,
+              endedAt: index === 0 ? record.endedAt : 40 + index,
+            },
+          ),
+        ),
       );
       const stored = runOpenClawStateWriteTransaction(
         ({ db }) => readCronRunRecordsInDatabase(db, job.id, record.runId)[0],
@@ -360,24 +334,18 @@ it("pages the exact archived Cron generation for a limited caller without main-t
         observation.restore();
       }
     },
-  );
-});
+  ));
 
-it("preserves shared custom-session conversation history across recorded runs", async () => {
-  await withCronTranscript(async ({ cron, job, record, oldScope, query }) => {
+it("preserves shared custom-session conversation history across recorded runs", () =>
+  withCronTranscript(async ({ cron, job, record, withDetail, oldScope, query }) => {
     await cron.update(job.id, { sessionTarget: `session:${oldScope.sessionKey}` });
     await upsertSessionEntryCore(oldScope, { sessionId: oldScope.sessionId, updatedAt: 3 });
     await appendTranscriptMessage(oldScope, {
       message: { role: "assistant", content: "A later run in this same conversation" },
     });
-    const detail = recordDetail(record);
     persistHistory([
       record,
-      {
-        ...record,
-        runId: "internal-later-run",
-        detail: { ...detail, runId: "public-later-run", runAtMs: 30 },
-      },
+      withDetail({ runId: "public-later-run", runAtMs: 30 }, { runId: "internal-later-run" }),
     ]);
     const current = await query({ runId: "public-old-run" });
     expect(current.ok).toBe(true);
@@ -388,11 +356,10 @@ it("preserves shared custom-session conversation history across recorded runs", 
       "Old last",
       "A later run in this same conversation",
     );
-  });
-});
+  }));
 
-it("does not disclose hidden session keys in cron.history errors", async () => {
-  await withCronTranscript(async ({ cron, storePath, baseKey, alias, query }) => {
+it("does not disclose hidden session keys in cron.history errors", () =>
+  withCronTranscript(async ({ cron, storePath, baseKey, alias, query }) => {
     await patchSessionEntryCore({ agentId: "main", sessionKey: baseKey }, () => ({
       visibility: "draft",
     }));
@@ -418,11 +385,10 @@ it("does not disclose hidden session keys in cron.history errors", async () => {
       expect(JSON.stringify(respond.mock.calls)).not.toContain(baseKey);
       expect(JSON.stringify(respond.mock.calls)).not.toContain(alias);
     }
-  });
-});
+  }));
 
-it("removes runs and totals when detail hydration reveals a hidden session", async () => {
-  await withCronTranscript(async ({ cron, storePath, baseKey, job, record, profile }) => {
+it("removes runs and totals when detail hydration reveals a hidden session", () =>
+  withCronTranscript(async ({ cron, storePath, baseKey, job, withDetail, profile }) => {
     const hiddenKey = "agent:main:hidden-cron-run";
     const hiddenProfile = ensureProfileForEmail("hidden-cron-owner@example.test");
     await upsertSessionEntryCore(
@@ -434,10 +400,7 @@ it("removes runs and totals when detail hydration reveals a hidden session", asy
         createdActor: { type: "human", source: "profile", id: hiddenProfile.id },
       },
     );
-    const detail = recordDetail(record);
-    persistHistory([
-      { ...record, sessionKey: baseKey, detail: { ...detail, sessionKey: baseKey } },
-    ]);
+    persistHistory([withDetail({ sessionKey: baseKey }, { sessionKey: baseKey })]);
     const { context, client } = await limitedReader(cron, storePath, profile.id);
     const queryRuns = async () => {
       return (await callCron(context, "cron.runs", { id: job.id }, { client })).calls;
@@ -449,9 +412,7 @@ it("removes runs and totals when detail hydration reveals a hidden session", asy
     const detailRead = vi
       .spyOn(cronReadOnly, "readCronRunHistoryRecords")
       .mockImplementationOnce(async (...args) => {
-        persistHistory([
-          { ...record, sessionKey: hiddenKey, detail: { ...detail, sessionKey: hiddenKey } },
-        ]);
+        persistHistory([withDetail({ sessionKey: hiddenKey }, { sessionKey: hiddenKey })]);
         return readDetails(...args);
       });
     try {
@@ -461,21 +422,15 @@ it("removes runs and totals when detail hydration reveals a hidden session", asy
     } finally {
       detailRead.mockRestore();
     }
-  });
-});
+  }));
 
-it("refuses ambiguous timestamps and cursors moved to another recorded run", async () => {
-  await withCronTranscript(async ({ record, query }) => {
+it("refuses ambiguous timestamps and cursors moved to another recorded run", () =>
+  withCronTranscript(async ({ record, detail, withDetail, query }) => {
     const first = await query({ runId: "public-old-run", limit: 1 });
     const cursor = expectDefined(first.payload?.nextCursor, "bound cursor");
-    const detail = recordDetail(record);
     persistHistory([
       record,
-      {
-        ...record,
-        runId: "internal-second-run",
-        detail: { ...detail, runId: "public-second-run" },
-      },
+      withDetail({ runId: "public-second-run" }, { runId: "internal-second-run" }),
     ]);
     for (const [selector, ok] of [
       [{ runAtMs: 10 }, false],
@@ -495,14 +450,13 @@ it("refuses ambiguous timestamps and cursors moved to another recorded run", asy
       },
     ]);
     expect((await query({ runId: "public-old-run" })).ok).toBe(false);
-  });
-});
+  }));
 
 it.each(["sharing", "binding", "retention", "transcript owner"] as const)(
   "rechecks %s before publishing a retained Cron transcript",
-  async (change) => {
-    await withCronTranscript(
-      async ({ cron, storePath, baseKey, oldScope, latest, record, query }) => {
+  (change) =>
+    withCronTranscript(
+      async ({ cron, storePath, baseKey, oldScope, latest, record, withDetail, query }) => {
         let storageChanged = false;
         const unrelatedKey = "agent:main:unrelated";
         if (change === "transcript owner") {
@@ -518,8 +472,7 @@ it.each(["sharing", "binding", "retention", "transcript owner"] as const)(
               visibility: "draft",
             }));
           } else if (change === "binding") {
-            const detail = recordDetail(record);
-            persistHistory([{ ...record, detail: { ...detail, sessionId: latest.sessionId } }]);
+            persistHistory([withDetail({ sessionId: latest.sessionId })]);
           } else if (change === "retention") {
             storageChanged =
               runOpenClawStateWriteTransaction(({ db }) => {
@@ -564,6 +517,5 @@ it.each(["sharing", "binding", "retention", "transcript owner"] as const)(
         expect(JSON.stringify(result.calls)).not.toContain(baseKey);
         expect(JSON.stringify(result.calls)).not.toContain(unrelatedKey);
       },
-    );
-  },
+    ),
 );

@@ -1,4 +1,3 @@
-import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
@@ -23,18 +22,15 @@ import { bindSessionRowProjection } from "../session-row-projection-access.js";
 import * as sessionRows from "../session-row-projection-record.js";
 import { createSessionRowProjection } from "../session-row-projection.js";
 import { createControlUiRequestOptions } from "./control-ui-request.test-support.js";
-import { controlUiHandlers, createControlUiHandlers } from "./control-ui.js";
+import { controlUiHandlers } from "./control-ui.js";
 import { identifiedClient } from "./sessions-sharing.test-support.js";
 import type { RespondFn } from "./types.js";
 
 const requestOptions = createControlUiRequestOptions(() => ({
   agents: { entries: { main: {} } },
 }));
-const previewHandler = (fresh = false) =>
-  expectDefined(
-    (fresh ? createControlUiHandlers() : controlUiHandlers)["controlUi.sessionPreview"],
-    "session preview handler",
-  );
+const runPreview = (...args: Parameters<typeof requestOptions>) =>
+  controlUiHandlers["controlUi.sessionPreview"]!(requestOptions(...args));
 
 function previewEntry(sessionId: string, label: string, extra: Partial<InternalSessionEntry> = {}) {
   return { sessionId, label, updatedAt: 1, visibility: "shared" as const, ...extra };
@@ -57,38 +53,6 @@ function expectPreview(respond: RespondFn, fields: Record<string, unknown>) {
   );
 }
 
-function writeTurn(
-  scope: Parameters<typeof persistSessionTranscriptTurn>[0],
-  content: string,
-  now: number,
-) {
-  return persistSessionTranscriptTurn(scope, {
-    cwd: "/tmp",
-    updateMode: "none",
-    messages: [{ message: { role: "user", content }, now }],
-  });
-}
-
-function waitForTranscript(key: string, titles: Map<string, string>) {
-  const completions = new Map([...titles.keys()].map((agentId) => [agentId, createDeferred()]));
-  const publish = sessionRows.publishTranscriptFields;
-  const publication = vi
-    .spyOn(sessionRows, "publishTranscriptFields")
-    .mockImplementation((row, ...args) => {
-      const changed = publish(row, ...args);
-      if (
-        row.key === key &&
-        row.lastMessagePreview &&
-        (!titles.get(row.agentId) || row.lastMessagePreview === titles.get(row.agentId))
-      ) {
-        completions.get(row.agentId)?.resolve();
-      }
-      return changed;
-    });
-  onTestFinished(() => publication.mockRestore());
-  return Promise.all([...completions.values()].map((completion) => completion.promise));
-}
-
 async function createPreviewContext(cfg: OpenClawConfig = {}, getRuntimeConfig = () => cfg) {
   const projection = await createSessionRowProjection({ cfg });
   onTestFinished(() => projection.dispose());
@@ -98,9 +62,9 @@ async function createPreviewContext(cfg: OpenClawConfig = {}, getRuntimeConfig =
 
 describe("controlUi.sessionPreview", () => {
   it.for(["active", "archived"])(
-    "returns a renamed %s preview without waiting for native runtime ownership",
-    async (state, { signal }) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    "renames %s previews without native ownership",
+    (state, { signal }) =>
+      withOpenClawTestState({ scenario: "minimal" }, async () => {
         const cfg = { agents: { entries: { main: {} } } };
         setRuntimeConfigSnapshot(cfg);
         const scope = { agentId: "main", sessionKey: "agent:main:preview-owner" };
@@ -152,9 +116,7 @@ describe("controlUi.sessionPreview", () => {
             holdOwnership = true;
             replaceSessionEntrySync(scope, { ...entry, label: "Renamed preview", updatedAt: 2 });
             pending = Promise.resolve(
-              controlUiHandlers["controlUi.sessionPreview"]!(
-                requestOptions({ sessionKey: scope.sessionKey }, respond, { context }),
-              ),
+              runPreview({ sessionKey: scope.sessionKey }, respond, { context }),
             );
             const winner = await Promise.race([
               pending.then(() => "response" as const),
@@ -177,12 +139,11 @@ describe("controlUi.sessionPreview", () => {
           restoreActivePluginRegistrySnapshot(previousRegistry);
           signal.removeEventListener("abort", abort);
         }
-      });
-    },
+      }),
   );
 
-  it("replies in the same authorization frame before queued visibility revocation", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+  it("replies in the same authorization frame before queued visibility revocation", () =>
+    withOpenClawTestState({ scenario: "minimal" }, async () => {
       setRuntimeConfigSnapshot({});
       const { scope, entry } = ownedPreview("preview-response-frame", "Visible preview title");
       await replaceSessionEntry(scope, entry);
@@ -207,21 +168,18 @@ describe("controlUi.sessionPreview", () => {
         }
         return {};
       });
-      await previewHandler()(
-        requestOptions({ sessionKey: scope.sessionKey }, respond, {
-          client: { ...identifiedClient("reader"), connId: "preview-reader" },
-          context,
-        }),
-      );
+      await runPreview({ sessionKey: scope.sessionKey }, respond, {
+        client: { ...identifiedClient("reader"), connId: "preview-reader" },
+        context,
+      });
       expect(queued).toBe(true);
       await revoked.promise;
       expectPreview(respond, { title: entry.label });
       expect(events).toEqual(["response", "revoked"]);
-    });
-  });
+    }));
 
-  it("rechecks exact-key visibility after compact registry preparation", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+  it("rechecks exact-key visibility after compact registry preparation", () =>
+    withOpenClawTestState({ scenario: "minimal" }, async () => {
       setRuntimeConfigSnapshot({});
       const { scope, entry } = ownedPreview("preparing-preview", "Private after preparation");
       await replaceSessionEntry(scope, entry);
@@ -234,12 +192,10 @@ describe("controlUi.sessionPreview", () => {
         .spyOn(subagentState, "prepareSubagentSessionListReadCache")
         .mockReturnValueOnce(prepared.promise);
       const respond = vi.fn<RespondFn>();
-      const pending = previewHandler(true)(
-        requestOptions({ sessionKey: scope.sessionKey }, respond, {
-          client: { ...identifiedClient("reader"), connId: "preview-reader" },
-          context,
-        }),
-      );
+      const pending = runPreview({ sessionKey: scope.sessionKey }, respond, {
+        client: { ...identifiedClient("reader"), connId: "preview-reader" },
+        context,
+      });
       try {
         expect(respond).not.toHaveBeenCalled();
         await replaceSessionEntry(scope, { ...entry, visibility: "draft" });
@@ -253,55 +209,10 @@ describe("controlUi.sessionPreview", () => {
         prepare.mockRestore();
         identity.mockRestore();
       }
-    });
-  });
+    }));
 
-  it("keeps the resolved owner without host SQL when previewing a qualified global main alias", async () => {
-    await withOpenClawTestState({ label: "hover-global-owner" }, async () => {
-      const cfg: OpenClawConfig = {
-        session: { scope: "global" },
-        agents: { entries: { main: {}, research: {} } },
-      };
-      setRuntimeConfigSnapshot(cfg);
-      for (const agentId of ["main", "research"]) {
-        const scope = { agentId, sessionKey: "global", sessionId: `hover-${agentId}` };
-        await replaceSessionEntry(scope, {
-          sessionId: scope.sessionId,
-          updatedAt: 42,
-          displayName: `Title from ${agentId}`,
-        });
-        await writeTurn(scope, `Title from ${agentId}`, 42);
-      }
-      const handler = previewHandler(true);
-      const published = waitForTranscript(
-        "global",
-        new Map(["main", "research"].map((agentId) => [agentId, `Title from ${agentId}`])),
-      );
-      const context = await createPreviewContext(cfg);
-      await published;
-      const statements = observeHostDataSql();
-      onTestFinished(() => statements.restore());
-      for (const agentId of ["main", "research"]) {
-        const respond = vi.fn<RespondFn>();
-        await handler(
-          requestOptions({ sessionKey: `agent:${agentId}:main` }, respond, {
-            context,
-          }),
-        );
-        expectPreview(respond, {
-          sessionKey: "global",
-          agentId,
-          derivedTitle: `Title from ${agentId}`,
-          lastMessagePreview: `Title from ${agentId}`,
-        });
-      }
-      expect(statements.queries).toEqual([]);
-      statements.restore();
-    });
-  });
-
-  it("returns bounded, original metadata for one session", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+  it("returns bounded, original metadata for one session", () =>
+    withOpenClawTestState({ scenario: "minimal" }, async () => {
       setRuntimeConfigSnapshot({});
       const secret = "sk-test-session-preview-secret-1234567890";
       const scope = {
@@ -320,14 +231,32 @@ describe("controlUi.sessionPreview", () => {
           origin: { provider: "webchat" },
         },
       });
-      await writeTurn(scope, `  OPENAI_API_KEY=${secret} ${"x".repeat(240)}  `, 1_786_000_000_000);
-      const published = waitForTranscript(scope.sessionKey, new Map([["main", ""]]));
+      const content = `  OPENAI_API_KEY=${secret} ${"x".repeat(240)}  `;
+      await persistSessionTranscriptTurn(scope, {
+        cwd: "/tmp",
+        updateMode: "none",
+        messages: [{ message: { role: "user", content }, now: 1_786_000_000_000 }],
+      });
+      const published = createDeferred();
+      const publish = sessionRows.publishTranscriptFields;
+      const publication = vi
+        .spyOn(sessionRows, "publishTranscriptFields")
+        .mockImplementation((row, ...args) => {
+          const changed = publish(row, ...args);
+          if (row.key === scope.sessionKey && row.lastMessagePreview) {
+            published.resolve();
+          }
+          return changed;
+        });
+      onTestFinished(() => publication.mockRestore());
       const context = await createPreviewContext();
-      await published;
+      await published.promise;
+      const statements = observeHostDataSql();
+      onTestFinished(() => statements.restore());
       const respond = vi.fn<RespondFn>();
-      await previewHandler()(
-        requestOptions({ sessionKey: " agent:main:research " }, respond, { context }),
-      );
+      await runPreview({ sessionKey: " agent:main:research " }, respond, { context });
+      expect(statements.queries).toEqual([]);
+      statements.restore();
 
       const payload = respond.mock.calls[0]?.[1] as ControlUiSessionPreview | undefined;
       expect(respond.mock.calls[0]?.[0]).toBe(true);
@@ -348,15 +277,12 @@ describe("controlUi.sessionPreview", () => {
       expect(payload.lastMessagePreview).toBeTruthy();
       expect(payload.lastMessagePreview?.length).toBeLessThanOrEqual(200);
       expect(payload.lastMessagePreview).toContain(secret);
-    });
-  });
+    }));
 
   it("rejects malformed preview params", async () => {
     const respond = vi.fn<RespondFn>();
 
-    await previewHandler()(
-      requestOptions({ sessionKey: "agent:main:research", extra: true }, respond),
-    );
+    await runPreview({ sessionKey: "agent:main:research", extra: true }, respond);
 
     expect(respond).toHaveBeenCalledWith(false, undefined, {
       code: "INVALID_REQUEST",

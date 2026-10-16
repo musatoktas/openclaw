@@ -66,19 +66,15 @@ const adminClient = {
   connect: { scopes: ["operator.admin"] },
 } as never;
 
-function context(): GatewayRequestContext {
-  return {
-    dedupe: new Map(),
-    getRuntimeConfig: () => ({}),
-  } as GatewayRequestContext;
-}
-
 function caller(
   method = "conversations.turn",
   defaults: Record<string, unknown> = request,
   client: GatewayClient | null = adminClient,
 ) {
-  const gatewayContext = context();
+  const gatewayContext = {
+    dedupe: new Map(),
+    getRuntimeConfig: () => ({}),
+  } as GatewayRequestContext;
   const invoke = (respond: RespondFn, params = defaults) =>
     conversationHandlers[method]!({
       params,
@@ -160,30 +156,28 @@ describe("conversations.list Gateway handler", () => {
   });
 });
 
-describe("conversations.send Gateway handler", () => {
-  it("owns the send and rejects operation-id reuse with different source input", async () => {
-    runConversationSend.mockResolvedValue(sendResult);
-    const { query } = caller("conversations.send", sendRequest);
-    const respond = await query();
-    expect(runConversationSend).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "main",
-        senderIsOwner: true,
-        sourceSessionKey: "agent:main:telegram:direct:operator",
-        operationId: "conversation-send-1",
-        conversationRef: request.conversationRef,
-        message: "hello molty",
-      }),
-    );
-    expect(respond).toHaveBeenCalledWith(true, sendResult, undefined, { channel: "reef" });
+it("conversations.send rejects operation-id reuse with different source input", async () => {
+  runConversationSend.mockResolvedValue(sendResult);
+  const { query } = caller("conversations.send", sendRequest);
+  const respond = await query();
+  expect(runConversationSend).toHaveBeenCalledWith(
+    expect.objectContaining({
+      agentId: "main",
+      senderIsOwner: true,
+      sourceSessionKey: "agent:main:telegram:direct:operator",
+      operationId: "conversation-send-1",
+      conversationRef: request.conversationRef,
+      message: "hello molty",
+    }),
+  );
+  expect(respond).toHaveBeenCalledWith(true, sendResult, undefined, { channel: "reef" });
 
-    const mismatchRespond = await query({
-      ...sendRequest,
-      sourceSessionKey: "agent:main:discord:channel:other",
-    });
-    expect(runConversationSend).toHaveBeenCalledOnce();
-    expectFailure(mismatchRespond);
+  const mismatchRespond = await query({
+    ...sendRequest,
+    sourceSessionKey: "agent:main:discord:channel:other",
   });
+  expect(runConversationSend).toHaveBeenCalledOnce();
+  expectFailure(mismatchRespond);
 });
 
 describe("conversations.turn Gateway handler", () => {
@@ -259,35 +253,30 @@ describe("conversations.turn Gateway handler", () => {
     expectReply(otherRespond, otherResult);
   });
 
-  it("retries transient unavailable failures instead of caching them", async () => {
-    runConversationTurn
-      .mockRejectedValueOnce(new Error("temporary outage"))
-      .mockResolvedValueOnce(result);
-    const { query } = caller();
-    const failedRespond = await query();
-    expectFailure(failedRespond, { code: "UNAVAILABLE" }, expect.any(Object));
-
-    const retryRespond = await query();
-    expect(runConversationTurn).toHaveBeenCalledTimes(2);
-    expectReply(retryRespond);
-  });
-
-  it("does not let a durable operation conflict poison the authoritative retry identity", async () => {
-    runConversationTurn
-      .mockRejectedValueOnce(
-        new ConversationOperationConflictError(
-          `Conversation delivery operation was reused with different input: ${request.turnId}`,
-        ),
-      )
-      .mockResolvedValueOnce(result);
+  it.each([
+    { name: "transient outage", conflict: false, error: new Error("temporary outage") },
+    {
+      name: "durable conflict",
+      conflict: true,
+      error: new ConversationOperationConflictError("operation input changed"),
+    },
+  ])("allows an authoritative retry after $name", async ({ conflict, error }) => {
+    runConversationTurn.mockRejectedValueOnce(error).mockResolvedValueOnce(result);
     const { query, gatewayContext } = caller();
-    const conflictRespond = await query({ ...request, message: "conflicting message" });
-    expectFailure(conflictRespond, { code: "INVALID_REQUEST" }, expect.any(Object));
-    expect([...gatewayContext.dedupe.keys()].some((key) => key.endsWith(":identity"))).toBe(false);
-
-    const authoritativeRespond = await query();
+    const failed = await query(conflict ? { ...request, message: "conflicting message" } : request);
+    expectFailure(
+      failed,
+      { code: conflict ? "INVALID_REQUEST" : "UNAVAILABLE" },
+      expect.any(Object),
+    );
+    if (conflict) {
+      expect([...gatewayContext.dedupe.keys()].some((key) => key.endsWith(":identity"))).toBe(
+        false,
+      );
+    }
+    const retried = await query();
     expect(runConversationTurn).toHaveBeenCalledTimes(2);
-    expectReply(authoritativeRespond);
+    expectReply(retried);
   });
 
   it("maps unsupported conversation input to a stable invalid-request response", async () => {

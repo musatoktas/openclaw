@@ -8,12 +8,10 @@ import {
   deleteSessionEntryLifecycle,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
-import { cronRunLogEntryToDetail, cronRunStorageStatus } from "../../cron/run-history-detail.js";
 import type { CronRunLogEntry } from "../../cron/run-log-types.js";
 import type { CronService } from "../../cron/service.js";
 import { loadCronStore, saveCronStore } from "../../cron/store.js";
 import { cronStoreKey } from "../../cron/store/key.js";
-import { recordCronRunInDatabase } from "../../cron/store/run-history.kernel.js";
 import type { CronRunHistoryWrite } from "../../cron/store/run-history.types.js";
 import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
 import { prepareUserProfileCatalog } from "../../state/user-profile-list.js";
@@ -21,7 +19,13 @@ import { ensureUserProfilesSchema } from "../../state/user-profiles-schema.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { roleClient, rolePolicyConfig } from "../session-sharing.test-utils.js";
-import { callCron as invokeCron, createReadService } from "./cron-read.test-support.js";
+import {
+  callCron as invokeCron,
+  createReadService,
+  createHistoryJob,
+  historyRecord,
+  persistRuns,
+} from "./cron-read.test-support.js";
 import {
   disposeSessionReadContexts,
   initializeSessionReadContext,
@@ -35,6 +39,10 @@ function expectError(respond: ReturnType<typeof vi.fn<RespondFn>>, error: unknow
   expect(respond).toHaveBeenCalledWith(false, undefined, error);
 }
 
+function expectNotFound(respond: ReturnType<typeof vi.fn<RespondFn>>, jobId: string) {
+  expectError(respond, expect.objectContaining({ details: { code: "CRON_JOB_NOT_FOUND", jobId } }));
+}
+
 function makeRun(
   jobId: string,
   runId: string,
@@ -42,34 +50,6 @@ function makeRun(
 ): CronRunLogEntry {
   return { action: "finished", jobId, runId, status: "ok", ts: Date.now(), ...fields };
 }
-function persistRuns(records: CronRunHistoryWrite[]) {
-  runOpenClawStateWriteTransaction(({ db }) => {
-    for (const record of records) {
-      recordCronRunInDatabase(db, record);
-    }
-  });
-}
-function historyRecord(
-  entry: CronRunLogEntry,
-  storePath: string,
-  agentId: string,
-  runId: string,
-): CronRunHistoryWrite {
-  const storeKey = cronStoreKey(storePath);
-  return {
-    storeKey,
-    jobId: entry.jobId,
-    runId,
-    agentId,
-    sessionKey: entry.sessionKey,
-    startedAt: entry.ts,
-    endedAt: entry.ts,
-    status: cronRunStorageStatus(entry),
-    summary: entry.summary,
-    detail: cronRunLogEntryToDetail(entry, { storeKey }),
-  };
-}
-
 function createOwnedSession(
   agentId: string,
   sessionKey: string,
@@ -159,54 +139,35 @@ async function withCronHistory(
     try {
       const jobs = [];
       for (const sessionKey of [ownKey, foreignKey]) {
-        const result = await cron.add({
-          name: sessionKey,
-          agentId,
-          owner: { agentId, sessionKey },
-          enabled: false,
-          schedule: { kind: "every", everyMs: 60_000 },
-          sessionTarget: "isolated",
-          wakeMode: "next-heartbeat",
-          payload: { kind: "agentTurn", message: "fixture" },
-          delivery: { mode: "none" },
-        });
+        const result = await cron.add(createHistoryJob(agentId, sessionKey, sessionKey));
         jobs.push("job" in result ? result.job : result);
       }
       const jobId = expectDefined(jobs[0], "own job").id;
       const foreignJobId = expectDefined(jobs[1], "foreign job").id;
-      const rows: Array<
-        Pick<CronRunLogEntry, "sessionKey" | "status" | "summary" | "jobId"> & {
-          agentId?: string;
-        }
-      > = [
-        { jobId, sessionKey: foreignKey, status: "error", summary: "needle hidden" },
-        { jobId, sessionKey: ownKey, status: "error", summary: "needle first" },
-        { jobId, sessionKey: foreignKey, status: "ok", summary: "other hidden" },
-        { jobId, status: "error", summary: "needle second" },
-        { jobId, sessionKey: ownKey, status: "ok", summary: "other third" },
-        {
-          jobId: foreignJobId,
-          sessionKey: ownKey,
-          status: "error",
-          summary: "needle foreign job",
-        },
-      ];
       const now = Date.now();
-      const records = rows.map((row, index): CronRunHistoryWrite => {
-        const entry: CronRunLogEntry = {
-          ...row,
-          action: "finished",
-          ts: now + index,
-          runId: `history-run-${index}`,
-          deliveryStatus: row.status === "error" ? "not-delivered" : "delivered",
-        };
-        return historyRecord(
-          entry,
+      const records = (
+        [
+          [foreignKey, "error", "needle hidden"],
+          [ownKey, "error", "needle first"],
+          [foreignKey, "ok", "other hidden"],
+          [undefined, "error", "needle second"],
+          [ownKey, "ok", "other third"],
+          [ownKey, "error", "needle foreign job", foreignJobId],
+        ] as const
+      ).map(([sessionKey, status, summary, id = jobId], index) =>
+        historyRecord(
+          makeRun(id, `history-run-${index}`, {
+            sessionKey,
+            status,
+            summary,
+            ts: now + index,
+            deliveryStatus: status === "error" ? "not-delivered" : "delivered",
+          }),
           storePath,
-          row.agentId ?? agentId,
-          `cron:${entry.jobId}:${entry.ts}:history`,
-        );
-      });
+          agentId,
+          `cron:${id}:${now + index}:history`,
+        ),
+      );
       persistRuns(records);
       const context = createDirectChatContext({
         cron,
@@ -214,13 +175,11 @@ async function withCronHistory(
         getRuntimeConfig: () => cfg,
       });
       await initializeSessionReadContext(context);
-      const query = async (
+      const query = (
         params: Record<string, unknown>,
         client = owner,
         method: "cron.runs" | "cron.list" | "cron.get" = "cron.runs",
-      ) => {
-        return invokeCron(context, method, params, { client });
-      };
+      ) => invokeCron(context, method, params, { client });
       const recordRun = (entry: CronRunLogEntry, suffix: string, runAgentId = agentId) =>
         persistRuns([
           historyRecord(entry, storePath, runAgentId, `cron:${entry.jobId}:${entry.ts}:${suffix}`),
@@ -246,8 +205,8 @@ async function withCronHistory(
 describe("cron.runs session visibility", () => {
   it.each([true, false])(
     "keeps retained deleted-main visibility ahead of replacement-agent aliases (visible: %s)",
-    async (visible) => {
-      await withCronHistory(
+    (visible) =>
+      withCronHistory(
         async ({ jobId, query, owner, viewer, recordRun }) => {
           await createOwnedSession(
             "main",
@@ -267,40 +226,30 @@ describe("cron.runs session visibility", () => {
           });
           recordRun(entry, "retained-main", "main");
           const params = { id: jobId, runId: entry.runId };
-          expectReply(
-            await query(params),
-            expect.objectContaining({
-              total: visible ? 1 : 0,
-              entries: visible ? [expect.objectContaining({ runId: entry.runId })] : [],
-            }),
-          );
+          expectVisibleRuns(await query(params), visible ? [entry.runId] : []);
         },
         { agentId: "research" },
-      );
-    },
+      ),
   );
 
-  it("searches full run details before paging summary views without changing visibility", async () => {
-    await withCronHistory(async ({ jobId, foreignJobId, query, storePath }) => {
-      const targets: Pick<CronRunLogEntry, "jobId" | "sessionKey" | "deliveryStatus">[] = [
-        { jobId, sessionKey: "agent:main:history-foreign", deliveryStatus: "not-delivered" },
-        { jobId, sessionKey: "agent:main:history-own", deliveryStatus: "not-delivered" },
-        { jobId, sessionKey: "agent:main:history-own", deliveryStatus: "unknown" },
-        {
-          jobId: foreignJobId,
-          sessionKey: "agent:main:history-own",
-          deliveryStatus: "not-delivered",
-        },
-      ];
-      const entries: CronRunLogEntry[] = targets.map((row, index) => ({
-        jobId: row.jobId,
-        sessionKey: row.sessionKey,
-        deliveryStatus: row.deliveryStatus,
+  it("searches full run details before paging summary views without changing visibility", () =>
+    withCronHistory(async ({ jobId, foreignJobId, query, storePath }) => {
+      const entries: CronRunLogEntry[] = (
+        [
+          [jobId, "agent:main:history-foreign", "not-delivered"],
+          [jobId, "agent:main:history-own", "not-delivered"],
+          [jobId, "agent:main:history-own", "unknown"],
+          [foreignJobId, "agent:main:history-own", "not-delivered"],
+        ] as const
+      ).map(([entryJobId, sessionKey, deliveryStatus], index) => ({
+        jobId: entryJobId,
+        sessionKey,
+        deliveryStatus,
         action: "finished",
         ts: 100 + index,
         runId: `delivery-search-${index}`,
         status: "ok",
-        completionStatus: row.deliveryStatus === "unknown" ? "unknown" : "failed",
+        completionStatus: deliveryStatus === "unknown" ? "unknown" : "failed",
         summary: "Report completed",
         deliveryError: "Synthetic recipient unavailable",
         sessionId: `delivery-session-${index}`,
@@ -356,8 +305,7 @@ describe("cron.runs session visibility", () => {
           }
         }
       }
-    });
-  });
+    }));
 
   it.each([
     {
@@ -370,8 +318,8 @@ describe("cron.runs session visibility", () => {
     { sessionTarget: "main", agentId: "ops", explicitOwner: false, sqlOwner: "main" },
   ] as const)(
     "uses canonical sharing for $sessionTarget without a fleet default (explicit=$explicitOwner, SQL owner=$sqlOwner)",
-    async ({ sessionTarget, agentId, explicitOwner, sqlOwner }) => {
-      await withCronHistory(
+    ({ sessionTarget, agentId, explicitOwner, sqlOwner }) =>
+      withCronHistory(
         async ({ cron, query, jobId, storePath, owner, viewer }) => {
           const store = await loadCronStore(storePath);
           const job = expectDefined(
@@ -456,24 +404,15 @@ describe("cron.runs session visibility", () => {
           }
         },
         { unresolvedDefault: true },
-      );
-    },
+      ),
   );
   it.each(["cron.list", "cron.runs"] as const)(
     "%s filters jobs before preparing unavailable foreign sessions",
-    async (method) => {
-      await withCronHistory(async ({ cron, query, jobId, foreignJobId, recordRun }) => {
-        const unavailable = await cron.add({
-          name: "Unavailable foreign job",
-          agentId: "broken",
-          owner: { agentId: "broken", sessionKey: "agent:broken:creator" },
-          enabled: false,
-          schedule: { kind: "every", everyMs: 60_000 },
-          sessionTarget: "isolated",
-          wakeMode: "next-heartbeat",
-          payload: { kind: "agentTurn", message: "fixture" },
-          delivery: { mode: "none" },
-        });
+    (method) =>
+      withCronHistory(async ({ cron, query, jobId, foreignJobId, recordRun }) => {
+        const unavailable = await cron.add(
+          createHistoryJob("broken", "agent:broken:creator", "Unavailable foreign job"),
+        );
         const agentDir = path.dirname(
           path.dirname(resolveSessionStorePathCore(undefined, { agentId: "broken" })),
         );
@@ -509,12 +448,7 @@ describe("cron.runs session visibility", () => {
           );
         } else {
           const unavailableId = "job" in unavailable ? unavailable.job.id : unavailable.id;
-          expectError(
-            await query({ id: unavailableId, agentId: "main" }),
-            expect.objectContaining({
-              details: { code: "CRON_JOB_NOT_FOUND", jobId: unavailableId },
-            }),
-          );
+          expectNotFound(await query({ id: unavailableId, agentId: "main" }), unavailableId);
           await cron.remove(unavailableId);
           const historicalEntry: CronRunLogEntry = makeRun(jobId, "historical-ops-run", {
             summary: "run before the job changed agents",
@@ -525,13 +459,9 @@ describe("cron.runs session visibility", () => {
             [{ scope: "all", agentId: "MAIN" }, 0],
             [{ id: jobId, agentId: "MAIN" }, 1],
           ] as const) {
-            expectReply(
+            expectVisibleRuns(
               await query({ ...selector, runId: historicalEntry.runId }),
-              expect.objectContaining({
-                total,
-                entries:
-                  total === 0 ? [] : [expect.objectContaining({ runId: "historical-ops-run" })],
-              }),
+              total === 0 ? [] : [historicalEntry.runId],
             );
           }
           for (const [id, runId] of [
@@ -556,12 +486,11 @@ describe("cron.runs session visibility", () => {
             expectReply(result.value, expect.objectContaining({ total: index < 2 ? 1 : 0 }));
           }
         }
-      });
-    },
+      }),
   );
 
-  it("refreshes run and job visibility after session creation and deletion", async () => {
-    await withCronHistory(async ({ jobId, query, owner, rows, recordRun }) => {
+  it("refreshes run and job visibility after session creation and deletion", () =>
+    withCronHistory(async ({ jobId, query, owner, rows, recordRun }) => {
       const sessionKey = "agent:main:history-created";
       const entry: CronRunLogEntry = makeRun(jobId, "created-session-run", {
         sessionKey,
@@ -587,15 +516,11 @@ describe("cron.runs session visibility", () => {
       expect((await deleteSession(sessionKey)).deleted).toBe(true);
       expectVisibleRuns(await query(params), ["history-run-1", "history-run-3", "history-run-4"]);
       expect((await deleteSession("agent:main:history-own")).deleted).toBe(true);
-      expectError(
-        await query(params),
-        expect.objectContaining({ details: { code: "CRON_JOB_NOT_FOUND", jobId } }),
-      );
-    });
-  });
+      expectNotFound(await query(params), jobId);
+    }));
 
-  it.each(["job", "all"] as const)("combines %s visibility with history filters", async (scope) => {
-    await withCronHistory(async ({ jobId, query }) => {
+  it.each(["job", "all"] as const)("combines %s visibility with history filters", (scope) =>
+    withCronHistory(async ({ jobId, query }) => {
       const respond = await query({
         ...(scope === "job" ? { id: jobId } : { scope }),
         agentId: "MAIN",
@@ -616,17 +541,26 @@ describe("cron.runs session visibility", () => {
         hasMore: false,
         nextOffset: null,
       });
-    });
-  });
+    }),
+  );
 
   it.each([
     { filter: { runId: "absent-run" }, total: 0, offset: 0 },
     { filter: { runId: "history-run-1", offset: 99 }, total: 1, offset: 1 },
   ])(
     "keeps deleted-job empty pages distinct from missing history: $filter",
-    async ({ filter, total, offset }) => {
-      await withCronHistory(async ({ jobId, cron, query, viewer }) => {
+    ({ filter, total, offset }) =>
+      withCronHistory(async ({ jobId, foreignJobId, cron, query, viewer }) => {
+        expectNotFound(await query({ id: foreignJobId }), foreignJobId);
         await cron.remove(jobId);
+        expectNotFound(await query({ id: jobId }), jobId);
+        expectReply(
+          await query({ id: jobId, limit: 1, runId: "history-run-1" }, viewer),
+          expect.objectContaining({
+            entries: [expect.objectContaining({ summary: "needle first" })],
+            total: 1,
+          }),
+        );
         expectReply(await query({ id: jobId, ...filter, limit: 1 }, viewer), {
           entries: [],
           total,
@@ -635,34 +569,10 @@ describe("cron.runs session visibility", () => {
           hasMore: false,
           nextOffset: null,
         });
-        expectError(
+        expectNotFound(
           await query({ id: "missing-job", ...filter, limit: 1 }, viewer),
-          expect.objectContaining({
-            details: { code: "CRON_JOB_NOT_FOUND", jobId: "missing-job" },
-          }),
+          "missing-job",
         );
-      });
-    },
+      }),
   );
-
-  it("keeps foreign jobs hidden and retained deleted-job history available to viewers", async () => {
-    await withCronHistory(async ({ jobId, foreignJobId, cron, query, viewer }) => {
-      expectError(
-        await query({ id: foreignJobId }),
-        expect.objectContaining({ details: { code: "CRON_JOB_NOT_FOUND", jobId: foreignJobId } }),
-      );
-      await cron.remove(jobId);
-      expectError(
-        await query({ id: jobId }),
-        expect.objectContaining({ details: { code: "CRON_JOB_NOT_FOUND", jobId } }),
-      );
-      expectReply(
-        await query({ id: jobId, limit: 1, runId: "history-run-1" }, viewer),
-        expect.objectContaining({
-          entries: [expect.objectContaining({ summary: "needle first" })],
-          total: 1,
-        }),
-      );
-    });
-  });
 });

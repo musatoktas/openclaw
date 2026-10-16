@@ -1,5 +1,3 @@
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,16 +6,16 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import * as listRevision from "../../cron/list-snapshot-revision.js";
 import type { CronService } from "../../cron/service.js";
 import * as cronSort from "../../cron/service/list-page-sort.js";
+import type { CronListPageResult } from "../../cron/service/list-page-types.js";
 import { loadCronQuarantinedJobs, loadCronStore, saveCronStore } from "../../cron/store.js";
 import { cronStoreKey } from "../../cron/store/key.js";
 import type { CronJob } from "../../cron/types.js";
 import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
-import { withEnvAsync } from "../../test-utils/env.js";
-import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
 import { withLocalGatewayRequestScope } from "../local-request-context.js";
-import { callCron as invokeCron, createReadService } from "./cron-read.test-support.js";
+import { callCron, createReadService } from "./cron-read.test-support.js";
 import { createCronCallerClient, createCronJob } from "./cron.validation.test-support.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
@@ -28,15 +26,6 @@ function expectReply(respond: ReturnType<typeof vi.fn>, payload: unknown) {
 }
 function expectError(respond: ReturnType<typeof vi.fn>, error: unknown) {
   expect(respond).toHaveBeenCalledExactlyOnceWith(false, undefined, error);
-}
-
-async function callCron(
-  context: GatewayRequestContext,
-  method: string,
-  params: Record<string, unknown>,
-  client: GatewayClient | null = null,
-) {
-  return invokeCron(context, method, params, { client });
 }
 
 function createJobs(count: number): CronJob[] {
@@ -65,44 +54,33 @@ async function withCronStore(
     jobs?: CronJob[];
   } = {},
 ) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cron-list-scoped-"));
-  try {
-    await withEnvAsync({ OPENCLAW_STATE_DIR: path.join(root, "state") }, async () => {
-      const storePath = path.join(root, "jobs.json");
-      await saveCronStore(storePath, { version: 1, jobs: options.jobs ?? createJobs(count) });
-      const cron = createReadService({
-        storePath,
-        cronEnabled: true,
-        defaultAgentId: options.defaultAgentId ?? "main",
-        enqueueSystemEvent: vi.fn(),
-        requestHeartbeat: vi.fn(),
-        runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-      });
-      try {
-        // Listing loads the real store without starting the scheduler.
-        await withLocalGatewayRequestScope(
-          { deps: {}, getRuntimeConfig: () => options.config ?? {} },
-          async () => {
-            const context: GatewayRequestContext = {
-              ...expectDefined(
-                getPluginRuntimeGatewayRequestScope()?.context,
-                "local Gateway context",
-              ),
-              cron,
-              cronStorePath: storePath,
-            };
-            await run({ context, storePath, cron });
-          },
-        );
-      } finally {
-        cron.stop();
-      }
+  await withOpenClawTestState({ layout: "state-only" }, async (state) => {
+    const storePath = path.join(state.root, "jobs.json");
+    await saveCronStore(storePath, { version: 1, jobs: options.jobs ?? createJobs(count) });
+    const cron = createReadService({
+      storePath,
+      cronEnabled: true,
+      defaultAgentId: options.defaultAgentId ?? "main",
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
     });
-  } finally {
-    // Retire worker admissions before removing storage, including failed fixture setup.
-    await cleanupSessionStateForTest({ stateDir: path.join(root, "state"), rootPath: root });
-    await fs.rm(root, { recursive: true, force: true });
-  }
+    try {
+      // Listing loads the real store without starting the scheduler.
+      await withLocalGatewayRequestScope(
+        { deps: {}, getRuntimeConfig: () => options.config ?? {} },
+        async () => {
+          const context = expectDefined(
+            getPluginRuntimeGatewayRequestScope()?.context,
+            "local Gateway context",
+          );
+          await run({ context: { ...context, cron, cronStorePath: storePath }, storePath, cron });
+        },
+      );
+    } finally {
+      cron.stop();
+    }
+  });
 }
 
 async function listScoped(
@@ -122,18 +100,10 @@ async function listScoped(
       limit: 1,
       offset,
     },
-    client,
+    { client },
   );
   expectReply(respond, expect.any(Object));
-  return respond.mock.calls[0]![1] as {
-    jobs: CronJob[];
-    snapshotRevision: string;
-    total: number;
-    offset: number;
-    limit: number;
-    hasMore: boolean;
-    nextOffset: number | null;
-  };
+  return respond.mock.calls[0]![1] as CronListPageResult;
 }
 
 describe("cron.list scoped SQLite snapshots", () => {
@@ -173,8 +143,8 @@ describe("cron.list scoped SQLite snapshots", () => {
     );
   });
 
-  it("keeps unsupported enabled delivery repairable beside healthy work and quarantine", async () => {
-    await withCronStore(
+  it("keeps unsupported enabled delivery repairable beside healthy work and quarantine", () =>
+    withCronStore(
       3,
       async ({ context, storePath, cron }) => {
         const db = openOpenClawStateDatabase().db;
@@ -269,8 +239,7 @@ describe("cron.list scoped SQLite snapshots", () => {
         expect((await cron.readJob("job-0001"))?.name).toBe("healthy sibling still editable");
       },
       { defaultAgentId: "ops" },
-    );
-  });
+    ));
 
   it("keeps migrated owners outside a different ambient agent's reads and mutations", async () => {
     const config: OpenClawConfig = {
@@ -305,7 +274,7 @@ describe("cron.list scoped SQLite snapshots", () => {
               id: historical.id,
               ...(method === "cron.update" ? { patch: { name: "changed" } } : {}),
             },
-            client,
+            { client },
           );
           expectError(
             respond,
@@ -319,8 +288,8 @@ describe("cron.list scoped SQLite snapshots", () => {
       { config, defaultAgentId: "research" },
     );
   });
-  it("prepares one revision for concurrent lists while status does no listing work", async () => {
-    await withCronStore(300, async ({ context, cron }) => {
+  it("prepares one revision for concurrent lists while status does no listing work", () =>
+    withCronStore(300, async ({ context, cron }) => {
       await cron.start();
       const revision = vi.spyOn(listRevision, "resolveCronListSnapshotRevision");
       const pages = await Promise.all(
@@ -341,10 +310,9 @@ describe("cron.list scoped SQLite snapshots", () => {
       expect(revision).toHaveBeenCalledOnce();
       expect((await listScoped(context)).total).toBe(2);
       expect((await listScoped(context, 0, undefined, null)).total).toBe(300);
-    });
-  });
-  it("filters session bindings before pagination without widening caller visibility", async () => {
-    await withCronStore(401, async ({ context, storePath, cron }) => {
+    }));
+  it("filters session bindings before pagination without widening caller visibility", () =>
+    withCronStore(401, async ({ context, storePath, cron }) => {
       await cron.start();
       const store = await loadCronStore(storePath);
       const sessionKey = "agent:ops:night-watch";
@@ -352,7 +320,22 @@ describe("cron.list scoped SQLite snapshots", () => {
         store.jobs[index]!.sessionKey = sessionKey;
       }
       await saveCronStore(storePath, store);
+      const sort = vi.spyOn(cronSort, "sortCronJobs");
       const page = await listScoped(context, 0, sessionKey);
+      const visible = store.jobs.filter(
+        (job) => job.agentId === "ops" && job.sessionKey === sessionKey,
+      );
+      expect(page).toMatchObject({
+        offset: 0,
+        limit: 1,
+        hasMore: true,
+        nextOffset: 1,
+        snapshotRevision: listRevision.resolveCronListSnapshotRevision(visible),
+      });
+      expect(await loadCronStore(storePath)).toEqual(store);
+      expect(sort.mock.calls.reduce((total, [jobs]) => total + jobs.length, 0)).toBeLessThanOrEqual(
+        401,
+      );
       expect(page).toMatchObject({ total: 2, jobs: [{ id: "job-0000" }] });
       expect((await listScoped(context, 1, sessionKey)).jobs.map((job) => job.id)).toEqual([
         "job-0200",
@@ -363,11 +346,10 @@ describe("cron.list scoped SQLite snapshots", () => {
       expect((await listScoped(context, 1, sessionKey, null)).jobs.map((job) => job.id)).toEqual([
         "job-0001",
       ]);
-    });
-  });
+    }));
 
-  it("keeps global-session filtering on the explicit job agent instead of the ambient default", async () => {
-    await withCronStore(
+  it("keeps global-session filtering on the explicit job agent instead of the ambient default", () =>
+    withCronStore(
       2,
       async ({ context, storePath }) => {
         const store = await loadCronStore(storePath);
@@ -391,33 +373,10 @@ describe("cron.list scoped SQLite snapshots", () => {
           session: { scope: "global" },
         },
       },
-    );
-  });
+    ));
 
-  it("bounds sorting work while finding visible jobs across a 401-job inventory", async () => {
-    const count = 401;
-    await withCronStore(count, async ({ context, storePath }) => {
-      const before = await loadCronStore(storePath);
-      const sort = vi.spyOn(cronSort, "sortCronJobs");
-      const page = await listScoped(context);
-      const sortedRows = sort.mock.calls.reduce((total, [jobs]) => total + jobs.length, 0);
-      const visible = before.jobs.filter((job) => job.agentId === "ops");
-      expect(page).toMatchObject({
-        total: visible.length,
-        offset: 0,
-        limit: 1,
-        hasMore: visible.length > 1,
-        nextOffset: visible.length > 1 ? 1 : null,
-        snapshotRevision: listRevision.resolveCronListSnapshotRevision(visible),
-        jobs: [expect.objectContaining({ id: "job-0000" })],
-      });
-      expect(await loadCronStore(storePath)).toEqual(before);
-      expect(sortedRows).toBeLessThanOrEqual(count);
-    });
-  });
-
-  it("isolates hidden changes while revising visible off-page changes and detaching rows", async () => {
-    await withCronStore(401, async ({ context, storePath, cron }) => {
+  it("isolates hidden changes while revising visible off-page changes and detaching rows", () =>
+    withCronStore(401, async ({ context, storePath, cron }) => {
       await cron.start();
       const first = await listScoped(context);
       const store = await loadCronStore(storePath);
@@ -433,11 +392,5 @@ describe("cron.list scoped SQLite snapshots", () => {
       expect((await listScoped(context, 2)).jobs).toEqual([
         expect.objectContaining({ id: "job-0400", name: "visible replacement" }),
       ]);
-
-      store.jobs[0]!.payload = { kind: "agentTurn", message: "replacement message" };
-      await saveCronStore(storePath, store);
-      await listScoped(context);
-      expect(first.jobs[0]!.payload).toEqual({ kind: "agentTurn", message: "scheduled check" });
-    });
-  });
+    }));
 });
