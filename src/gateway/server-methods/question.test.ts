@@ -13,20 +13,12 @@ import {
 } from "../../infra/agent-run-registry.js";
 import { isSecretValueRegisteredForRedaction } from "../../logging/secret-redaction-registry.js";
 import * as secretsRuntimeState from "../../secrets/runtime-state.js";
-import {
-  listSecretStoreEntries,
-  readSecretStoreValue,
-  writeSecretStoreEntry,
-} from "../../secrets/store/secret-store.js";
+import * as store from "../../secrets/store/secret-store.js";
 import { prepareUserProfileCatalog } from "../../state/user-profile-list.js";
 import { setUserProfileRole } from "../../state/user-profile-writes.worker.js";
 import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import {
-  abortChatRunById,
-  registerChatAbortController,
-  type ChatAbortControllerEntry,
-} from "../chat-abort.js";
+import * as chatAbort from "../chat-abort.js";
 import { prepareGatewayRecipientProfile } from "../expected-profile.js";
 import { createChatRunState } from "../server-chat-state.js";
 import { GatewayClientRegistry } from "../server/client-registry.js";
@@ -37,6 +29,7 @@ import {
   callQuestionRpc as call,
   createProjectedQuestionBroadcaster,
   createQuestionPeer,
+  createQuestionRuntimeClient,
   questionNotFound,
   installQuestionTestHooks,
   manager,
@@ -74,8 +67,9 @@ const withState = (run: () => Promise<void>) =>
     setRuntimeConfigSnapshot({});
     await run();
   });
-const listSecrets = () => listSecretStoreEntries({ scope: { kind: "team" } });
-const readSecret = () => readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" });
+const listSecrets = () => store.listSecretStoreEntries({ scope: { kind: "team" } });
+const readSecret = () =>
+  store.readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" });
 const secretAnswers = (value: string) => ({ answers: { secret_value: [value] } });
 const answerSecret = (id: string, value: string, params: Record<string, unknown> = {}) =>
   call("question.resolve", { id, answers: secretAnswers(value), ...params });
@@ -89,15 +83,7 @@ const publicationOptions = {
 function mockReferencedStoreSnapshot() {
   vi.spyOn(secretsRuntimeState, "getActiveSecretsRuntimeSnapshotState").mockReturnValue({
     sourceConfig: {
-      models: {
-        providers: {
-          test: {
-            baseUrl: "https://provider.example.test",
-            models: [],
-            apiKey: { source: "store", provider: "default", id: "SERVICE_API_KEY" },
-          },
-        },
-      },
+      gateway: { auth: { token: { source: "store", provider: "default", id: "SERVICE_API_KEY" } } },
     },
     config: {},
     authStores: [],
@@ -150,8 +136,8 @@ async function sharingFixture(others: "none" | "suggest" = "none") {
   return { owner, guest, cfg, client, profile };
 }
 
-it("conceals foreign session questions for role-none readers while preserving global prompts", async () => {
-  await withState(async () => {
+it("conceals foreign session questions for role-none readers while preserving global prompts", () =>
+  withState(async () => {
     const { client, cfg } = await sharingFixture();
     using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     manager.request({ ...requestParams, id: "foreign-question" });
@@ -172,11 +158,10 @@ it("conceals foreign session questions for role-none readers while preserving gl
       expect(await call(method, params, { client, cfg })).toMatchObject(questionNotFound);
     }
     expect(manager.get("foreign-question")?.status).toBe("pending");
-  });
-});
+  }));
 
-it("requires membership to resolve a suggest-capped guest question", async () => {
-  await withState(async () => {
+it("requires membership to resolve a suggest-capped guest question", () =>
+  withState(async () => {
     const { owner, guest, cfg, client } = await sharingFixture("suggest");
     using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     manager.request({ ...requestParams, id: "foreign-question" });
@@ -192,11 +177,10 @@ it("requires membership to resolve a suggest-capped guest question", async () =>
     expect(
       await call("question.resolve", { id: "foreign-question", cancel: true }, { client, cfg }),
     ).toEqual(ok({ status: "cancelled" }));
-  });
-});
+  }));
 
-it("scopes requested and resolved questions to operators allowed to see their session", async () => {
-  await withState(async () => {
+it("scopes requested and resolved questions to operators allowed to see their session", () =>
+  withState(async () => {
     const { owner, guest, cfg, profile: userProfile } = await sharingFixture();
     using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     const viewer = ensureProfileForEmail("viewer@example.test");
@@ -253,8 +237,7 @@ it("scopes requested and resolved questions to operators allowed to see their se
     expect(ownerClient.socket.send).toHaveBeenCalledTimes(2);
     expect(viewerClient.socket.send).toHaveBeenCalledTimes(2);
     expect(guestClient.socket.send).not.toHaveBeenCalled();
-  });
-});
+  }));
 
 const credentialUrl = new URL("https://example.test/connect");
 credentialUrl.username = "fixture-user";
@@ -360,8 +343,8 @@ it("requires admin scope to mint store-bound questions", async () => {
 
 it.each(["replacement", "abort"] as const)(
   "fences a pending credential on exact requester %s while preserving ordinary questions",
-  async (closure) => {
-    await withState(async () => {
+  (closure) =>
+    withState(async () => {
       const id = await requestSecretQuestion();
       const ordinary = await call("question.request", requestParams);
       const ordinaryId = (ordinary[1] as { id: string }).id;
@@ -373,8 +356,8 @@ it.each(["replacement", "abort"] as const)(
           runId: requestParams.runId,
         });
       } else {
-        const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
-        const registration = registerChatAbortController({
+        const chatAbortControllers = new Map<string, chatAbort.ChatAbortControllerEntry>();
+        const registration = chatAbort.registerChatAbortController({
           chatAbortControllers,
           runId: requestParams.runId,
           sessionId: "question-session",
@@ -387,7 +370,7 @@ it.each(["replacement", "abort"] as const)(
         // the exact claim before notifying the run's abort listeners.
         try {
           expect(
-            abortChatRunById(
+            chatAbort.abortChatRunById(
               {
                 chatAbortControllers,
                 chatRunState: createChatRunState(),
@@ -419,35 +402,25 @@ it.each(["replacement", "abort"] as const)(
           true,
         );
         if (successor) {
-          const successorClient = {
-            ...adminRequestClient,
-            internal: {
-              agentRuntimeIdentity: {
-                ...adminRequestClient.internal!.agentRuntimeIdentity!,
-                operationalRunInstance: successor.operationalRunInstance,
-                delegatedAuthority: { kind: "local", ...successor },
-              },
-            },
-          } as GatewayClient;
+          const successorClient = createQuestionRuntimeClient(
+            successor,
+            requestParams,
+            adminRequestClient,
+          );
           const replacement = await call("question.request", secretRequestParams, {
             client: successorClient,
           });
           const replacementId = (replacement[1] as { id: string }).id;
-          expect((await answerSecret(replacementId, "test-secret-current-requester"))[0]).toBe(
-            true,
-          );
-          expect(await readSecret()).toEqual({
-            ok: true,
-            value: "test-secret-current-requester",
-          });
+          const value = "test-secret-current-requester";
+          expect((await answerSecret(replacementId, value))[0]).toBe(true);
+          expect(await readSecret()).toEqual({ ok: true, value });
         }
       } finally {
         if (successor) {
           releaseAgentRunDelegatedAuthority(successor);
         }
       }
-    });
-  },
+    }),
 );
 
 it("requires admitted authority, not an admin's supplied run metadata", async () => {
@@ -459,8 +432,8 @@ it("requires admitted authority, not an admin's supplied run metadata", async ()
   expect(manager.list()).toEqual([]);
 });
 
-it("diverts operator-entered credentials into the store and exposes only a stored marker", async () => {
-  await withState(async () => {
+it("diverts operator-entered credentials into the store and exposes only a stored marker", () =>
+  withState(async () => {
     const id = await requestSecretQuestion();
     const value = "test-secret-value-gateway-diversion-123";
     const client = {
@@ -488,11 +461,10 @@ it("diverts operator-entered credentials into the store and exposes only a store
     published("question.resolved", { id, status: "answered", answers: storedAnswers });
     expect(JSON.stringify([resolved, manager.get(id), broadcast.mock.calls])).not.toContain(value);
     expect(isSecretValueRegisteredForRedaction(value)).toBe(true);
-  });
-});
+  }));
 
-it("uses operator-edited hosts and keeps invalid store submissions pending for retry", async () => {
-  await withState(async () => {
+it("uses operator-edited hosts and keeps invalid store submissions pending for retry", () =>
+  withState(async () => {
     const id = await requestSecretQuestion();
     const value = "test-secret-value-retry-123";
     const invalid = await answerSecret(id, value, { secretStoreAllowedHosts: ["*.example.test"] });
@@ -509,8 +481,7 @@ it("uses operator-edited hosts and keeps invalid store submissions pending for r
     expect((await listSecrets())[0]).toMatchObject({
       allowedHosts: ["replacement.example.test"],
     });
-  });
-});
+  }));
 
 it.each<[string, Record<string, string[]>, string | undefined]>([
   ["no submitted value", { secret_value: [] }, undefined],
@@ -540,8 +511,8 @@ it.each<[string, Record<string, string[]>, string | undefined]>([
   });
 });
 
-it("rejects masked env requests while preserving ordinary question host validation and cancellation", async () => {
-  await withState(async () => {
+it("rejects masked env requests while preserving ordinary question host validation and cancellation", () =>
+  withState(async () => {
     expect(
       await requestQuestions(
         [secretQuestion({ secretStore: { name: "SERVICE_URL", kind: "env" } })],
@@ -564,11 +535,10 @@ it("rejects masked env requests while preserving ordinary question host validati
     expect(await call("question.resolve", { id, cancel: true })).toEqual(
       ok({ status: "cancelled" }),
     );
-  });
-});
+  }));
 
-it("settles the SQLite commit before a second answer races its deferred refresh", async () => {
-  await withState(async () => {
+it("settles the SQLite commit before a second answer races its deferred refresh", () =>
+  withState(async () => {
     mockReferencedStoreSnapshot();
     const reload = createDeferred<{ warningCount: number }>();
     const reloadStarted = createDeferred();
@@ -604,11 +574,10 @@ it("settles the SQLite commit before a second answer races its deferred refresh"
       expect((await competitor)[0]).toBe(false);
     }
     expect(await manager.waitAnswer(id)).toEqual(answered());
-  });
-});
+  }));
 
-it("keeps a committed answer terminal and reports refresh failure without inviting overwrite", async () => {
-  await withState(async () => {
+it("keeps a committed answer terminal and reports refresh failure without inviting overwrite", () =>
+  withState(async () => {
     mockReferencedStoreSnapshot();
     reloadSecrets.mockRejectedValue(new Error("synthetic refresh failure"));
     const id = await requestSecretQuestion();
@@ -627,8 +596,7 @@ it("keeps a committed answer terminal and reports refresh failure without inviti
     expect(await readSecret()).toEqual({ ok: true, value });
     expect(reloadSecrets).toHaveBeenCalledTimes(1);
     expect(JSON.stringify([result, manager.get(id), broadcast.mock.calls])).not.toContain(value);
-  });
-});
+  }));
 
 it("returns INVALID_REQUEST for answers that violate the stored question", async () => {
   const requested = await requestQuestions([
@@ -656,55 +624,52 @@ it.each<[string, boolean, string[] | undefined, string[] | undefined, string[]]>
   ["concurrent host update", true, undefined, undefined, ["a.example.test"]],
   ["empty proposed policy", true, [], undefined, []],
   ["operator clears policy", true, undefined, [], ["a.example.test"]],
-])(
-  "saves only the consented host policy: %s",
-  async (_scenario, existing, proposal, override, shown) => {
-    await withState(async () => {
-      const entry = {
-        scope: { kind: "team" as const },
-        name: "SERVICE_API_KEY",
-        kind: "secret" as const,
-        value: "test-secret-existing",
-        updatedBy: "Previous Operator",
-      };
-      if (existing) {
-        await writeSecretStoreEntry({ ...entry, allowedHosts: ["a.example.test"] });
-      }
-      const id = await requestSecretQuestion({
-        name: entry.name,
-        kind: entry.kind,
-        ...(proposal !== undefined ? { allowedHosts: proposal } : {}),
-      });
-      const question = {
-        secretStore: { name: entry.name, kind: entry.kind, allowedHosts: shown },
-        ...(existing
-          ? { secretStoreExisting: { updatedAtMs: 1_000, updatedBy: entry.updatedBy } }
-          : {}),
-      };
-      const displayed = await call("question.get", { id });
-      expect(displayed).toMatchObject(ok({ question: { questions: [question] } }));
-      expect(JSON.stringify(displayed)).not.toContain(entry.value);
-      published(
-        "question.requested",
-        expect.objectContaining({ id, questions: [expect.objectContaining(question)] }),
-      );
-      if (!existing) {
-        expect(manager.get(id)?.questions[0]).not.toHaveProperty("secretStoreExisting");
-      }
-      await writeSecretStoreEntry({ ...entry, allowedHosts: ["b.example.test"] });
-      expect((await listSecrets())[0]?.allowedHosts).toEqual(["b.example.test"]);
-      const value = "test-secret-consented-replacement";
-      const resolved = await call("question.resolve", {
-        id,
-        answers: secretAnswers(value),
-        ...(override !== undefined ? { secretStoreAllowedHosts: override } : {}),
-      });
-      expect(resolved).toEqual(ok(answered()));
-      expect(manager.get(id)).toMatchObject(answered());
-      expect(await listSecrets()).toMatchObject([
-        { name: entry.name, kind: "secret", allowedHosts: override ?? shown },
-      ]);
-      expect(await readSecret()).toEqual({ ok: true, value });
+])("saves only the consented host policy: %s", (_scenario, existing, proposal, override, shown) =>
+  withState(async () => {
+    const entry = {
+      scope: { kind: "team" as const },
+      name: "SERVICE_API_KEY",
+      kind: "secret" as const,
+      value: "test-secret-existing",
+      updatedBy: "Previous Operator",
+    };
+    if (existing) {
+      await store.writeSecretStoreEntry({ ...entry, allowedHosts: ["a.example.test"] });
+    }
+    const id = await requestSecretQuestion({
+      name: entry.name,
+      kind: entry.kind,
+      ...(proposal !== undefined ? { allowedHosts: proposal } : {}),
     });
-  },
+    const question = {
+      secretStore: { name: entry.name, kind: entry.kind, allowedHosts: shown },
+      ...(existing
+        ? { secretStoreExisting: { updatedAtMs: 1_000, updatedBy: entry.updatedBy } }
+        : {}),
+    };
+    const displayed = await call("question.get", { id });
+    expect(displayed).toMatchObject(ok({ question: { questions: [question] } }));
+    expect(JSON.stringify(displayed)).not.toContain(entry.value);
+    published(
+      "question.requested",
+      expect.objectContaining({ id, questions: [expect.objectContaining(question)] }),
+    );
+    if (!existing) {
+      expect(manager.get(id)?.questions[0]).not.toHaveProperty("secretStoreExisting");
+    }
+    await store.writeSecretStoreEntry({ ...entry, allowedHosts: ["b.example.test"] });
+    expect((await listSecrets())[0]?.allowedHosts).toEqual(["b.example.test"]);
+    const value = "test-secret-consented-replacement";
+    const resolved = await call("question.resolve", {
+      id,
+      answers: secretAnswers(value),
+      ...(override !== undefined ? { secretStoreAllowedHosts: override } : {}),
+    });
+    expect(resolved).toEqual(ok(answered()));
+    expect(manager.get(id)).toMatchObject(answered());
+    expect(await listSecrets()).toMatchObject([
+      { name: entry.name, kind: "secret", allowedHosts: override ?? shown },
+    ]);
+    expect(await readSecret()).toEqual({ ok: true, value });
+  }),
 );

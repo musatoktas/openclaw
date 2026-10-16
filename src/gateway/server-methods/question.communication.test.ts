@@ -7,11 +7,7 @@ import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  claimAgentRunDelegatedAuthority,
-  releaseAgentRunDelegatedAuthority,
-  validateAgentRunDelegatedAuthority,
-} from "../../infra/agent-run-registry.js";
+import * as runs from "../../infra/agent-run-registry.js";
 import type { CommunicationEndpoint } from "../../sessions/communication-admission.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
@@ -21,7 +17,7 @@ import {
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { createOperatorClient } from "../server-plugin-in-process-dispatch.test-support.js";
 import { requestSessionCommunicationApproval } from "../session-communication-approval.js";
-import { resolveGatewaySessionStoreTargetInWorker } from "../session-utils-store-worker.js";
+import { resolveGatewaySessionStoreTargetInWorker as loadTarget } from "../session-utils-store-worker.js";
 import {
   broadcast,
   callQuestionRpc,
@@ -90,17 +86,14 @@ async function fixture(run: (f: Awaited<ReturnType<typeof createFixture>>) => Pr
   );
 }
 
-function beforeAdmission(question: Promise<string>, pending: Promise<unknown>) {
-  return Promise.race([
+const beforeAdmission = (question: Promise<string>, pending: Promise<unknown>) =>
+  Promise.race([
     question,
-    pending.then(() => {
-      throw new Error("Expected approval before admission");
-    }),
+    pending.then(() => expect.unreachable("Expected approval before admission")),
   ]);
-}
 
-it("publishes to the real recipient under sender ALS and refuses model/admin self-approval", async () => {
-  await fixture(async ({ endpoint, creator, admin, ask, resolve }) => {
+it("publishes to the real recipient under sender ALS and refuses model/admin self-approval", () =>
+  fixture(async ({ endpoint, creator, admin, ask, resolve }) => {
     const model = { ...admin, internal: { syntheticClient: true as const } };
     broadcast.mockImplementation((event, _payload, options) => {
       if (event === "question.requested") {
@@ -120,20 +113,16 @@ it("publishes to the real recipient under sender ALS and refuses model/admin sel
     expect(manager.get(question.id)?.status).toBe("pending");
     expect((await resolve(creator, question.id))[0]).toBe(true);
     await expect(pending).resolves.toBeUndefined();
-  });
-});
+  }));
 
-it("retains creator/admin rights without treating assigned responsibility as authority", async () => {
-  await fixture(async ({ endpoint, cfg, creator, admin, peer, ask, resolve, get }) => {
+it("retains creator/admin rights without treating assigned responsibility as authority", () =>
+  fixture(async ({ endpoint, cfg, creator, admin, peer, ask, resolve, get }) => {
     endpoint.entry!.owner = { actor: { type: "human", id: "sender" } };
     const pending = expect(ask()).rejects.toThrow("not authorized");
-    const question = manager.list()[0]!;
-    const canRead = async (client: GatewayClient) => (await get(client, question.id))[0];
-    expect([await canRead(creator), await canRead(admin), await canRead(peer)]).toEqual([
-      true,
-      true,
-      false,
-    ]);
+    const id = manager.list()[0]!.id;
+    const canRead = async (client: GatewayClient) => (await get(client, id))[0];
+    const access = [await canRead(creator), await canRead(admin), await canRead(peer)];
+    expect(access).toEqual([true, true, false]);
     expect((await callQuestionRpc("question.list", {}, { cfg, client: peer }))[1]).toEqual({
       questions: [],
     });
@@ -141,30 +130,28 @@ it("retains creator/admin rights without treating assigned responsibility as aut
     expect(await canRead(solo)).toBe(true);
     creator.invalidated = true;
     await expect(canRead(creator)).rejects.toThrow("requester authority changed");
-    await resolve(admin, question.id, "Deny");
+    await resolve(admin, id, "Deny");
     await pending;
-  });
-});
+  }));
 
-it("rejects an already displayed decision after the recipient incarnation changes", async () => {
-  await fixture(async ({ endpoint, creator, admin, ask, resolve, write }) => {
+it("rejects an already displayed decision after the recipient incarnation changes", () =>
+  fixture(async ({ endpoint, creator, admin, ask, resolve, write }) => {
     const denied = expect(ask()).rejects.toThrow("not authorized");
-    const question = manager.list()[0]!;
+    const id = manager.list()[0]!.id;
     await write(endpoint.sessionKey, {
       ...endpoint.entry!,
       sessionId: "replacement-recipient-session",
       lifecycleRevision: "replacement-recipient-lifecycle",
     });
-    expect((await resolve(creator, question.id))[0]).toBe(false);
-    expect(manager.get(question.id)?.status).toBe("pending");
-    expect((await resolve(admin, question.id))[0]).toBe(false);
-    manager.cancel(question.id, "recipient-replaced");
+    expect((await resolve(creator, id))[0]).toBe(false);
+    expect(manager.get(id)?.status).toBe("pending");
+    expect((await resolve(admin, id))[0]).toBe(false);
+    manager.cancel(id, "recipient-replaced");
     await denied;
-  });
-});
+  }));
 
-it("cancellation and expiration settle without approval and cannot be released by later policy changes", async () => {
-  await fixture(async ({ ask }) => {
+it("cancellation and expiration settle without approval and cannot be released by later policy changes", () =>
+  fixture(async ({ ask }) => {
     const controller = new AbortController();
     const cancelledCheck = expect(ask(controller.signal)).rejects.toThrow();
     controller.abort();
@@ -173,21 +160,16 @@ it("cancellation and expiration settle without approval and cannot be released b
     await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
     await expiredCheck;
     expect(manager.list()).toEqual([]);
-  });
-});
+  }));
 
 it.each(["Allow once", "Deny"] as const)(
   "missing configured main gets real recipient consent after empty creation: %s",
-  async (decision) => {
-    await fixture(async ({ endpoint, cfg, creator, admin, context, write, resolve }) => {
+  (decision) =>
+    fixture(async ({ endpoint, cfg, creator, admin, context, write, resolve }) => {
       cfg.session!.communication = { send: "ask", receive: "ask" };
       setRuntimeConfigSnapshot(cfg);
       const read = async (key: string): Promise<CommunicationEndpoint> => {
-        const loaded = await resolveGatewaySessionStoreTargetInWorker({
-          cfg,
-          key,
-          agentId: "main",
-        });
+        const loaded = await loadTarget({ cfg, key, agentId: "main" });
         return {
           agentId: loaded.agentId,
           sessionKey: loaded.canonicalKey,
@@ -221,7 +203,7 @@ it.each(["Allow once", "Deny"] as const)(
         .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
         .mockResolvedValue(undefined);
       const operationalRunInstance = createOperationalRunInstanceRef("communication-sender");
-      const authority = claimAgentRunDelegatedAuthority(operationalRunInstance);
+      const authority = runs.claimAgentRunDelegatedAuthority(operationalRunInstance);
       try {
         const pending = withGatewayToolCallerIdentity(
           {
@@ -230,7 +212,7 @@ it.each(["Allow once", "Deny"] as const)(
             gatewayContextResolver: () => context,
             operationalRunInstance,
             approvalAuthority: authority,
-            receiptAuthority: () => validateAgentRunDelegatedAuthority(authority),
+            receiptAuthority: () => runs.validateAgentRunDelegatedAuthority(authority),
           },
           () =>
             prepareSessionsSendCommunication({
@@ -242,10 +224,7 @@ it.each(["Allow once", "Deny"] as const)(
               callGateway: inProcessGateway.callAgentToolGatewayRequest,
             }),
         );
-        const observed = pending.then(
-          (gate) => ({ gate, error: undefined }),
-          (error: unknown) => ({ gate: undefined, error }),
-        );
+        const observed = Promise.allSettled([pending]);
         const senderId = await beforeAdmission(questions.get(source.sessionKey)!.promise, pending);
         expect(ensureTarget).not.toHaveBeenCalled();
         expect(callGateway).not.toHaveBeenCalled();
@@ -256,20 +235,20 @@ it.each(["Allow once", "Deny"] as const)(
         );
         expect(ensureTarget).toHaveBeenCalledOnce();
         expect(callGateway).not.toHaveBeenCalled();
-        expect(manager.get(recipientId)).toMatchObject({
-          sessionKey: target.sessionKey,
-          status: "pending",
-        });
+        const recipient = manager.get(recipientId);
+        expect(recipient).toMatchObject({ sessionKey: target.sessionKey, status: "pending" });
         expect((await read(target.sessionKey)).entry?.sessionId).toBe("created-empty-main");
         expect((await resolve(admin, recipientId, decision))[0]).toBe(true);
-        const result = await observed;
-        if (decision === "Deny") {
-          expect(result.error).toBeInstanceOf(Error);
+        const [result] = await observed;
+        if (result.status === "rejected") {
+          expect(decision).toBe("Deny");
+          expect(result.reason).toBeInstanceOf(Error);
           expect(callGateway).not.toHaveBeenCalled();
         } else {
-          expect(result.error).toBeUndefined();
-          expect(result.gate).toBeDefined();
-          await result.gate!.callGateway({
+          expect(decision).toBe("Allow once");
+          const gate = result.value;
+          expect(gate).toBeDefined();
+          await gate.callGateway({
             method: "agent",
             params: {
               agentId: "main",
@@ -278,12 +257,11 @@ it.each(["Allow once", "Deny"] as const)(
             },
           });
           expect(callGateway).toHaveBeenCalledOnce();
-          result.gate!.close();
+          gate.close();
         }
       } finally {
         callGateway.mockRestore();
-        releaseAgentRunDelegatedAuthority(authority);
+        runs.releaseAgentRunDelegatedAuthority(authority);
       }
-    });
-  },
+    }),
 );

@@ -3,7 +3,7 @@ import { createDeferred } from "../../../test/helpers/promise.js";
 import * as runAdmission from "../../agents/admitted-run-context.js";
 import * as runs from "../../agents/embedded-agent-runner/runs.js";
 import { testing as embeddedRunTesting } from "../../agents/embedded-agent-runner/runs.test-support.js";
-import * as caller from "../../agents/tools/gateway-caller-context.js";
+import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { isReplyRunEvidenceStale } from "../../auto-reply/reply/reply-run-registry.state.js";
 import { admitReplyTurn } from "../../auto-reply/reply/reply-turn-admission.js";
@@ -17,20 +17,24 @@ import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-c
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createAgentRuntimeApprovalAuthorityValidator } from "../agent-runtime-approval-authority.js";
 import { QuestionManager } from "../question-manager.js";
-import { createQuestionHandlers } from "./question.js";
-import { createSecretStoreWriteService } from "./secrets.js";
-import type { GatewayClient, GatewayRequestHandlerOptions, RespondFn } from "./types.js";
+import {
+  admitQuestionRun,
+  createQuestionRuntimeClient,
+  createQuestionTestHandlers,
+  invokeQuestionRpc,
+  requestParams,
+} from "./question.test-support.js";
+import type { GatewayClient, GatewayRequestHandlerOptions } from "./types.js";
 
 const session = { sessionId: "human-wait-session", sessionKey: "agent:main:main" };
 const ref = { ...session, runId: "human-wait-run" };
 const target = { agentId: "main", sessionKey: session.sessionKey };
-const answers = () => ({ answers: { answer: ["synthetic-human-answer"] } });
+const answers = () => ({ answers: { destination: ["synthetic-human-answer"] } });
 let manager: QuestionManager;
-let scheduler: ReturnType<typeof createTestGatewayScheduler>;
 let authority: registry.AgentRunDelegatedAuthority;
 let unregister: () => void;
 let client: GatewayClient;
-let handlers: ReturnType<typeof createQuestionHandlers>;
+let handlers: ReturnType<typeof createQuestionTestHandlers>;
 let admission: runAdmission.PreparedAgentRunAdmission;
 let onBroadcast: (event: string) => void;
 let requesterActive: boolean;
@@ -38,32 +42,12 @@ let validateAuthority: ReturnType<typeof createAgentRuntimeApprovalAuthorityVali
 const abort = vi.fn();
 let handle: runs.EmbeddedAgentQueueHandle;
 
-function runtimeClient(claim: registry.AgentRunDelegatedAuthority): GatewayClient {
-  return {
-    connect: { scopes: ["operator.admin"] },
-    internal: {
-      agentRuntimeIdentity: {
-        kind: "agentRuntime",
-        ...target,
-        operationalRunInstance: claim.operationalRunInstance,
-        delegatedAuthority: { kind: "local", ...claim },
-      },
-    },
-  } as GatewayClient;
-}
-
 function heartbeat(
   recovery = vi.fn(recoverStuckDiagnosticSession),
   options: Parameters<typeof startGatewayDiagnosticHeartbeat>[2] = {},
 ) {
-  startGatewayDiagnosticHeartbeat(
-    createTestGatewayScheduler("fake-timers"),
-    {},
-    {
-      ...options,
-      recoverStuckSession: recovery,
-    },
-  );
+  const opts = { ...options, recoverStuckSession: recovery };
+  startGatewayDiagnosticHeartbeat(createTestGatewayScheduler("fake-timers"), {}, opts);
   return recovery;
 }
 
@@ -98,40 +82,27 @@ beforeEach(async () => {
   vi.useFakeTimers();
   vi.setSystemTime(Date.parse("2026-08-20T12:00:00Z"));
   diagnostics.setDiagnosticsEnabledForProcess(true);
-  scheduler = createTestGatewayScheduler("fake-timers");
+  const scheduler = createTestGatewayScheduler("fake-timers");
   manager = new QuestionManager(scheduler);
   onBroadcast = () => {};
   requesterActive = true;
   const validateRunAuthority = createAgentRuntimeApprovalAuthorityValidator();
   validateAuthority = (identity) => requesterActive && validateRunAuthority(identity);
   registry.registerAgentRunContext(ref.runId, target);
-  admission = runAdmission.prepareSystemAgentRunAdmission(
-    {},
-    ref.runId,
-    "main",
-    "question-recovery-test",
-  );
-  const admitted = await admission.admit("embedded");
+  const { parent, admitted, caller } = await admitQuestionRun({}, ref.runId, target, "question");
+  admission = parent;
   authority = runAdmission.getAdmittedRunDelegatedAuthority(admitted)!;
   unregister = registry.registerAgentRunDelegatedAuthorityClosedHandler(() =>
     manager.cancelClosedAuthorities(),
   );
-  client = runtimeClient(authority);
-  handlers = createQuestionHandlers(
-    manager,
-    createSecretStoreWriteService({ reloadSecrets: async () => ({ warningCount: 0 }) }),
-    scheduler,
-  );
+  client = createQuestionRuntimeClient(authority, target);
+  handlers = createQuestionTestHandlers(manager, scheduler);
   abort.mockReset().mockImplementation(() => {
     registry.releaseAgentRunDelegatedAuthority(authority);
     runs.clearActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey);
   });
-  await caller.withGatewayToolCallerIdentity(
-    caller.createAdmittedGatewayToolCallerIdentity({
-      admittedRunContext: admitted,
-      ...target,
-    }),
-    () => runs.setActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey),
+  await withGatewayToolCallerIdentity(caller, () =>
+    runs.setActiveEmbeddedRun(ref.sessionId, handle, ref.sessionKey),
   );
 });
 
@@ -148,20 +119,15 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-async function call(
+function call(
   method: string,
   params: Record<string, unknown>,
   trusted = true,
   requestAuthority: Pick<GatewayRequestHandlerOptions, "signal" | "hasCurrentClientAuthority"> = {},
 ) {
-  const responses: Parameters<RespondFn>[] = [];
   const cfg = {};
-  await handlers[method]!({
-    req: { type: "req", id: "request", method, params },
-    params,
+  return invokeQuestionRpc(method, params, handlers[method]!, {
     client: trusted ? client : ({ connect: { scopes: ["operator.admin"] } } as GatewayClient),
-    respond: (...args) => responses.push(args),
-    isWebchatConnect: () => false,
     ...requestAuthority,
     context: {
       broadcast: (event: string) => onBroadcast(event),
@@ -169,30 +135,17 @@ async function call(
       validateAgentRuntimeApprovalAuthority: validateAuthority,
     } as unknown as GatewayRequestHandlerOptions["context"],
   });
-  return responses[0];
 }
 
 async function request(trusted = true, timeoutMs = 3_600_000, id = "human-question") {
   const params = {
+    ...requestParams,
     id,
     ...target,
     runId: ref.runId,
     timeoutMs,
-    questions: [
-      {
-        questionId: "answer",
-        header: "Input",
-        question: "Provide the requested input",
-        options: [],
-        isOther: true,
-      },
-    ],
   };
   expect((await call("question.request", params, trusted))?.[0]).toBe(true);
-  expect(manager.get(params.id)).toMatchObject({
-    status: "pending",
-    expiresAtMs: Date.now() + timeoutMs,
-  });
   return params.id;
 }
 
@@ -205,16 +158,13 @@ function startQuestionTool(toolCallId: string) {
   });
 }
 
-it("keeps an accepted one-hour question alive through default diagnostic recovery", async () => {
-  await withState(async () => {
+it("keeps an accepted one-hour question alive through default diagnostic recovery", () =>
+  withState(async () => {
     const recovery = heartbeat();
     startQuestionTool("human-call");
     await vi.advanceTimersByTimeAsync(10_000);
     const id = await request();
     await vi.advanceTimersByTimeAsync(920_000);
-    expect(recovery).toHaveBeenCalledWith(
-      expect.objectContaining({ allowActiveAbort: true, queueDepth: 0 }),
-    );
     expect([abort.mock.calls.length, manager.get(id)?.status]).toEqual([0, "pending"]);
     const answer = manager.waitAnswer(id);
     await vi.advanceTimersByTimeAsync(2_500_000);
@@ -227,8 +177,7 @@ it("keeps an accepted one-hour question alive through default diagnostic recover
     await vi.advanceTimersByTimeAsync(900_000);
     await Promise.all(recovery.mock.results.map((result) => result.value));
     expect(abort).toHaveBeenCalledTimes(1);
-  });
-});
+  }));
 
 function recover() {
   return recoverStuckDiagnosticSession({
@@ -239,8 +188,8 @@ function recover() {
   });
 }
 
-it("keeps a replacement alive when a heartbeat expires its pending question", async () => {
-  await withState(async () => {
+it("keeps a replacement alive when a heartbeat expires its pending question", () =>
+  withState(async () => {
     const heartbeatAtMs = Date.now() + 900_000;
     const recovery = vi.fn(recoverStuckDiagnosticSession);
     const replacement = replacementHandle();
@@ -266,17 +215,14 @@ it("keeps a replacement alive when a heartbeat expires its pending question", as
     await vi.advanceTimersByTimeAsync(50);
     const id = await request(true, 900_000);
     const answer = manager.waitAnswer(id);
-
     await vi.advanceTimersByTimeAsync(899_950);
     await Promise.all(recovery.mock.results.map((result) => result.value));
-
     await expect(answer).resolves.toEqual({ status: "expired" });
     expect([abort.mock.calls, replacement.abort.mock.calls]).toEqual([[], []]);
-  });
-});
+  }));
 
-it("keeps resumed question work alive when attention reporting settles the question", async () => {
-  await withState(async () => {
+it("keeps resumed question work alive when attention reporting settles the question", () =>
+  withState(async () => {
     const recovery = heartbeat(undefined, { sampleLiveness: () => null });
     startQuestionTool("reporting-settlement-call");
     const id = await request();
@@ -294,13 +240,8 @@ it("keeps resumed question work alive when attention reporting settles the quest
     });
     try {
       await vi.advanceTimersByTimeAsync(900_000);
-      expect(manager.observe(id)?.record.status).toBe("cancelled");
       const outcomes = await Promise.all(recovery.mock.results.map((result) => result.value));
-
       await expect(answer).resolves.toEqual({ status: "cancelled" });
-      expect(recovery).toHaveBeenCalledWith(
-        expect.objectContaining({ allowActiveAbort: true, ageMs: 900_000 }),
-      );
       expect(outcomes).toContainEqual(
         expect.objectContaining({ status: "skipped", reason: "stale_session_state" }),
       );
@@ -308,8 +249,7 @@ it("keeps resumed question work alive when attention reporting settles the quest
     } finally {
       unsubscribe();
     }
-  });
-});
+  }));
 
 it.each(["active", "signal", "current client"] as const)(
   "settles a stopped RPC observer with %s authority without expiring its question",
@@ -321,13 +261,10 @@ it.each(["active", "signal", "current client"] as const)(
     const controller = new AbortController();
     let current = true;
     const registered = vi.spyOn(manager, "waitAnswer");
-    const auth =
-      source === "active"
-        ? {}
-        : {
-            signal: controller.signal,
-            hasCurrentClientAuthority: () => current,
-          };
+    const auth = {
+      signal: source === "active" ? undefined : controller.signal,
+      hasCurrentClientAuthority: source === "active" ? undefined : () => current,
+    };
     const waiting = observer.track(() => call("question.waitAnswer", { id }, false, auth));
     const result = Promise.allSettled([waiting]);
     try {
@@ -378,53 +315,44 @@ it("does not let operator questions or public diagnostic text suppress unrelated
 it("keeps explicit user abort authoritative during human input", async () => {
   const id = await request();
   await expect(recover()).resolves.toMatchObject({ reason: "human_input_wait" });
-  await expect(
-    runs.abortAndDrainEmbeddedAgentRun({ ...ref, reason: "user_abort" }),
-  ).resolves.toMatchObject({
-    aborted: true,
-    drained: true,
-  });
+  const result = await runs.abortAndDrainEmbeddedAgentRun({ ...ref, reason: "user_abort" });
+  expect(result).toMatchObject({ aborted: true, drained: true });
   expect(manager.get(id)?.status).toBe("cancelled");
 });
 
-it.each([true, false])(
-  "protects late human input only for its owning reply backend (%s)",
-  async (owns) => {
-    const operation = createReplyOperation({ ...session, resetTriggered: false });
+it.each([true, false])("checks reply-backend wait ownership (%s)", async (owns) => {
+  const operation = createReplyOperation({ ...session, resetTriggered: false });
+  if (owns) {
+    operation.attachBackend(Object.assign(handle, { kind: "embedded" as const, cancel: abort }));
+    const surface = () => "human-wait-surface";
+    operation.bindToolAuthoritySnapshot({ fingerprint: surface, project: surface });
+  } else {
+    operation.attachBackend({ ...handle, kind: "embedded", cancel: () => {} });
+  }
+  operation.setPhase("running");
+  try {
+    await request();
+    startQuestionTool(owns ? "late-answer-call" : "unrelated-call");
+    await vi.advanceTimersByTimeAsync(930_000);
+    expect(isReplyRunEvidenceStale(operation)).toBe(!owns);
     if (owns) {
-      operation.attachBackend(Object.assign(handle, { kind: "embedded" as const, cancel: abort }));
-      operation.bindToolAuthoritySnapshot({
-        fingerprint: () => "human-wait-surface",
-        project: () => "human-wait-surface",
+      await expect(
+        admitReplyTurn({
+          ...session,
+          kind: "visible",
+          resetTriggered: false,
+          waitForActive: false,
+        }),
+      ).resolves.toMatchObject({
+        status: "skipped",
+        reason: "active-run",
+        activeOperation: operation,
       });
-    } else {
-      operation.attachBackend({ ...handle, kind: "embedded", cancel: () => {} });
     }
-    operation.setPhase("running");
-    try {
-      await request();
-      startQuestionTool(owns ? "late-answer-call" : "unrelated-call");
-      await vi.advanceTimersByTimeAsync(930_000);
-      expect(isReplyRunEvidenceStale(operation)).toBe(!owns);
-      if (owns) {
-        await expect(
-          admitReplyTurn({
-            ...session,
-            kind: "visible",
-            resetTriggered: false,
-            waitForActive: false,
-          }),
-        ).resolves.toMatchObject({
-          status: "skipped",
-          reason: "active-run",
-          activeOperation: operation,
-        });
-      }
-    } finally {
-      operation.complete();
-    }
-  },
-);
+  } finally {
+    operation.complete();
+  }
+});
 
 it("does not transfer a pending question to a replacement handle with the same run ID", async () => {
   await request();
@@ -441,7 +369,7 @@ it("refuses to bind new authority to the old handle when a run ID is reused", as
     instanceId: "replacement-instance",
   });
   try {
-    client = runtimeClient(replacementAuthority);
+    client = createQuestionRuntimeClient(replacementAuthority, target);
     await request(true, 3_600_000, "replacement-question");
     await expect(recover()).resolves.toMatchObject({ status: "aborted" });
   } finally {

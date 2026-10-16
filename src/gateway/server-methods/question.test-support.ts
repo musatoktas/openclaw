@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, vi } from "vitest";
 import type { QuestionRequestQuestion } from "../../../packages/gateway-protocol/src/index.js";
+import { prepareSystemAgentRunAdmission as prepareRun } from "../../agents/admitted-run-context.js";
+import { createAdmittedGatewayToolCallerIdentity as createCaller } from "../../agents/tools/gateway-caller-context.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
@@ -13,6 +15,7 @@ import {
   releaseAgentRunDelegatedAuthority,
   type AgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
+import { bindGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { createAgentRuntimeApprovalAuthorityValidator } from "../agent-runtime-approval-authority.js";
@@ -28,7 +31,12 @@ import { canReceiveSessionEvent, prepareProjectedSessionSharing } from "../sessi
 import { resolveSessionStoreIdentity } from "../session-store-key.js";
 import { createQuestionHandlers } from "./question.js";
 import { createSecretStoreWriteService } from "./secrets.js";
-import type { GatewayClient, GatewayRequestOptions, RespondFn } from "./types.js";
+import type {
+  GatewayClient,
+  GatewayRequestHandlerOptions,
+  GatewayRequestOptions,
+  RespondFn,
+} from "./types.js";
 
 export let manager: QuestionManager;
 let scheduler: ReturnType<typeof createTestGatewayScheduler>;
@@ -49,6 +57,9 @@ export async function createQuestionSource(
   client: GatewayClient,
   cfg: OpenClawConfig,
   viaClient = false,
+  context: Parameters<typeof captureGatewayOperatorRunAuthority>[0]["context"] = {
+    getRuntimeConfig: () => cfg,
+  },
 ) {
   const controller = new AbortController();
   const authority = {
@@ -60,7 +71,7 @@ export async function createQuestionSource(
   }
   const source = await captureGatewayOperatorRunAuthority({
     client,
-    context: { getRuntimeConfig: () => cfg },
+    context,
     ...(viaClient ? {} : { sourceAuthority: authority }),
   });
   if (!source) {
@@ -164,18 +175,7 @@ export function installQuestionTestHooks() {
       instanceId: "requester-instance",
       runId: requestParams.runId,
     });
-    adminRequestClient = {
-      connect: { scopes: ["operator.admin"] },
-      internal: {
-        agentRuntimeIdentity: {
-          kind: "agentRuntime",
-          agentId: requestParams.agentId,
-          sessionKey: requestParams.sessionKey,
-          operationalRunInstance: requesterAuthority.operationalRunInstance,
-          delegatedAuthority: { kind: "local", ...requesterAuthority },
-        },
-      },
-    } as GatewayClient;
+    adminRequestClient = createQuestionRuntimeClient(requesterAuthority, requestParams);
     unregisterAuthorityClosed = registerAgentRunDelegatedAuthorityClosedHandler((authority) =>
       manager.cancelClosedAuthorities(authority.operationalRunInstance),
     );
@@ -205,30 +205,30 @@ export async function callQuestionRpc(
     "hasCurrentClientAuthority"
   >,
 ) {
-  const calls: Parameters<RespondFn>[] = [];
-  const respond: RespondFn = (...args) => calls.push(args);
   const cfg = options?.cfg ?? {};
-  const request = {
-    req: { type: "req" as const, id: "request-1", method, params },
+  const response = await invokeQuestionRpc(
+    method,
     params,
-    respond,
-    client: options?.client ?? null,
-    hasCurrentClientAuthority: options?.hasCurrentClientAuthority,
-    isWebchatConnect: () => false,
-    context: createDirectChatContext({
-      broadcast,
-      questionManager: manager,
-      validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
-      getRuntimeConfig: () => cfg,
-    }),
-  };
-  if (options?.registered) {
-    const { handleGatewayRequest } = await import("../server-methods.js");
-    await handleGatewayRequest({ ...request, extraHandlers: handlers });
-  } else {
-    await handlers[method]?.(request);
-  }
-  const response = calls[0];
+    async (request) => {
+      if (options?.registered) {
+        const { handleGatewayRequest } = await import("../server-methods.js");
+        await handleGatewayRequest({ ...request, extraHandlers: handlers });
+      } else {
+        await handlers[method]?.(request);
+      }
+    },
+    {
+      client: options?.client ?? null,
+      hasCurrentClientAuthority: options?.hasCurrentClientAuthority,
+      context: createDirectChatContext({
+        broadcast,
+        questionManager: manager,
+        validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
+        getRuntimeConfig: () => cfg,
+      }),
+    },
+    "request-1",
+  );
   if (!response) {
     throw new Error(`expected ${method} response`);
   }
@@ -284,4 +284,70 @@ export async function requestSecretQuestion(
   );
   expect(response[0]).toBe(true);
   return (response[1] as { id: string }).id;
+}
+
+export function createQuestionRuntimeClient(
+  claim: AgentRunDelegatedAuthority,
+  { agentId, sessionKey }: { agentId: string; sessionKey: string } = requestParams,
+  client = { connect: { scopes: ["operator.admin"] } } as GatewayClient,
+): GatewayClient {
+  return {
+    ...client,
+    internal: {
+      ...client.internal,
+      agentRuntimeIdentity: {
+        kind: "agentRuntime",
+        agentId,
+        sessionKey,
+        operationalRunInstance: claim.operationalRunInstance,
+        delegatedAuthority: { kind: "local", ...claim },
+      },
+    },
+  };
+}
+
+export function createQuestionTestHandlers(
+  questionManager: QuestionManager,
+  clock: Parameters<typeof createQuestionHandlers>[2],
+) {
+  return createQuestionHandlers(
+    questionManager,
+    createSecretStoreWriteService({ reloadSecrets: async () => ({ warningCount: 0 }) }),
+    clock,
+  );
+}
+
+export async function invokeQuestionRpc(
+  method: string,
+  params: Record<string, unknown>,
+  dispatch: (options: GatewayRequestHandlerOptions) => void | Promise<void>,
+  options: Omit<GatewayRequestOptions, "req" | "respond" | "isWebchatConnect">,
+  id = "request",
+) {
+  const responses: Parameters<RespondFn>[] = [];
+  await dispatch({
+    ...options,
+    req: { type: "req", id, method, params },
+    params,
+    respond: (...args) => responses.push(args),
+    isWebchatConnect: () => false,
+  });
+  return responses[0];
+}
+
+export async function admitQuestionRun(
+  cfg: OpenClawConfig,
+  runId: string,
+  target: { agentId: string; sessionKey: string },
+  label: string,
+  authority?: Parameters<typeof prepareRun>[5],
+  resolve?: Parameters<typeof bindGatewayContextResolver>[1],
+) {
+  const parent = prepareRun(cfg, runId, target.agentId, label, undefined, authority);
+  const admitted = await parent.admit("embedded");
+  if (resolve) {
+    bindGatewayContextResolver(admitted, resolve);
+  }
+  const caller = createCaller({ admittedRunContext: admitted, ...target });
+  return { parent, admitted, caller };
 }
