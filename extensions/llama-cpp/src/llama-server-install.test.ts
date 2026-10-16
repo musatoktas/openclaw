@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import type { ExecFileException } from "node:child_process";
 import { createHash } from "node:crypto";
 import nodeFs from "node:fs";
 import fs from "node:fs/promises";
@@ -62,19 +61,12 @@ function mockCommand(
       options: { timeout?: number },
       callback: (error: unknown, stdout: string, stderr: string) => void,
     ) => {
-      try {
-        const output = run(command, args, options);
-        if (typeof output === "string") {
-          callback(null, output, "");
-        } else {
-          void output.then(
-            (text) => callback(null, text, ""),
-            (error: unknown) => callback(error, "", ""),
-          );
-        }
-      } catch (error) {
-        callback(error, "", "");
-      }
+      void Promise.resolve()
+        .then(() => run(command, args, options))
+        .then(
+          (output) => callback(null, output, ""),
+          (error: unknown) => callback(error, "", ""),
+        );
     },
   );
 }
@@ -160,10 +152,6 @@ async function createCpuArchive() {
     release: vi.fn(),
   }));
   return { root, asset, runtime };
-}
-
-function mockVersionOutput(output: string): void {
-  mockCommand(() => output);
 }
 
 function mockDownload(payload: Buffer): ReturnType<typeof vi.fn> {
@@ -319,13 +307,8 @@ describe("downloadVerifiedFile", () => {
     },
   );
 
-  it.each([
-    {
-      label: "shared clock ticks after an established sample",
-      times: [1010, 1010, 1030],
-      rates: [100_000_000, 100_000_000, 100_000_000],
-    },
-  ])("counts every persisted byte in the rate across $label", async ({ times, rates }) => {
+  it("counts every persisted byte across shared clock ticks after an established sample", async () => {
+    const times = [1010, 1010, 1030];
     const { destination } = await createDestination();
     const chunks = [1, 2, 3].map((value) => Buffer.alloc(1_000_000, value));
     const payload = Buffer.concat(chunks);
@@ -359,7 +342,9 @@ describe("downloadVerifiedFile", () => {
       onProgress,
     });
 
-    expect(onProgress.mock.calls.map(([progress]) => progress.bytesPerSecond)).toEqual(rates);
+    expect(onProgress.mock.calls.map(([progress]) => progress.bytesPerSecond)).toEqual([
+      100_000_000, 100_000_000, 100_000_000,
+    ]);
     expect(onProgress.mock.calls.map(([progress]) => progress.downloadedSize)).toEqual([
       1_000_000, 2_000_000, 3_000_000,
     ]);
@@ -472,12 +457,13 @@ describe("ensureLlamaServerInstalled", () => {
         args: call.args,
         timeout: call.timeout,
       })),
-    ).toEqual([
-      { published: false, args: ["--version"], timeout: 120_000 },
-      { published: false, args: ["--version"], timeout: 120_000 },
-      { published: true, args: ["--version"], timeout: 120_000 },
-      { published: true, args: ["--version"], timeout: 120_000 },
-    ]);
+    ).toEqual(
+      [false, false, true, true].map((published) => ({
+        published,
+        args: ["--version"],
+        timeout: 120_000,
+      })),
+    );
     expect(await fs.readFile(command, "utf8")).toBe("server");
     for (const file of runtime.files) {
       expect(await fs.readFile(path.join(path.dirname(command), file.target), "utf8")).toBe(
@@ -490,40 +476,36 @@ describe("ensureLlamaServerInstalled", () => {
     expect((await fs.readdir(root)).every((entry) => !entry.startsWith("."))).toBe(true);
   });
 
-  it("does not fetch the VC runtime when the fresh CPU ZIP already starts", async () => {
-    const { root, asset, runtime } = await createCpuArchive();
-    mockVersionOutput(pinnedVersion);
-
-    const { command } = resolveManagedLlamaServerPaths(asset);
-    await expect(ensureLlamaServerInstalled({ asset })).resolves.toMatchObject({ command });
-
-    expect(mocks.extractWindowsVcRuntime).not.toHaveBeenCalled();
-    expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalledWith(
-      expect.objectContaining({ url: runtime.url }),
-    );
-    for (const file of runtime.files) {
-      await expect(fs.stat(path.join(path.dirname(command), file.target))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-    }
-    expect(await fs.readFile(command, "utf8")).toBe("server");
-    expect((await fs.readdir(root)).every((entry) => !entry.startsWith("."))).toBe(true);
-  });
-
-  it("does not fetch the VC runtime when the fresh CPU ZIP reports a different build", async () => {
-    const { root, asset, runtime } = await createCpuArchive();
-    mockVersionOutput("version: 0.1.0-dev (build 1, commit deadbeef0)");
-
-    await expect(ensureLlamaServerInstalled({ asset })).rejects.toThrow(
-      `expected b${LLAMA_SERVER_BUILD} (${LLAMA_SERVER_COMMIT.slice(0, 9)})`,
-    );
-
-    expect(mocks.extractWindowsVcRuntime).not.toHaveBeenCalled();
-    expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalledWith(
-      expect.objectContaining({ url: runtime.url }),
-    );
-    expect(await fs.readdir(root)).toEqual([]);
-  });
+  it.each(["verified", "wrong-build"])(
+    "does not fetch the VC runtime for a launchable %s CPU ZIP",
+    async (build) => {
+      const { root, asset, runtime } = await createCpuArchive();
+      mockCommand(() =>
+        build === "verified" ? pinnedVersion : "version: 0.1.0-dev (build 1, commit deadbeef0)",
+      );
+      const { command } = resolveManagedLlamaServerPaths(asset);
+      const install = ensureLlamaServerInstalled({ asset });
+      if (build === "verified") {
+        await expect(install).resolves.toMatchObject({ command });
+        for (const file of runtime.files) {
+          await expect(
+            fs.stat(path.join(path.dirname(command), file.target)),
+          ).rejects.toMatchObject({ code: "ENOENT" });
+        }
+        expect(await fs.readFile(command, "utf8")).toBe("server");
+        expect((await fs.readdir(root)).every((entry) => !entry.startsWith("."))).toBe(true);
+      } else {
+        await expect(install).rejects.toThrow(
+          `expected b${LLAMA_SERVER_BUILD} (${LLAMA_SERVER_COMMIT.slice(0, 9)})`,
+        );
+        expect(await fs.readdir(root)).toEqual([]);
+      }
+      expect(mocks.extractWindowsVcRuntime).not.toHaveBeenCalled();
+      expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalledWith(
+        expect.objectContaining({ url: runtime.url }),
+      );
+    },
+  );
 
   it("preserves both launch errors when the VC runtime fallback cannot start the server", async () => {
     const { root, asset } = await createCpuArchive();
@@ -664,114 +646,83 @@ describe("ensureLlamaServerInstalled", () => {
 });
 
 describe("macOS runtime floor", () => {
-  const dyldFailure = Object.assign(
-    new Error("dyld: Symbol not found: _cblas_sgemm$NEWLAPACK$ILP64"),
-    {
-      cmd: "llama-server --version",
+  it.each([
+    ["12.7.6", "none"],
+    ["12.7.6", "valid"],
+    ["12.7.6", "crashes"],
+    [Object.assign(new Error("sw_vers unavailable"), { cmd: "sw_vers" }), "crashes"],
+    ["13.3", "crashes"],
+  ] as const)(
+    "preserves the runtime-floor/launch distinction on macOS %s with %s installation",
+    async (productVersion, installed) => {
+      await createRoot("llama-server-macos-");
+      const asset = selectLlamaServerAsset("darwin", "x64", { kind: "cpu" });
+      const { command } = resolveManagedLlamaServerPaths(asset);
+      if (installed !== "none") {
+        await fs.mkdir(path.dirname(command), { recursive: true });
+        await fs.writeFile(command, "");
+      }
+      mockCommand((file) => {
+        if (file !== "/usr/bin/sw_vers") {
+          if (installed === "crashes") {
+            throw Object.assign(new Error("dyld: Symbol not found: _cblas_sgemm$NEWLAPACK$ILP64"), {
+              cmd: "llama-server --version",
+            });
+          }
+          return pinnedVersion;
+        } else if (typeof productVersion !== "string") {
+          throw productVersion;
+        } else {
+          return `${productVersion}\n`;
+        }
+      });
+      const install = ensureLlamaServerInstalled({ asset });
+      if (installed === "valid") {
+        await expect(install).resolves.toMatchObject({ command });
+      } else if (productVersion === "12.7.6") {
+        await expect(install).rejects.toBeInstanceOf(UnsupportedLlamaServerHostError);
+        if (installed === "none") {
+          await expect(install).rejects.toThrow(
+            "requires macOS 13.3+; this Mac runs macOS 12.7.6. Build llama-server for this Mac and set models.providers.llama-cpp.localService.command",
+          );
+        } else {
+          await expect(install).rejects.toMatchObject({
+            message: expect.stringContaining("requires macOS 13.3+"),
+            cause: expect.objectContaining({ message: expect.stringContaining("dyld") }),
+          });
+        }
+      } else {
+        await expect(install).rejects.not.toBeInstanceOf(UnsupportedLlamaServerHostError);
+        await expect(install).rejects.toThrow("dyld");
+      }
+      expect(mocks.execFile.mock.calls.map(([file]) => file)).toEqual(
+        installed === "none"
+          ? ["/usr/bin/sw_vers"]
+          : installed === "valid"
+            ? [command]
+            : [command, "/usr/bin/sw_vers"],
+      );
+      expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalled();
     },
   );
-
-  async function prepareMac(
-    productVersion: string | ExecFileException,
-    installed: "none" | "valid" | "crashes",
-  ) {
-    await createRoot("llama-server-macos-");
-    const asset = selectLlamaServerAsset("darwin", "x64", { kind: "cpu" });
-    const { command } = resolveManagedLlamaServerPaths(asset);
-    if (installed !== "none") {
-      await fs.mkdir(path.dirname(command), { recursive: true });
-      await fs.writeFile(command, "");
-    }
-    mockCommand((file) => {
-      if (file !== "/usr/bin/sw_vers") {
-        if (installed === "crashes") {
-          throw dyldFailure;
-        }
-        return pinnedVersion;
-      } else if (typeof productVersion !== "string") {
-        throw productVersion;
-      } else {
-        return `${productVersion}\n`;
-      }
-    });
-    return { asset, command };
-  }
-
-  it("refuses macOS below 13.3 before downloading the verified build", async () => {
-    const { asset } = await prepareMac("12.7.6", "none");
-
-    const install = ensureLlamaServerInstalled({ asset });
-    await expect(install).rejects.toBeInstanceOf(UnsupportedLlamaServerHostError);
-    await expect(install).rejects.toThrow(
-      "requires macOS 13.3+; this Mac runs macOS 12.7.6. Build llama-server for this Mac and set models.providers.llama-cpp.localService.command",
-    );
-    expect(mocks.execFile.mock.calls.map(([file]) => file)).toEqual(["/usr/bin/sw_vers"]);
-    expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalled();
-  });
-
-  it("reuses a validating build on macOS below 13.3", async () => {
-    const { asset, command } = await prepareMac("12.7.6", "valid");
-
-    await expect(ensureLlamaServerInstalled({ asset })).resolves.toMatchObject({ command });
-    expect(mocks.execFile.mock.calls.map(([file]) => file)).toEqual([command]);
-  });
-
-  it("explains a build that cannot start on macOS below 13.3", async () => {
-    const { asset } = await prepareMac("12.7.6", "crashes");
-
-    const install = ensureLlamaServerInstalled({ asset });
-    await expect(install).rejects.toBeInstanceOf(UnsupportedLlamaServerHostError);
-    await expect(install).rejects.toMatchObject({
-      message: expect.stringContaining("requires macOS 13.3+"),
-      cause: expect.objectContaining({ message: expect.stringContaining("dyld") }),
-    });
-    expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalled();
-  });
-
-  it("keeps the launch error when the macOS version cannot be read", async () => {
-    const { asset, command } = await prepareMac(
-      Object.assign(new Error("sw_vers unavailable"), { cmd: "sw_vers" }),
-      "crashes",
-    );
-
-    const install = ensureLlamaServerInstalled({ asset });
-    await expect(install).rejects.not.toBeInstanceOf(UnsupportedLlamaServerHostError);
-    await expect(install).rejects.toThrow("dyld");
-    expect(mocks.execFile.mock.calls.map(([file]) => file)).toEqual([command, "/usr/bin/sw_vers"]);
-    expect(mocks.fetchWithSsrFGuard).not.toHaveBeenCalled();
-  });
-
-  it("keeps the launch error for a build that cannot start on a supported Mac", async () => {
-    const { asset } = await prepareMac("13.3", "crashes");
-
-    const install = ensureLlamaServerInstalled({ asset });
-    await expect(install).rejects.not.toBeInstanceOf(UnsupportedLlamaServerHostError);
-    await expect(install).rejects.toThrow("dyld");
-  });
 });
 
 describe("CUDA runtime selection", () => {
-  it.each([["551.77", 8.6]] as const)(
-    "checks the upstream driver and device contract for %s / SM %s",
-    (driverVersion, computeCapability) => {
-      const choose = () =>
-        selectLlamaServerAsset("win32", "x64", {
-          kind: "cuda",
-          devices: [{ driverVersion, computeCapability }],
-        });
-      expect(choose).toThrow(/driver 551\.78/u);
-    },
-  );
+  it("checks the upstream driver and device contract", () => {
+    expect(() =>
+      selectLlamaServerAsset("win32", "x64", {
+        kind: "cuda",
+        devices: [{ driverVersion: "551.77", computeCapability: 8.6 }],
+      }),
+    ).toThrow(/driver 551\.78/u);
+  });
 
-  it.each(["win32"] as const)(
-    "does not silently replace unavailable CUDA on %s/arm64 with CPU",
-    (platform) => {
-      expect(() =>
-        selectLlamaServerAsset(platform, "arm64", {
-          kind: "cuda",
-          devices: [{ driverVersion: "580.1" }],
-        }),
-      ).toThrow(/No verified CUDA/u);
-    },
-  );
+  it("does not silently replace unavailable CUDA on Windows arm64 with CPU", () => {
+    expect(() =>
+      selectLlamaServerAsset("win32", "arm64", {
+        kind: "cuda",
+        devices: [{ driverVersion: "580.1" }],
+      }),
+    ).toThrow(/No verified CUDA/u);
+  });
 });

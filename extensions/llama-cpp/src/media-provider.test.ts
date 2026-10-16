@@ -6,7 +6,7 @@ import type {
   ImageDescriptionRequest,
   ImagesDescriptionRequest,
 } from "openclaw/plugin-sdk/media-understanding";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { LLAMA_CPP_MEDIA_RECIPES } from "./media-catalog.js";
 import { LLAMA_CPP_MEDIA_MAX_BYTES, LLAMA_CPP_MEDIA_MAX_TOKENS } from "./media-config.js";
 
@@ -28,6 +28,8 @@ import { createLlamaCppMediaProvider } from "./media-provider.js";
 const OCR = "glm-ocr-q8_0";
 const VISION = "smolvlm2-2.2b-instruct-q4_k_m";
 const IMAGE = Buffer.from("synthetic-image-bytes");
+const ARTIFACT_ERROR = "must match the verified recipe artifacts. Rerun local media setup";
+const EXPLICIT_PROXY = { proxy: { mode: "explicit-proxy", url: "http://proxy.example.test:8080" } };
 const REQUEST_MODEL = {
   id: VISION,
   name: "test vision model",
@@ -125,6 +127,7 @@ function expectNoGenericTransport() {
 async function expectRejected(req: ImagesDescriptionRequest, message?: string) {
   await expect(providerMethods().multiple(req)).rejects.toThrow(message);
   expect(transport.managed).not.toHaveBeenCalled();
+  expectNoGenericTransport();
 }
 
 async function transformedPayload(payload: unknown) {
@@ -133,6 +136,21 @@ async function transformedPayload(payload: unknown) {
     throw new Error("Managed image transport did not register its payload transform");
   }
   return await call[1](payload, { ...REQUEST_MODEL, id: call[0].model });
+}
+
+function captureSend(model = REQUEST_MODEL, before: () => void = () => {}) {
+  const send = vi.fn();
+  transport.managed.mockImplementationOnce(async (_req, transform) => {
+    await Promise.resolve();
+    before();
+    if (!transform) {
+      throw new Error("fixture transform missing");
+    }
+    await transform({ messages: [{ role: "user", content: [] }] }, model);
+    send();
+    return { text: "local result" };
+  });
+  return send;
 }
 
 beforeEach(() => {
@@ -144,278 +162,212 @@ beforeEach(() => {
 
 afterEach(() => vi.unstubAllEnvs());
 
-describe("llama-cpp registered media provider", () => {
-  it("uses the selected OCR recipe task token", async () => {
-    const req = request({ model: OCR, prompt: "Describe the colors." });
-    const original = structuredClone(req.images);
-    await providerMethods().multiple(req);
-    expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ model: OCR, prompt: "Text Recognition:" }),
-      expect.any(Function),
-    );
-    const imagePart = { type: "image_url", image_url: { url: "data:image/png;base64,fixture" } };
-    const payload = {
-      model: OCR,
-      messages: [
-        { role: "system", content: "Text Recognition:" },
-        { role: "user", content: [imagePart] },
-      ],
-      max_tokens: 2048,
-    };
-    expect(await transformedPayload(payload)).toEqual({
-      model: OCR,
-      messages: [
-        { role: "user", content: [imagePart, { type: "text", text: "Text Recognition:" }] },
-      ],
-      max_tokens: 2048,
-      temperature: 0,
-      seed: 4827,
-    });
-    expect(payload.messages).toHaveLength(2);
-    expect(Buffer.from(original[0]?.buffer ?? [])).toEqual(req.images[0]?.buffer);
-    expectNoGenericTransport();
-  });
-
-  it("routes a single image through the same managed images transport with signal and prepared facts", async () => {
-    const signal = new AbortController().signal;
-    const base = request({ signal, prompt: undefined });
-    prepare(base);
-    await providerMethods().single(singleRequest(base));
-    expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        images: base.images,
-        signal,
-        cfg: base.cfg,
-        preparedModelRuntime: base.preparedModelRuntime,
-        prompt: "Describe the image.",
-      }),
-      expect.any(Function),
-    );
-  });
-
-  it("keeps existing external and custom image models on the shared generic transport", async () => {
-    const hooks = providerMethods();
-    const req = request({ cfg: {}, model: "external-custom-vision" });
-    await hooks.multiple(req);
-    expect(transport.multiple).toHaveBeenCalledExactlyOnceWith(req);
-    await hooks.single(singleRequest(req));
-    expect(transport.single).toHaveBeenCalledExactlyOnceWith(singleRequest(req));
-    await hooks.multiple(request({ model: "my-other-image-model" }));
-    expect(transport.managed).not.toHaveBeenCalled();
-  });
-
-  it("does not retry with a cloud provider after local inference fails", async () => {
-    transport.managed.mockRejectedValueOnce(new Error("projector load failed"));
-    await expect(providerMethods().multiple(request())).rejects.toThrow("projector load failed");
-    expect(transport.managed).toHaveBeenCalledTimes(1);
-    expectNoGenericTransport();
-  });
-
-  it("fails closed for incomplete saved local routes", async () => {
-    const req = request();
-    const provider = configured(req.cfg);
-    provider.params = { mediaModels: { ocr: OCR } };
-    provider.baseUrl = "https://cloud.example.test/v1";
-    const hooks = providerMethods();
-    await expect(hooks.multiple(req)).rejects.toThrow("local media routes are incomplete");
-    await expect(hooks.single(singleRequest(req))).rejects.toThrow(
-      "local media routes are incomplete",
-    );
-    expect(transport.managed).not.toHaveBeenCalled();
-    expectNoGenericTransport();
-  });
-
-  it.each([
-    "https://cloud.example.test/v1",
-    "http://127.0.0.1.example.test:19432/v1",
-    "not-a-url",
-    "http://fixture-user@127.0.0.1:19432/v1",
-    "http://:fixture-password@127.0.0.1:19432/v1",
-  ])("rejects an untrusted managed endpoint before transport: %s", async (baseUrl) => {
-    const req = request();
-    configured(req.cfg).baseUrl = baseUrl;
-    await expectRejected(req, "loopback");
-    expectNoGenericTransport();
-  });
-
-  it("accepts numeric IPv6 loopback endpoints", async () => {
-    const req = request();
-    configured(req.cfg).baseUrl = "http://[::1]:19432/v1";
-    await providerMethods().multiple(req);
-    expect(transport.managed).toHaveBeenCalledOnce();
-  });
-
-  it("rejects missing managed ownership and provider identity substitution", async () => {
-    const req = request();
-    delete configured(req.cfg).localService;
-    await expect(providerMethods().multiple(req)).rejects.toThrow("loopback");
-    await expect(providerMethods().multiple(request({ provider: "openai" }))).rejects.toThrow(
-      "loopback",
-    );
-    expect(transport.managed).not.toHaveBeenCalled();
-  });
-
-  it("rejects text-only configured image inventory", async () => {
-    const req = request();
-    visionModel(req.cfg).input = ["text"];
-    await expectRejected(req, "model is unavailable");
-  });
-
-  it("rejects a configured model endpoint override", async () => {
-    const req = request();
-    visionModel(req.cfg).baseUrl = "https://cloud.example.test/v1";
-    prepare(req);
-    await expectRejected(req, "endpoint must match");
-    expect(transport.multiple).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    { field: "modelPath", source: "hf:unknown/model/model.gguf" },
-    { field: "mmprojPath", source: "hf:unknown/projector/mmproj.gguf" },
-  ])("rejects a changed or missing curated artifact: $field $source", async ({ field, source }) => {
-    const req = request();
-    const model = visionModel(req.cfg);
-    if (!model?.params) {
-      throw new Error("fixture model artifacts missing");
-    }
-    model.params[field] = source;
-    await expectRejected(req, "must match the verified recipe artifacts. Rerun local media setup");
-    expectNoGenericTransport();
-  });
-
-  it.each([{ provider: "openai" }, { id: OCR }, { baseUrl: "https://cloud.example.test/v1" }])(
-    "blocks a prepared runtime's changed final transport target: %j",
-    async (override) => {
-      const req = request();
-      prepare(req);
-      const send = vi.fn();
-      transport.managed.mockImplementationOnce(async (_req, transform) => {
-        if (!transform) {
-          throw new Error("fixture transform missing");
-        }
-        await transform(
-          { messages: [{ role: "user", content: [] }] },
-          { ...REQUEST_MODEL, ...override },
-        );
-        send();
-        return { text: "unexpected request" };
-      });
-      await expect(providerMethods().multiple(req)).rejects.toThrow(
-        "resolved local image model must match",
-      );
-      expect(send).not.toHaveBeenCalled();
-      expectNoGenericTransport();
-    },
+it("uses the selected OCR recipe task token", async () => {
+  const req = request({ model: OCR, prompt: "Describe the colors." });
+  const original = structuredClone(req.images);
+  await providerMethods().multiple(req);
+  expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ model: OCR, prompt: "Text Recognition:" }),
+    expect.any(Function),
   );
-
-  it("rejects environment proxy routing without an explicit provider proxy", async () => {
-    vi.stubEnv("http_proxy", "http://proxy.example.test:8080");
-    vi.stubEnv("no_proxy", "");
-    const req = request();
-    const original = {
-      ...structuredClone(req),
-      images: req.images.map((image) => ({ ...image, buffer: Buffer.from(image.buffer) })),
-    };
-    await expect(providerMethods().multiple(req)).rejects.toThrow("NO_PROXY");
-    expect(transport.managed).not.toHaveBeenCalled();
-    expect(transport.multiple).not.toHaveBeenCalled();
-    expect(req).toEqual(original);
-    expect(req.images[0]?.buffer).toBe(IMAGE);
-    vi.stubEnv("no_proxy", "127.0.0.1");
-    await expect(providerMethods().multiple(req)).resolves.toEqual({ text: "local result" });
+  const imagePart = { type: "image_url", image_url: { url: "data:image/png;base64,fixture" } };
+  const payload = {
+    model: OCR,
+    messages: [
+      { role: "system", content: "Text Recognition:" },
+      { role: "user", content: [imagePart] },
+    ],
+    max_tokens: 2048,
+  };
+  expect(await transformedPayload(payload)).toEqual({
+    model: OCR,
+    messages: [{ role: "user", content: [imagePart, { type: "text", text: "Text Recognition:" }] }],
+    max_tokens: 2048,
+    temperature: 0,
+    seed: 4827,
   });
+  expect(payload.messages).toHaveLength(2);
+  expect(Buffer.from(original[0]?.buffer ?? [])).toEqual(req.images[0]?.buffer);
+  expectNoGenericTransport();
+});
 
-  it("rechecks an environment proxy enabled during model preparation", async () => {
-    const send = vi.fn();
-    transport.managed.mockImplementationOnce(async (_req, transform) => {
-      await Promise.resolve();
-      vi.stubEnv("http_proxy", "http://proxy.example.test:8080");
-      vi.stubEnv("no_proxy", "");
-      if (!transform) {
-        throw new Error("fixture transform missing");
-      }
-      await transform({ messages: [{ role: "user", content: [] }] }, REQUEST_MODEL);
-      send();
-      return { text: "local result" };
-    });
-    const result = providerMethods().multiple(request());
-    await expect(result).rejects.toThrow("NO_PROXY");
+it("routes a single image through the same managed images transport with signal and prepared facts", async () => {
+  const signal = new AbortController().signal;
+  const base = request({ signal, prompt: undefined });
+  prepare(base);
+  await providerMethods().single(singleRequest(base));
+  expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ ...base, prompt: "Describe the image." }),
+    expect.any(Function),
+  );
+});
+
+it("keeps existing external and custom image models on the shared generic transport", async () => {
+  const hooks = providerMethods();
+  const req = request({ cfg: {}, model: "external-custom-vision" });
+  await hooks.multiple(req);
+  expect(transport.multiple).toHaveBeenCalledExactlyOnceWith(req);
+  await hooks.single(singleRequest(req));
+  expect(transport.single).toHaveBeenCalledExactlyOnceWith(singleRequest(req));
+  await hooks.multiple(request({ model: "my-other-image-model" }));
+  expect(transport.managed).not.toHaveBeenCalled();
+});
+
+it("does not retry with a cloud provider after local inference fails", async () => {
+  transport.managed.mockRejectedValueOnce(new Error("projector load failed"));
+  await expect(providerMethods().multiple(request())).rejects.toThrow("projector load failed");
+  expect(transport.managed).toHaveBeenCalledTimes(1);
+  expectNoGenericTransport();
+});
+
+it("fails closed for incomplete saved local routes", async () => {
+  const req = request();
+  const provider = configured(req.cfg);
+  provider.params = { mediaModels: { ocr: OCR } };
+  provider.baseUrl = "https://cloud.example.test/v1";
+  const hooks = providerMethods();
+  await expect(hooks.multiple(req)).rejects.toThrow("local media routes are incomplete");
+  await expect(hooks.single(singleRequest(req))).rejects.toThrow(
+    "local media routes are incomplete",
+  );
+  expect(transport.managed).not.toHaveBeenCalled();
+  expectNoGenericTransport();
+});
+
+it.each([
+  "https://cloud.example.test/v1",
+  "http://127.0.0.1.example.test:19432/v1",
+  "not-a-url",
+  "http://fixture-user@127.0.0.1:19432/v1",
+  "http://:fixture-password@127.0.0.1:19432/v1",
+])("rejects an untrusted managed endpoint before transport: %s", async (baseUrl) => {
+  const req = request();
+  configured(req.cfg).baseUrl = baseUrl;
+  await expectRejected(req, "loopback");
+});
+
+it("accepts numeric IPv6 loopback endpoints", async () => {
+  const req = request();
+  configured(req.cfg).baseUrl = "http://[::1]:19432/v1";
+  await providerMethods().multiple(req);
+  expect(transport.managed).toHaveBeenCalledOnce();
+});
+
+it("rejects missing managed ownership and provider identity substitution", async () => {
+  const req = request();
+  delete configured(req.cfg).localService;
+  await expect(providerMethods().multiple(req)).rejects.toThrow("loopback");
+  await expect(providerMethods().multiple(request({ provider: "openai" }))).rejects.toThrow(
+    "loopback",
+  );
+  expect(transport.managed).not.toHaveBeenCalled();
+});
+
+it.each([
+  [false, "model", "input", ["text"], "model is unavailable"],
+  ["shared", "model", "baseUrl", "https://cloud.example.test/v1", "endpoint must match"],
+  [false, "params", "modelPath", "hf:unknown/model/model.gguf", ARTIFACT_ERROR],
+  [false, "params", "mmprojPath", "hf:unknown/projector/mmproj.gguf", ARTIFACT_ERROR],
+  [true, "provider", "request", EXPLICIT_PROXY, "direct loopback"],
+  [true, "params", "modelPath", "hf:custom/model/other.gguf", "verified recipe artifacts"],
+  [true, "params", "mmprojPath", "hf:custom/model/other.gguf", "verified recipe artifacts"],
+  [true, "provider", "baseUrl", "http://127.0.0.1:19433/v1", "endpoint must match"],
+] as const)("rejects retained=%s %s.%s=%j", async (retained, target, field, value, error) => {
+  const req = request();
+  const config = retained === true ? structuredClone(req.cfg) : req.cfg;
+  const model = visionModel(config);
+  const destination =
+    target === "provider" ? configured(config) : target === "model" ? model : model.params;
+  if (!destination) {
+    throw new Error("fixture model artifacts missing");
+  }
+  Object.assign(destination, { [field]: value });
+  if (retained) {
+    prepare(req, config);
+  }
+  await expectRejected(req, error);
+});
+
+it.each([{ provider: "openai" }, { id: OCR }, { baseUrl: "https://cloud.example.test/v1" }])(
+  "blocks a prepared runtime's changed final transport target: %j",
+  async (override) => {
+    const req = request();
+    prepare(req);
+    const send = captureSend({ ...REQUEST_MODEL, ...override });
+    await expect(providerMethods().multiple(req)).rejects.toThrow(
+      "resolved local image model must match",
+    );
     expect(send).not.toHaveBeenCalled();
     expectNoGenericTransport();
-  });
+  },
+);
 
-  it("rejects a retained runtime's explicit proxy before transport", async () => {
-    const req = request();
-    const config = structuredClone(req.cfg);
-    configured(config).request = {
-      proxy: { mode: "explicit-proxy", url: "http://proxy.example.test:8080" },
-    };
-    prepare(req, config);
-    await expectRejected(req, "direct loopback");
-  });
+it("rejects environment proxy routing without an explicit provider proxy", async () => {
+  vi.stubEnv("http_proxy", "http://proxy.example.test:8080");
+  vi.stubEnv("no_proxy", "");
+  const req = request();
+  const original = {
+    ...structuredClone(req),
+    images: req.images.map((image) => ({ ...image, buffer: Buffer.from(image.buffer) })),
+  };
+  await expectRejected(req, "NO_PROXY");
+  expect(req).toEqual(original);
+  expect(req.images[0]?.buffer).toBe(IMAGE);
+  vi.stubEnv("no_proxy", "127.0.0.1");
+  await expect(providerMethods().multiple(req)).resolves.toEqual({ text: "local result" });
+});
 
-  it.each(["modelPath", "mmprojPath"] as const)(
-    "rejects a retained runtime's changed %s before transport",
-    async (field) => {
-      const req = request();
-      const config = structuredClone(req.cfg);
-      const model = visionModel(config);
-      model.params = { ...model.params, [field]: "hf:custom/model/other.gguf" };
-      prepare(req, config);
-      await expectRejected(req, "verified recipe artifacts");
-    },
+it("rechecks an environment proxy enabled during model preparation", async () => {
+  const send = captureSend(REQUEST_MODEL, () => {
+    vi.stubEnv("http_proxy", "http://proxy.example.test:8080");
+    vi.stubEnv("no_proxy", "");
+  });
+  const result = providerMethods().multiple(request());
+  await expect(result).rejects.toThrow("NO_PROXY");
+  expect(send).not.toHaveBeenCalled();
+  expectNoGenericTransport();
+});
+
+it.each([
+  [{ buffer: Buffer.alloc(LLAMA_CPP_MEDIA_MAX_BYTES + 1), fileName: "large.png" }],
+  [
+    { buffer: IMAGE, fileName: "one.png" },
+    { buffer: IMAGE, fileName: "two.png" },
+  ],
+])("rejects empty, oversized, or multiple image input before transport", async (...images) => {
+  await expectRejected(request({ images }));
+});
+
+it("rejects a zero output token budget", async () => {
+  await expectRejected(request({ maxTokens: 0 }), "positive finite");
+});
+
+it("carries cancellation to shared inference and refuses results after cancellation", async () => {
+  const hooks = providerMethods();
+  const before = new AbortController();
+  before.abort();
+  await expectRejected(request({ signal: before.signal }));
+  const during = new AbortController();
+  transport.managed.mockImplementationOnce(async (req) => {
+    expect(req.signal).toBe(during.signal);
+    during.abort();
+    return { text: "late result" };
+  });
+  await expect(hooks.multiple(request({ signal: during.signal }))).rejects.toThrow();
+  expect(transport.multiple).not.toHaveBeenCalled();
+});
+
+it("rejects incompatible payload format and unavailable recipe with useful setup errors", async () => {
+  const req = request();
+  await providerMethods().multiple(req);
+  await expect(
+    transformedPayload({ messages: [{ role: "user", content: "plain text" }] }),
+  ).rejects.toThrow("OpenAI image request format");
+  const provider = configured(req.cfg);
+  provider.params = { mediaModels: { ocr: OCR, vision: "missing-recipe" } };
+  provider.models.push({ ...provider.models[0]!, id: "missing-recipe" });
+  await expect(providerMethods().multiple({ ...req, model: "missing-recipe" })).rejects.toThrow(
+    "recipe is unavailable",
   );
-
-  it("rejects a retained runtime's changed loopback endpoint before transport", async () => {
-    const req = request();
-    const config = structuredClone(req.cfg);
-    configured(config).baseUrl = "http://127.0.0.1:19433/v1";
-    prepare(req, config);
-    await expectRejected(req, "endpoint must match");
-  });
-
-  it.each([
-    [{ buffer: Buffer.alloc(LLAMA_CPP_MEDIA_MAX_BYTES + 1), fileName: "large.png" }],
-    [
-      { buffer: IMAGE, fileName: "one.png" },
-      { buffer: IMAGE, fileName: "two.png" },
-    ],
-  ])("rejects empty, oversized, or multiple image input before transport", async (...images) => {
-    await expectRejected(request({ images }));
-  });
-
-  it("rejects a zero output token budget", async () => {
-    await expectRejected(request({ maxTokens: 0 }), "positive finite");
-  });
-
-  it("carries cancellation to shared inference and refuses results after cancellation", async () => {
-    const hooks = providerMethods();
-    const before = new AbortController();
-    before.abort();
-    await expect(hooks.multiple(request({ signal: before.signal }))).rejects.toThrow();
-    expect(transport.managed).not.toHaveBeenCalled();
-    const during = new AbortController();
-    transport.managed.mockImplementationOnce(async (req) => {
-      expect(req.signal).toBe(during.signal);
-      during.abort();
-      return { text: "late result" };
-    });
-    await expect(hooks.multiple(request({ signal: during.signal }))).rejects.toThrow();
-    expect(transport.multiple).not.toHaveBeenCalled();
-  });
-
-  it("rejects incompatible payload format and unavailable recipe with useful setup errors", async () => {
-    const req = request();
-    await providerMethods().multiple(req);
-    await expect(
-      transformedPayload({ messages: [{ role: "user", content: "plain text" }] }),
-    ).rejects.toThrow("OpenAI image request format");
-    const provider = configured(req.cfg);
-    provider.params = { mediaModels: { ocr: OCR, vision: "missing-recipe" } };
-    provider.models.push({ ...provider.models[0]!, id: "missing-recipe" });
-    await expect(providerMethods().multiple({ ...req, model: "missing-recipe" })).rejects.toThrow(
-      "recipe is unavailable",
-    );
-    expect(transport.managed).toHaveBeenCalledTimes(1);
-  });
+  expect(transport.managed).toHaveBeenCalledTimes(1);
 });
