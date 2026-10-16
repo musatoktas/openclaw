@@ -19,44 +19,41 @@ import {
   REMOTE_WORKSPACE_ACCEPTED_TRANSACTION_JS,
   REMOTE_WORKSPACE_MANIFEST_JS,
 } from "./workspace-sync-scripts.js";
-import { initializeScriptGitWorkspace } from "./workspace-sync-scripts.test-support.js";
+import {
+  createScriptWorkspace,
+  initializeScriptGitWorkspace,
+  workspaceScriptRunner,
+} from "./workspace-sync-scripts.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-function scriptRunner(script: string, workspace: string, baseEnv = process.env) {
-  return (args: string[], input?: string) =>
-    runCommandWithTimeout([process.execPath, "-e", script, workspace, ...args], {
-      timeoutMs: 10_000,
-      baseEnv,
-      input,
-    });
-}
-
 function transactionRunner(workspace: string, env = process.env) {
-  const run = scriptRunner(REMOTE_WORKSPACE_ACCEPTED_TRANSACTION_JS, workspace, env);
+  // Unlike manifests, transactions take the action before the workspace.
+  const runTransaction = (action: string, nonce: string, input?: string) =>
+    runCommandWithTimeout(
+      [process.execPath, "-e", REMOTE_WORKSPACE_ACCEPTED_TRANSACTION_JS, action, workspace, nonce],
+      { timeoutMs: 10_000, baseEnv: env, input },
+    );
   return {
-    runTransaction: (action: string, nonce: string, input?: string) => run([action, nonce], input),
-    begin: (nonce: string, paths: string[]) => run(["begin", nonce], JSON.stringify(paths)),
+    runTransaction,
+    begin: (nonce: string, paths: string[]) =>
+      runTransaction("begin", nonce, JSON.stringify(paths)),
   };
 }
 
-async function fixture(prefix: string) {
-  const root = tempDirs.make(prefix);
-  const home = path.join(root, "home");
-  const workspace = path.join(root, "workspace");
-  await Promise.all([fs.mkdir(home), fs.mkdir(workspace)]);
-  const env = { ...process.env, HOME: home };
-  return {
-    root,
-    home,
-    workspace,
-    env,
-    runManifest: scriptRunner(REMOTE_WORKSPACE_MANIFEST_JS, workspace, env),
-  };
-}
+const fixture = (prefix: string) => createScriptWorkspace(tempDirs.make(prefix));
 
 async function expectFile(root: string, relative: string, content: string) {
   await expect(fs.readFile(path.join(root, relative), "utf8")).resolves.toBe(content);
+}
+
+async function transactionWorkspace(prefix: string) {
+  const root = tempDirs.make(prefix);
+  const target = path.join(root, "workspace");
+  await fs.mkdir(target);
+  const workspace = await fs.realpath(target);
+  await fs.writeFile(path.join(workspace, "result.txt"), "old\n");
+  return { root, workspace, ...transactionRunner(workspace) };
 }
 
 function spawnTransaction(argv: string[], env: NodeJS.ProcessEnv) {
@@ -109,9 +106,9 @@ describe("remote workspace manifest script", () => {
     const digest = createHash("sha256").update(rawManifest).digest("hex");
     const windowsScript = `Object.defineProperty(process, "platform", { value: "win32" });\n${REMOTE_WORKSPACE_MANIFEST_JS}`;
 
-    const runWindows = scriptRunner(windowsScript, workspace, env);
+    const runWindows = workspaceScriptRunner(windowsScript, workspace, env);
 
-    const published = await runWindows(["", "publish", digest], rawManifest);
+    const published = await runWindows(["", "publish", digest], { input: rawManifest });
     expect(published).toMatchObject({ code: 0, stdout: `sha256:${digest}\n` });
 
     const capture = async () => await runWindows(["", "all", digest]);
@@ -254,12 +251,9 @@ describe("remote workspace manifest script", () => {
   });
 
   it("reports strict settlement outcomes for each durable transaction phase", async () => {
-    const root = tempDirs.make("openclaw-accepted-settlement-outcomes-");
-    let workspace = path.join(root, "workspace");
-    await fs.mkdir(workspace);
-    workspace = await fs.realpath(workspace);
-    await fs.writeFile(path.join(workspace, "result.txt"), "old\n");
-    const { runTransaction, begin } = transactionRunner(workspace);
+    const { root, workspace, runTransaction, begin } = await transactionWorkspace(
+      "openclaw-accepted-settlement-outcomes-",
+    );
     const expectSettlement = (
       value: Awaited<ReturnType<typeof runTransaction>>,
       outcome: "begun" | "rolled-back" | "applied" | "committed",
@@ -338,17 +332,8 @@ process.kill = function(pid, signal) {
         OPENCLAW_TEST_CONTENDER: contender,
       };
       const nonce = contender === "rollback" ? "3".repeat(32) : "4".repeat(32);
-      const begin = await runCommandWithTimeout(
-        [
-          process.execPath,
-          "-e",
-          REMOTE_WORKSPACE_ACCEPTED_TRANSACTION_JS,
-          "begin",
-          workspace,
-          nonce,
-        ],
-        { timeoutMs: 10_000, baseEnv: env, input: JSON.stringify(["result.txt"]) },
-      );
+      const { begin: beginTransaction } = transactionRunner(workspace, env);
+      const begin = await beginTransaction(nonce, ["result.txt"]);
       expect(begin.code).toBe(0);
       const staging = begin.stdout.trim();
       await fs.writeFile(path.join(staging, "result.txt"), "new\n");
@@ -415,14 +400,10 @@ process.kill = function(pid, signal) {
   });
 
   it("restores a dead reclaimer before settling its dead apply owner", async () => {
-    const root = tempDirs.make("openclaw-accepted-dead-owner-");
-    let workspace = path.join(root, "workspace");
-    await fs.mkdir(workspace);
-    workspace = await fs.realpath(workspace);
-    await fs.writeFile(path.join(workspace, "result.txt"), "old\n");
+    const { root, workspace } = await transactionWorkspace("openclaw-accepted-dead-owner-");
     const nonce = "8".repeat(32);
-    const run = scriptRunner(REMOTE_WORKSPACE_ACCEPTED_TRANSACTION_JS, workspace);
-    const runTransaction = (action: string, input?: string) => run([action, nonce], input);
+    const { runTransaction: run } = transactionRunner(workspace);
+    const runTransaction = (action: string, input?: string) => run(action, nonce, input);
     const begin = await runTransaction("begin", JSON.stringify(["result.txt"]));
     expect(begin.code).toBe(0);
     const transaction = path.dirname(begin.stdout.trim());
@@ -505,9 +486,8 @@ process.kill = function(pid, signal) {
     );
 
     await fs.rm(firstTurnPath);
-    const published = await runManifest(["", "publish", firstTurnDigest], firstTurnRaw);
-    expect(published.code).toBe(0);
-    expect(published.stdout.trim()).toBe(firstTurnRef);
+    const published = await runManifest(["", "publish", firstTurnDigest], { input: firstTurnRaw });
+    expect(published).toMatchObject({ code: 0, stdout: firstTurnRef + "\n" });
     await expect(fs.readFile(firstTurnPath, "utf8")).resolves.toBe(firstTurnRaw);
 
     const legacy = JSON.parse(firstTurnRaw) as {
@@ -526,27 +506,19 @@ process.kill = function(pid, signal) {
     await fs.writeFile(path.join(manifestRoot, `${legacyDigest}.json`), legacyRaw);
     await fs.rm(firstTurnPath);
 
-    const legacyCanonical = structuredClone(legacy);
-    for (const entry of legacyCanonical.entries) {
-      if (entry.type === "directory") {
-        entry.mode = 0o700;
-      } else if (entry.type === "symlink") {
-        entry.mode = 0o777;
-      } else {
-        entry.mode = (entry.mode & 0o111) === 0 ? 0o644 : 0o755;
-      }
-    }
-    legacyCanonical.entries.sort((left, right) =>
-      left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
-    );
-    const acceptedRaw = JSON.stringify(legacyCanonical);
+    // This fixture contains only non-executable regular files.
+    const acceptedRaw = JSON.stringify({
+      ...legacy,
+      entries: legacy.entries
+        .toReversed()
+        .map((entry) => Object.assign({}, entry, { mode: 0o644 })),
+    });
     const acceptedDigest = createHash("sha256").update(acceptedRaw).digest("hex");
     const acceptedRef = `sha256:${acceptedDigest}`;
     const acceptedPath = path.join(manifestRoot, `${acceptedDigest}.json`);
 
     const recovered = await runManifest(["", "resolve", acceptedDigest]);
-    expect(recovered.code).toBe(0);
-    expect(recovered.stdout.trim()).toBe(acceptedRef);
+    expect(recovered).toMatchObject({ code: 0, stdout: acceptedRef + "\n" });
     await expect(fs.readFile(acceptedPath, "utf8")).resolves.toBe(acceptedRaw);
 
     await fs.writeFile(path.join(workspace, "notes.md"), "second cloud edit\n");
@@ -581,7 +553,7 @@ process.kill = function(pid, signal) {
   });
 
   it("drops stale descendants when a tracked directory becomes a file", async () => {
-    const { home, workspace, runManifest } = await fixture("openclaw-manifest-test-");
+    const { workspace, runManifest, readManifest } = await fixture("openclaw-manifest-test-");
     await fs.mkdir(path.join(workspace, "src"), { recursive: true });
     await fs.writeFile(path.join(workspace, "src", "old.txt"), "old");
     const baseCommit = await initializeScriptGitWorkspace(workspace, ".");
@@ -596,17 +568,7 @@ process.kill = function(pid, signal) {
       initial.stdout.trim().slice("sha256:".length),
     ]);
     expect(current.code).toBe(0);
-    const manifest = JSON.parse(
-      await fs.readFile(
-        path.join(
-          home,
-          ".openclaw-worker",
-          "manifests",
-          current.stdout.trim().slice("sha256:".length) + ".json",
-        ),
-        "utf8",
-      ),
-    ) as { entries: Array<{ path: string; type: string }> };
+    const manifest = await readManifest(current.stdout.trim());
     expect(manifest.entries).toContainEqual(expect.objectContaining({ path: "src", type: "file" }));
     expect(manifest.entries.some((entry) => entry.path === "src/old.txt")).toBe(false);
   });

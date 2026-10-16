@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { runCommandWithTimeout } from "../../process/exec.js";
 import { workspaceStatIdentity } from "./workspace-hash-memo.js";
 import {
   MAX_WORKSPACE_GIT_CANDIDATES,
@@ -11,35 +10,18 @@ import {
   MAX_WORKSPACE_INVENTORY_TOTAL_BYTES,
 } from "./workspace-inventory-limits.js";
 import { REMOTE_WORKSPACE_MANIFEST_JS } from "./workspace-sync-scripts.js";
-import { initializeScriptGitWorkspace } from "./workspace-sync-scripts.test-support.js";
+import {
+  createScriptWorkspace,
+  initializeScriptGitWorkspace,
+} from "./workspace-sync-scripts.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-async function manifestWorkspace(name: string) {
-  const root = await fs.realpath(tempDirs.make(`${name}-`));
-  const home = path.join(root, "home");
-  const workspace = path.join(root, "workspace");
-  await Promise.all([fs.mkdir(home), fs.mkdir(workspace)]);
-  const manifestRoot = path.join(home, ".openclaw-worker", "manifests");
-  const run = (
-    args: string[] = [],
-    options: Parameters<typeof runCommandWithTimeout>[1] = {},
-    script = REMOTE_WORKSPACE_MANIFEST_JS,
-  ) =>
-    runCommandWithTimeout([process.execPath, "-e", script, workspace, ...args], {
-      timeoutMs: 10_000,
-      baseEnv: { ...process.env, HOME: home },
-      ...options,
-    });
-  const readManifest = async (
-    ref: string,
-  ): Promise<{ entries: Array<{ path: string; type: string; size?: number; target?: string }> }> =>
-    JSON.parse(await fs.readFile(path.join(manifestRoot, ref.slice(7) + ".json"), "utf8"));
-  return { root, home, workspace, manifestRoot, run, readManifest };
-}
+const manifestWorkspace = async () =>
+  createScriptWorkspace(await fs.realpath(tempDirs.make("openclaw-manifest-")));
 
-async function gitWorkspace(name: string) {
-  const fixture = await manifestWorkspace(name);
+async function gitWorkspace() {
+  const fixture = await manifestWorkspace();
   const { workspace } = fixture;
   await fs.writeFile(path.join(workspace, ".gitignore"), "");
   const baseCommit = await initializeScriptGitWorkspace(workspace, ".gitignore");
@@ -53,22 +35,16 @@ it.each([
 ])(
   "budgets opened files ($firstSize + $secondSize) and symlink bytes with cached=$cached",
   async ({ firstSize, secondSize, cached, accepted }) => {
-    const { root, workspace, manifestRoot, run, readManifest } = await manifestWorkspace(
-      "openclaw-manifest-open-budget",
-    );
+    const { root, workspace, manifestRoot, readManifest, runScript } = await manifestWorkspace();
     const first = path.join(workspace, "a.txt");
     const second = path.join(workspace, "b.txt");
     const auditPath = path.join(root, "handles.json");
     const contents = Buffer.alloc(8, 65);
     await Promise.all([fs.writeFile(first, contents), fs.writeFile(second, contents)]);
     await fs.symlink("a.txt", path.join(workspace, "link"));
+    const digest = createHash("sha256").update(contents).digest("hex");
     const memo = cached
-      ? [
-          [
-            workspaceStatIdentity("worker", await fs.stat(first, { bigint: true })),
-            createHash("sha256").update(contents).digest("hex"),
-          ],
-        ]
+      ? [[workspaceStatIdentity("worker", await fs.stat(first, { bigint: true })), digest]]
       : [];
     // Keep real descriptors and hashing; resize only after inventory, at open.
     const prelude = String.raw`{
@@ -99,11 +75,9 @@ it.each([
       "const MAX_WORKSPACE_INVENTORY_TOTAL_BYTES = 24;",
     );
     expect(script).not.toBe(REMOTE_WORKSPACE_MANIFEST_JS);
-    const result = await run(
-      ["", "all", "memo-v1"],
-      { input: JSON.stringify(memo) },
-      prelude + script,
-    );
+    const result = await runScript(prelude + script)(["", "all", "memo-v1"], {
+      input: JSON.stringify(memo),
+    });
     expect(JSON.parse(await fs.readFile(auditPath, "utf8"))).toEqual([true, true]);
     if (!accepted) {
       expect(result.code).not.toBe(0);
@@ -131,7 +105,7 @@ it.each([
 );
 
 it("stops hashing a growing file at its opened size and settles its stream and handle", async () => {
-  const { root, home, workspace, run } = await manifestWorkspace("openclaw-manifest-stream-budget");
+  const { root, workspace, manifestRoot, runScript } = await manifestWorkspace();
   const target = path.join(workspace, "growing.txt");
   const auditPath = path.join(root, "stream.json");
   await fs.writeFile(target, "12345678");
@@ -178,7 +152,7 @@ it("stops hashing a growing file at its opened size and settles its stream and h
     })));
   }
   `;
-  const result = await run([], {}, prelude + REMOTE_WORKSPACE_MANIFEST_JS);
+  const result = await runScript(prelude + REMOTE_WORKSPACE_MANIFEST_JS)();
   expect(result.code).not.toBe(0);
   expect(result.stderr).toContain("file changed while it was being read");
   expect(result.stdout).toBe("");
@@ -195,43 +169,38 @@ it("stops hashing a growing file at its opened size and settles its stream and h
   expect(audit.consumed).toBeLessThan(72);
   expect(audit.hashed).toBeLessThanOrEqual(8);
   expect((await fs.stat(target)).size).toBe(72);
-  expect(await fs.readdir(path.join(home, ".openclaw-worker", "manifests"))).toEqual([]);
+  expect(await fs.readdir(manifestRoot)).toEqual([]);
 });
 
-it("rejects a full workspace above 4 GiB before hashing its files", async () => {
-  const { workspace, baseCommit, run } = await gitWorkspace("openclaw-manifest-byte-budget");
-  const oversizedPath = path.join(workspace, "oversized.bin");
-  await fs.writeFile(oversizedPath, "");
-  await fs.truncate(oversizedPath, MAX_WORKSPACE_INVENTORY_TOTAL_BYTES + 1);
-
-  const result = await run([baseCommit, "eligible"]);
-
+it.each([
+  ["full workspace above 4 GiB", "eligible byte limit"],
+  ["prior manifest above the entry limit", "invalid prior workspace manifest"],
+])("rejects a %s", async (kind, message) => {
+  const { workspace, baseCommit, manifestRoot, runManifest } = await gitWorkspace();
+  const args = [baseCommit, "eligible"];
+  if (kind.startsWith("full")) {
+    const oversized = path.join(workspace, "oversized.bin");
+    await fs.writeFile(oversized, "");
+    await fs.truncate(oversized, MAX_WORKSPACE_INVENTORY_TOTAL_BYTES + 1);
+  } else {
+    await fs.mkdir(manifestRoot, { recursive: true });
+    const raw = JSON.stringify({
+      version: 1,
+      baseCommit: null,
+      entries: Array.from({ length: MAX_WORKSPACE_INVENTORY_ENTRIES + 1 }, () => null),
+    });
+    const digest = createHash("sha256").update(raw).digest("hex");
+    await fs.writeFile(path.join(manifestRoot, digest + ".json"), raw);
+    args.push(digest);
+  }
+  const result = await runManifest(args);
   expect(result.code).not.toBe(0);
-  expect(result.stderr).toContain("eligible byte limit");
-});
-
-it("rejects prior manifests above the full-inventory entry limit", async () => {
-  const { baseCommit, manifestRoot, run } = await gitWorkspace("openclaw-manifest-entry-budget");
-  await fs.mkdir(manifestRoot, { recursive: true });
-  const priorRaw = JSON.stringify({
-    version: 1,
-    baseCommit: null,
-    entries: Array.from({ length: MAX_WORKSPACE_INVENTORY_ENTRIES + 1 }, () => null),
-  });
-  const priorDigest = createHash("sha256").update(priorRaw).digest("hex");
-  await fs.writeFile(path.join(manifestRoot, `${priorDigest}.json`), priorRaw);
-
-  const result = await run([baseCommit, "eligible", priorDigest]);
-
-  expect(result.code).not.toBe(0);
-  expect(result.stderr).toContain("invalid prior workspace manifest");
+  expect(result.stderr).toContain(message);
 });
 
 it("budgets raw Git candidates separately from materialized eligible inventory", async () => {
   expect(MAX_WORKSPACE_GIT_CANDIDATES).toBe(4 * MAX_WORKSPACE_INVENTORY_ENTRIES);
-  const { home, baseCommit, run, readManifest } = await gitWorkspace(
-    "openclaw-raw-git-candidate-budget",
-  );
+  const { home, baseCommit, runManifest: run, readManifest } = await gitWorkspace();
   const bin = path.join(home, "bin");
   const mockGit = path.join(bin, "git");
   await fs.mkdir(bin);
