@@ -1,42 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { LocalOnboardingState } from "../state/local-onboarding-state.js";
 import { buildOnboardingWelcome } from "./onboarding-welcome.js";
 
-const mocks = vi.hoisted(() => ({
-  readLocalOnboardingState: vi.fn<
-    (
-      configPath: string,
-      config: { wizard?: { securityAcknowledgedAt?: string } },
-    ) => LocalOnboardingState | undefined
-  >(() => undefined),
-  sourceConfig: {
-    agents: { defaults: { workspace: "/existing/workspace" } },
-    wizard: undefined as
-      | { securityAcknowledgedAt?: string; accessMode?: "full" | "guarded" }
-      | undefined,
-    gateway: undefined as
-      | {
-          mode?: "local" | "remote";
-          auth?: {
-            mode?: string;
-            token?: string | { source: "env"; provider: string; id: string };
-          };
-        }
-      | undefined,
-  },
-}));
+const mocks = vi.hoisted(() => {
+  const sourceConfig: Pick<OpenClawConfig, "agents" | "wizard" | "gateway"> = {};
+  return {
+    readLocalOnboardingState: vi.fn<
+      (
+        configPath: string,
+        config: { wizard?: { securityAcknowledgedAt?: string } },
+      ) => LocalOnboardingState | undefined
+    >(() => undefined),
+    sourceConfig,
+  };
+});
 
 vi.mock("../config/config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config/config.js")>()),
-  readConfigFileSnapshot: vi.fn(async () => ({
-    exists: true,
-    valid: true,
-    path: "/tmp/openclaw.json",
-    hash: "hash",
-    config: {},
-    sourceConfig: mocks.sourceConfig,
-    issues: [],
-  })),
+  readConfigFileSnapshot: vi.fn(async () => ({ sourceConfig: mocks.sourceConfig })),
 }));
 
 vi.mock("../state/local-onboarding-state.js", async (importOriginal) => ({
@@ -48,11 +30,9 @@ vi.mock("../commands/onboard-helpers.js", () => ({ DEFAULT_WORKSPACE: "/default/
 
 function createWelcomeEngine(
   defaultModel: string | undefined,
-  config: { exists: boolean; valid: boolean; issues?: []; hash?: string | null } = {
+  config: { exists: boolean; valid: boolean } = {
     exists: true,
     valid: true,
-    issues: [],
-    hash: "hash",
   },
   gateway?: { reachable: boolean; url: string },
 ) {
@@ -93,11 +73,7 @@ function receipt(overrides: Partial<LocalOnboardingState> = {}): LocalOnboarding
 }
 
 function readyEngine(url = "ws://127.0.0.1:18789") {
-  return createWelcomeEngine(
-    "openai/gpt-5.6-luna",
-    { exists: true, valid: true },
-    { reachable: true, url },
-  );
+  return createWelcomeEngine("openai/gpt-5.6-luna", undefined, { reachable: true, url });
 }
 
 function expectReceiptRead() {
@@ -114,12 +90,10 @@ async function expectReady(engine: ReturnType<typeof createWelcomeEngine>, local
 }
 
 describe("buildOnboardingWelcome", () => {
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
+  afterEach(() => vi.unstubAllEnvs());
 
   beforeEach(() => {
-    mocks.sourceConfig.agents.defaults.workspace = "/existing/workspace";
+    mocks.sourceConfig.agents = { defaults: { workspace: "/existing/workspace" } };
     mocks.sourceConfig.wizard = undefined;
     mocks.sourceConfig.gateway = undefined;
     mocks.readLocalOnboardingState.mockReset().mockReturnValue(undefined);
@@ -156,11 +130,9 @@ describe("buildOnboardingWelcome", () => {
 
   it("preserves an authored workspace in a partial setup", async () => {
     const engine = createWelcomeEngine("openai/gpt-5.5");
-    const { propose } = engine;
-
     const { text, question } = await welcome(engine, { agentName: "robby" });
 
-    expect(propose).toHaveBeenCalledWith({
+    expect(engine.propose).toHaveBeenCalledWith({
       kind: "setup",
       workspace: "/existing/workspace",
       agentName: "robby",
@@ -183,14 +155,16 @@ describe("buildOnboardingWelcome", () => {
     mocks.sourceConfig.gateway = { auth: { mode: "token", token: "existing-token" } };
     mocks.readLocalOnboardingState.mockReturnValueOnce(receipt());
     const engine = createWelcomeEngine("openai/gpt-5.6-luna", { exists: true, valid: true });
-    const { propose } = engine;
     const { text, question } = await welcome(engine, {
       workspace: "/requested/workspace",
       localRecovery: true,
     });
 
     expectReceiptRead();
-    expect(propose).toHaveBeenCalledWith({ kind: "setup", workspace: "/recovered/workspace" });
+    expect(engine.propose).toHaveBeenCalledWith({
+      kind: "setup",
+      workspace: "/recovered/workspace",
+    });
     expect(question.id).toBe("onboarding-apply-setup");
     expect(text).toContain("Workspace: /recovered/workspace");
   });
@@ -198,11 +172,7 @@ describe("buildOnboardingWelcome", () => {
   it("keeps the ready welcome after a local onboarding receipt completes", async () => {
     acknowledge();
     mocks.readLocalOnboardingState.mockReturnValueOnce(
-      receipt({
-        status: "completed",
-        runId: "completed-onboarding",
-        completedAtMs: 2,
-      }),
+      receipt({ status: "completed", completedAtMs: 2 }),
     );
     await expectReady(readyEngine(), true);
     expectReceiptRead();
@@ -213,7 +183,6 @@ describe("buildOnboardingWelcome", () => {
     mocks.readLocalOnboardingState.mockImplementation((_configPath, config) =>
       config.wizard?.securityAcknowledgedAt === "2026-08-02T00:00:00.000Z"
         ? receipt({
-            runId: "stale-onboarding",
             workspace: "/replaced/workspace",
             securityAcknowledgedAt: "2026-08-02T00:00:00.000Z",
           })
@@ -238,12 +207,7 @@ describe("buildOnboardingWelcome", () => {
   });
 
   it("advertises only the route that passed the inference gate", async () => {
-    const engine = createWelcomeEngine("openai/gpt-5.5", {
-      exists: false,
-      valid: false,
-      issues: [],
-      hash: null,
-    });
+    const engine = createWelcomeEngine("openai/gpt-5.5", { exists: false, valid: false });
     const { text } = await welcome(engine, { localRecovery: true });
 
     expect(mocks.readLocalOnboardingState).not.toHaveBeenCalled();
@@ -268,10 +232,9 @@ describe("buildOnboardingWelcome", () => {
   it("honors an explicit workspace override on an authored setup", async () => {
     mocks.sourceConfig.gateway = { auth: { mode: "token", token: "existing-token" } };
     const engine = createWelcomeEngine("openai/gpt-5.5");
-    const { propose } = engine;
     const { text } = await welcome(engine, { workspace: "/requested/workspace" });
 
-    expect(propose).toHaveBeenCalledWith({
+    expect(engine.propose).toHaveBeenCalledWith({
       kind: "setup",
       workspace: "/requested/workspace",
     });
@@ -280,12 +243,10 @@ describe("buildOnboardingWelcome", () => {
 
   it("fails closed before proposing setup when inference is missing", async () => {
     const engine = createWelcomeEngine(undefined);
-    const { propose, noteAssistantMessage } = engine;
-
     await expect(welcome(engine)).rejects.toThrow("requires working inference first");
 
-    expect(propose).not.toHaveBeenCalled();
-    expect(noteAssistantMessage).not.toHaveBeenCalled();
+    expect(engine.propose).not.toHaveBeenCalled();
+    expect(engine.noteAssistantMessage).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -301,10 +262,9 @@ describe("buildOnboardingWelcome", () => {
       reachable: true,
       url: "ws://127.0.0.1:18789",
     });
-    const { propose } = engine;
     const { text, question } = await welcome(engine);
 
-    expect(propose).toHaveBeenCalledTimes(configured ? 0 : 1);
+    expect(engine.propose).toHaveBeenCalledTimes(configured ? 0 : 1);
     expect(question.id).toBe(configured ? "onboarding-next-step" : "onboarding-apply-setup");
     expect(question.skipAction).toBe(configured ? "exit" : undefined);
     expect(text.includes("Say **yes**")).toBe(!configured);

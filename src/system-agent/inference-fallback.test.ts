@@ -6,6 +6,12 @@ import type { SystemAgentConfiguredRoute } from "./inference-route.js";
 import type { VerifySetupInferenceResult } from "./setup-inference.js";
 
 const runtime = {} as RuntimeEnv;
+type FallbackDeps = NonNullable<
+  Parameters<typeof verifySystemAgentInferenceWithFallback>[0]["deps"]
+>;
+const verifyConfigured = (deps: FallbackDeps) =>
+  verifySystemAgentInferenceWithFallback({ requestingAgentId: "requester", runtime, deps });
+const success = (modelRef: string) => ({ ok: true, modelRef, latencyMs: 1, binding: {} }) as never;
 
 function route(agentId: string, provider: string): SystemAgentConfiguredRoute {
   return {
@@ -21,50 +27,31 @@ function route(agentId: string, provider: string): SystemAgentConfiguredRoute {
   };
 }
 
-function fallbackConfig(
-  primary: string,
-  entries: Record<string, string>,
-  systemAgent?: { agentId: string },
-): OpenClawConfig {
+function fallbackConfig(agentIds: string[], systemAgent?: { agentId: string }): OpenClawConfig {
   return {
     agents: {
-      defaults: { model: { primary }, ...(systemAgent ? { systemAgent } : {}) },
-      entries: Object.fromEntries(Object.entries(entries).map(([id, model]) => [id, { model }])),
+      ...(systemAgent ? { defaults: { systemAgent } } : {}),
+      entries: Object.fromEntries(agentIds.map((id) => [id, {}])),
     },
   };
 }
 
 async function verifyAfterFailure(
   failure: Extract<VerifySetupInferenceResult, { ok: false }>,
-  {
-    includeBeta = false,
-    successfulAgentId = "alpha-other",
-  }: { includeBeta?: boolean; successfulAgentId?: "alpha-other" | "beta" } = {},
+  includeBeta: boolean,
+  successfulAgentId: "alpha-other" | "beta",
 ) {
   const attempts: string[] = [];
-  const cfg = fallbackConfig("alpha/model", {
-    requester: "alpha/model",
-    "alpha-other": "alpha/model",
-    ...(includeBeta ? { beta: "beta/model" } : {}),
-  });
-  const result = await verifySystemAgentInferenceWithFallback({
-    requestingAgentId: "requester",
-    runtime,
-    deps: {
-      readConfig: async () => cfg,
-      resolveRoute: async (_cfg, agentId) => route(agentId, agentId === "beta" ? "beta" : "alpha"),
-      hasAuth: async () => true,
-      verify: async ({ agentId }) => {
-        attempts.push(agentId);
-        return agentId === successfulAgentId
-          ? ({
-              ok: true,
-              modelRef: agentId === "beta" ? "beta/model" : "alpha/model",
-              latencyMs: 1,
-              binding: {},
-            } as never)
-          : { ...failure };
-      },
+  const cfg = fallbackConfig(["requester", "alpha-other", ...(includeBeta ? ["beta"] : [])]);
+  const result = await verifyConfigured({
+    readConfig: async () => cfg,
+    resolveRoute: async (_cfg, agentId) => route(agentId, agentId === "beta" ? "beta" : "alpha"),
+    hasAuth: async () => true,
+    verify: async ({ agentId }) => {
+      attempts.push(agentId);
+      return agentId === successfulAgentId
+        ? success(agentId === "beta" ? "beta/model" : "alpha/model")
+        : { ...failure };
     },
   });
   return { result, attempts };
@@ -155,26 +142,18 @@ describe("system-agent inference fallback", () => {
 
   it("uses a later authenticated route for one fallback provider", async () => {
     const attempts: string[] = [];
-    const duplicateProviderConfig = fallbackConfig("zeta/model", {
-      requester: "zeta/model",
-      "alpha-bad": "alpha/model",
-      "alpha-good": "alpha/model",
-    });
+    const duplicateProviderConfig = fallbackConfig(["requester", "alpha-bad", "alpha-good"]);
 
-    const result = await verifySystemAgentInferenceWithFallback({
-      requestingAgentId: "requester",
-      runtime,
-      deps: {
-        readConfig: async () => duplicateProviderConfig,
-        resolveRoute: async (_cfg, agentId) =>
-          route(agentId, agentId === "requester" ? "zeta" : "alpha"),
-        hasAuth: async ({ agentDir }) => agentDir?.endsWith("alpha-good") === true,
-        verify: async ({ agentId }) => {
-          attempts.push(agentId);
-          return agentId === "alpha-good"
-            ? ({ ok: true, modelRef: "alpha/model", latencyMs: 1, binding: {} } as never)
-            : ({ ok: false, status: "unavailable", error: "down" } as const);
-        },
+    const result = await verifyConfigured({
+      readConfig: async () => duplicateProviderConfig,
+      resolveRoute: async (_cfg, agentId) =>
+        route(agentId, agentId === "requester" ? "zeta" : "alpha"),
+      hasAuth: async ({ agentDir }) => agentDir?.endsWith("alpha-good") === true,
+      verify: async ({ agentId }) => {
+        attempts.push(agentId);
+        return agentId === "alpha-good"
+          ? success("alpha/model")
+          : ({ ok: false, status: "unavailable", error: "down" } as const);
       },
     });
 
@@ -192,7 +171,8 @@ describe("system-agent inference fallback", () => {
     async (status, error, includeBeta, successfulAgentId) => {
       const { result, attempts } = await verifyAfterFailure(
         { ok: false, status, error },
-        { includeBeta, successfulAgentId },
+        includeBeta,
+        successfulAgentId,
       );
       expect(result.ok).toBe(true);
       expect(attempts).toEqual(["requester", successfulAgentId]);
@@ -204,21 +184,13 @@ describe("system-agent inference fallback", () => {
       async () => ({ ok: false, status: "unknown", error: "winner identity uncertain" }) as const,
     );
 
-    const result = await verifySystemAgentInferenceWithFallback({
-      requestingAgentId: "requester",
-      runtime,
-      deps: {
-        readConfig: async () =>
-          fallbackConfig(
-            "zeta/model",
-            { requester: "zeta/model", beta: "beta/model", alpha: "alpha/model" },
-            { agentId: "requester" },
-          ),
-        resolveRoute: async (_cfg, agentId) =>
-          route(agentId, agentId === "requester" ? "zeta" : agentId),
-        hasAuth: async () => true,
-        verify,
-      },
+    const result = await verifyConfigured({
+      readConfig: async () =>
+        fallbackConfig(["requester", "beta", "alpha"], { agentId: "requester" }),
+      resolveRoute: async (_cfg, agentId) =>
+        route(agentId, agentId === "requester" ? "zeta" : agentId),
+      hasAuth: async () => true,
+      verify,
     });
 
     expect(result).toEqual({

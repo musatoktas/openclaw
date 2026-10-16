@@ -52,10 +52,10 @@ type State = ReturnType<typeof createSystemAgentTestRuntime> & {
   configPath: string;
   original: string;
 };
-async function withState(run: (state: State) => Promise<void>): Promise<void> {
-  await withTestDir({ prefix: "openclaw-custodian-roles-" }, async (root) => {
+function withState(run: (state: State) => Promise<void>): Promise<void> {
+  return withTestDir({ prefix: "openclaw-custodian-roles-" }, (root) => {
     const configPath = path.join(root, "openclaw.json");
-    await withEnvAsync(
+    return withEnvAsync(
       {
         OPENCLAW_STATE_DIR: root,
         OPENCLAW_CONFIG_PATH: configPath,
@@ -100,15 +100,10 @@ describe("custodian role creation through persisted configuration", () => {
     { source: "tool", agentId: "qa-writer", role: "writer" },
   ])(
     "creates $agentId from $source with role=$role only after approval",
-    async ({ source, agentId, role }) => {
-      await withState(async ({ root, configPath, original, runtime, lines }) => {
+    ({ source, agentId, role }) =>
+      withState(async ({ root, configPath, original, runtime, lines }) => {
         const workspace = path.join(root, agentId);
-        let operation: SystemAgentOperation =
-          source === "command"
-            ? parseSystemAgentOperation(
-                `create agent ${agentId} purpose "${purpose}" workspace "${workspace}"`,
-              )
-            : { kind: "create-agent", agentId, workspace, ...(role ? { role } : { purpose }) };
+        let operation: SystemAgentOperation;
         if (source === "tool") {
           const args = {
             action: "create_agent",
@@ -130,6 +125,9 @@ describe("custodian role creation through persisted configuration", () => {
           expect(describeSystemAgentPersistentOperation(operation)).toContain('name: "QA Writer"');
           expect(tool.parameters).toMatchObject({ properties: { name: { type: "string" } } });
         } else {
+          operation = parseSystemAgentOperation(
+            `create agent ${agentId} purpose "${purpose}" workspace "${workspace}"`,
+          );
           expect(await executeSystemAgentOperation(operation, runtime)).toMatchObject({
             applied: false,
             ...(role ? { message: expect.stringContaining("Writer") } : {}),
@@ -170,19 +168,16 @@ describe("custodian role creation through persisted configuration", () => {
           expect(await readText(workspace, "AGENTS.md")).toContain(purpose);
         } else {
           const template = await loadAgentRole(role);
-          expect(entry?.identity).toEqual({ ...template.identity, name: "QA Writer" });
-          expect(loadAgentIdentityFromWorkspace(workspace)).toMatchObject({
-            ...template.identity,
-            name: "QA Writer",
-          });
+          const identity = { ...template.identity, name: "QA Writer" };
+          expect(entry?.identity).toEqual(identity);
+          expect(loadAgentIdentityFromWorkspace(workspace)).toMatchObject(identity);
           expect(await readText(workspace, "AGENTS.md")).toBe(template.files["AGENTS.md"]);
         }
-      });
-    },
+      }),
   );
 
-  it("requires fresh approval when a custom purpose changes", async () => {
-    await withState(async ({ root, configPath, original }) => {
+  it("requires fresh approval when a custom purpose changes", () =>
+    withState(async ({ root, configPath, original }) => {
       const args = {
         action: "create_agent",
         agentId: "ledger",
@@ -200,11 +195,10 @@ describe("custodian role creation through persisted configuration", () => {
       expect(proposalRef.current).toBeUndefined();
       expect(await fs.readFile(configPath, "utf8")).toBe(original);
       await expectAbsent(args.workspace);
-    });
-  });
+    }));
 
-  it("preserves existing instructions", async () => {
-    await withState(async ({ root, configPath, original, runtime }) => {
+  it("preserves existing instructions", () =>
+    withState(async ({ root, configPath, original, runtime }) => {
       const workspace = path.join(root, "existing");
       await fs.mkdir(workspace);
       const instructions = "# Existing instructions\n\nKeep the operator's workflow.\n";
@@ -219,11 +213,10 @@ describe("custodian role creation through persisted configuration", () => {
       expect(await readText(workspace, "AGENTS.md")).toBe(instructions);
       expect(await fs.readFile(configPath, "utf8")).toBe(original);
       expect(await fs.readdir(workspace)).toEqual(["AGENTS.md"]);
-    });
-  });
+    }));
 
-  it("creates the approved team with directed delegation and separate role workspaces", async () => {
-    await withState(async ({ root, configPath, original, runtime, lines }) => {
+  it("creates the approved team with directed delegation and separate role workspaces", () =>
+    withState(async ({ root, configPath, original, runtime, lines }) => {
       const workspaceRoot = path.join(root, "team");
       const operation = {
         kind: "create-team" as const,
@@ -249,23 +242,18 @@ describe("custodian role creation through persisted configuration", () => {
         bootstrapPending: false,
       });
       const config = await readConfig();
+      const entries = config.agents?.entries ?? {};
       const members = [
         ["docs-lead", "coordinator"],
         ["docs-researcher", "researcher"],
         ["docs-writer", "writer"],
         ["docs-reviewer", "reviewer"],
       ] as const;
-      expect(Object.keys(config.agents?.entries ?? {})).toEqual([
-        "ambient",
-        ...members.map(([id]) => id),
-      ]);
+      expect(Object.keys(entries)).toEqual(["ambient", ...members.map(([id]) => id)]);
       for (const [id, role] of members) {
         const workspace = path.join(workspaceRoot, id);
         const template = await loadAgentRole(role);
-        expect(config.agents?.entries?.[id]).toMatchObject({
-          workspace,
-          identity: template.identity,
-        });
+        expect(entries[id]).toMatchObject({ workspace, identity: template.identity });
         expect(readAgentProvenance(id)).toMatchObject({
           createdVia: "agent",
           creatorAgentId: "planner",
@@ -273,7 +261,7 @@ describe("custodian role creation through persisted configuration", () => {
         expect(await readText(workspace, "AGENTS.md")).toBe(template.files["AGENTS.md"]);
         await expectAbsent(path.join(workspace, "BOOTSTRAP.md"));
       }
-      expect(config.agents?.entries?.["docs-lead"]?.subagents).toEqual({
+      expect(entries["docs-lead"]?.subagents).toEqual({
         allowAgents: ["docs-researcher", "docs-writer", "docs-reviewer"],
         delegationMode: "prefer",
       });
@@ -282,13 +270,12 @@ describe("custodian role creation through persisted configuration", () => {
       expect(confirmation).toContain("docs-lead");
       expect(confirmation).toContain("Agents home");
       expect(confirmation).toContain("agent switcher");
-    });
-  });
+    }));
 
   it.each(["unfinished-bootstrap", "authority-revoked", "post-commit-first"])(
     "reports and audits retained members after %s blocks the remaining team",
-    async (failure) => {
-      await withState(async ({ root, runtime, lines }) => {
+    (failure) =>
+      withState(async ({ root, runtime, lines }) => {
         const workspaceRoot = path.join(root, "team");
         const retainedAgentIds =
           failure === "post-commit-first" ? ["coordinator"] : ["coordinator", "researcher"];
@@ -350,7 +337,6 @@ describe("custodian role creation through persisted configuration", () => {
           details: { retainedAgentIds },
         });
         await expectAbsent(path.join(workspaceRoot, "reviewer"));
-      });
-    },
+      }),
   );
 });
