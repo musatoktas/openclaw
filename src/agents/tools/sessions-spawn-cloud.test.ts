@@ -82,18 +82,6 @@ describe("visible session placement and authority", () => {
     acpRuntimeRegistry.testing.resetAcpRuntimeBackendsForTests();
   });
 
-  function mockCallArg(mock: unknown, callIndex: number, argIndex: number, label: string) {
-    const calls = (mock as { mock?: { calls?: unknown[][] } }).mock?.calls;
-    if (!Array.isArray(calls)) {
-      throw new Error(`expected ${label} mock calls`);
-    }
-    const call = calls[callIndex];
-    if (!call) {
-      throw new Error(`expected ${label} call ${callIndex + 1}`);
-    }
-    return requireRecord(call[argIndex], `${label} call ${callIndex + 1} arg ${argIndex + 1}`);
-  }
-
   it.each([
     { visible: undefined, placement: undefined },
     { visible: false, placement: { kind: "local" } },
@@ -143,8 +131,7 @@ describe("visible session placement and authority", () => {
       const result = await tool.execute("local-review", args);
 
       expect(result.details).toMatchObject({ status: "accepted", runId: "local-review-run" });
-      expect(hoisted.spawnSubagentDirectMock).toHaveBeenCalledOnce();
-      expect(hoisted.spawnSubagentDirectMock).toHaveBeenCalledWith(
+      expect(hoisted.spawnSubagentDirectMock).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
           task: request.task,
           cwd: request.cwd,
@@ -353,11 +340,12 @@ describe("visible session placement and authority", () => {
         "sessions.dispatch",
         "agent",
       ]);
-      expect(mockCallArg(callGateway, 0, 1, "sessions.create")).toMatchObject({
+      const creation = callGateway.mock.calls[0]?.[1];
+      expect(creation).toMatchObject({
         model: "mock-provider/child@child-profile",
         titleSource: task.slice(0, 1000),
       });
-      expect(mockCallArg(callGateway, 0, 1, "sessions.create")).not.toHaveProperty("task");
+      expect(creation).not.toHaveProperty("task");
       expect(callGateway).toHaveBeenCalledWith(
         "sessions.dispatch",
         {

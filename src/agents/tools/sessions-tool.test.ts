@@ -25,6 +25,52 @@ import {
 } from "./sessions-tool.test-helpers.js";
 
 const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-sessions-tool-");
+type ToolOptions = NonNullable<Parameters<typeof createSessionsTool>[0]>;
+const mainKey = "agent:main:main";
+const visibleConfig = { tools: { sessions: { visibility: "agent" } } } satisfies OpenClawConfig;
+const fixedStoreConfig = {
+  session: { store: "/tmp/shared-sessions.sqlite", scope: "global" },
+  agents: {
+    ownership: "explicit",
+    defaults: { sessionStore: { agentId: "ops" } },
+    entries: { ops: {}, research: {} },
+  },
+} satisfies OpenClawConfig;
+const makeTool = (options: ToolOptions = {}) =>
+  createSessionsTool({ agentSessionKey: mainKey, config: {}, ...options });
+
+function expectReceipt(
+  work: ExecutionDecisionWork[],
+  operation: string,
+  fact = "committed",
+  outcome = "allowed",
+  target?: string,
+) {
+  expect(work[0]).toMatchObject({
+    receipt: {
+      action: { family: "session", operation },
+      decision: { outcome, reasonCode: `session_${operation}_${fact}` },
+      enforcement: { coverageState: "attribution-only" },
+    },
+    ...(target
+      ? { refs: { target: { namespace: "session", value: `["main","${target}"]` } } }
+      : {}),
+  });
+}
+
+function modelFallback(prevModel = "good", ts = 1) {
+  return { prevModel, prevProvider: "openai", ts, source: "agent-patch" as const };
+}
+
+async function seedModelSession(entry: Parameters<typeof upsertSessionEntryCore>[1]) {
+  const scope = {
+    agentId: "main",
+    sessionKey: mainKey,
+    storePath: path.join(sessionDirs.make(), "sessions.json"),
+  };
+  await upsertSessionEntryCore(scope, { sessionId: "session-main", updatedAt: 1, ...entry });
+  return scope;
+}
 
 const gatewayMocks = vi.hoisted(() => ({ callGateway: vi.fn() }));
 vi.mock("../../gateway/call.js", async (importOriginal) => ({
@@ -38,7 +84,10 @@ beforeEach(() => {
 
 type AgentToolGatewayRequest = Parameters<AgentToolGatewayRequestCaller>[0];
 
-async function captureSessionDecisionWork<T>(run: () => Promise<T>): Promise<{
+async function captureSessionDecisionWork<T>(
+  run: () => Promise<T>,
+  receiptAuthority = () => true,
+): Promise<{
   result: T;
   work: ExecutionDecisionWork[];
 }> {
@@ -57,7 +106,7 @@ async function captureSessionDecisionWork<T>(run: () => Promise<T>): Promise<{
         agentId: "main",
         sessionKey: "agent:main:main",
         executionIdentityToken: token,
-        receiptAuthority: () => true,
+        receiptAuthority,
       },
       run,
     );
@@ -70,16 +119,9 @@ async function captureSessionDecisionWork<T>(run: () => Promise<T>): Promise<{
 describe("sessions tool", () => {
   it("carries the persisted fixed-store owner for a bare patch key", async () => {
     const callGateway = vi.fn().mockResolvedValue({});
-    const tool = createSessionsTool({
+    const tool = makeTool({
       agentSessionKey: "global",
-      config: {
-        session: { store: "/tmp/shared-sessions.sqlite", scope: "global" },
-        agents: {
-          ownership: "explicit",
-          defaults: { sessionStore: { agentId: "ops" } },
-          entries: { ops: {}, research: {} },
-        },
-      },
+      config: fixedStoreConfig,
       callGateway,
     });
 
@@ -99,17 +141,10 @@ describe("sessions tool", () => {
       requests.push(request);
       return { ok: true } as T;
     };
-    const tool = createSessionsTool({
+    const tool = makeTool({
       agentSessionKey: "agent:research:main",
       requesterAgentIdOverride: "research",
-      config: {
-        session: { store: "/tmp/shared-sessions.sqlite", scope: "global" },
-        agents: {
-          ownership: "explicit",
-          defaults: { sessionStore: { agentId: "ops" } },
-          entries: { ops: {}, research: {} },
-        },
-      },
+      config: fixedStoreConfig,
       callGateway,
     });
 
@@ -137,7 +172,7 @@ describe("sessions tool", () => {
       }
       throw new Error(`unexpected gateway mutation: ${request.method}`);
     };
-    const tool = createSessionsTool({
+    const tool = makeTool({
       agentSessionKey: "global",
       requesterAgentIdOverride: "research",
       config: {
@@ -170,11 +205,7 @@ describe("sessions tool", () => {
   it("cannot patch an incognito session through the cross-session tool", async () => {
     const sessionKey = "agent:main:dashboard:incognito-private";
     const callGateway = vi.fn();
-    const tool = createSessionsTool({
-      agentSessionKey: sessionKey,
-      config: {},
-      callGateway,
-    });
+    const tool = makeTool({ agentSessionKey: sessionKey, callGateway });
 
     await expect(
       tool.execute("incognito-patch", { action: "patch", label: "private" }),
@@ -184,11 +215,7 @@ describe("sessions tool", () => {
 
   it("does not accept independent creation through management actions", async () => {
     const callGateway = vi.fn();
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-      callGateway,
-    });
+    const tool = makeTool({ callGateway });
 
     await expect(tool.execute("create-uncontrolled-session", { action: "create" })).rejects.toThrow(
       "Unknown action: create",
@@ -208,9 +235,8 @@ describe("sessions tool", () => {
         ? { ok: true, entry: { sessionId, lifecycleRevision } }
         : { ok: true, deleted: true },
     );
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: { tools: { sessions: { visibility: "agent" } } },
+    const tool = makeTool({
+      config: visibleConfig,
       callGateway: callGateway as never,
     });
 
@@ -244,21 +270,13 @@ describe("sessions tool", () => {
       ],
     ]);
     expect(work).toHaveLength(1);
-    expect(work[0]).toMatchObject({
-      receipt: {
-        action: { family: "session", operation: "delete" },
-        decision: { outcome: "allowed", reasonCode: "session_delete_committed" },
-        enforcement: { coverageState: "attribution-only" },
-      },
-      refs: { target: { namespace: "session", value: `["main","${sessionKey}"]` } },
-    });
+    expectReceipt(work, "delete", "committed", "allowed", sessionKey);
   });
 
   it("does not discover a lifecycle identity while deleting another session", async () => {
     const callGateway = vi.fn();
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: { tools: { sessions: { visibility: "agent" } } },
+    const tool = makeTool({
+      config: visibleConfig,
       callGateway,
     });
 
@@ -279,9 +297,8 @@ describe("sessions tool", () => {
         ? { ok: true, entry: { sessionId } }
         : { ok: true, deleted: false },
     );
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: { tools: { sessions: { visibility: "agent" } } },
+    const tool = makeTool({
+      config: visibleConfig,
       callGateway: callGateway as never,
     });
 
@@ -314,9 +331,8 @@ describe("sessions tool", () => {
     const sessionKey = "agent:main:dashboard:finished";
     const sessionId = "finished-session";
     const callGateway = vi.fn(async () => ({ ok: true }));
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: { tools: { sessions: { visibility: "agent" } } },
+    const tool = makeTool({
+      config: visibleConfig,
       callGateway: callGateway as never,
     });
 
@@ -342,9 +358,8 @@ describe("sessions tool", () => {
   it("resets another visible session through the canonical gateway method", async () => {
     const sessionKey = "agent:main:dashboard:reset-me";
     const callGateway = vi.fn(async () => ({ ok: true }));
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: { tools: { sessions: { visibility: "agent" } } },
+    const tool = makeTool({
+      config: visibleConfig,
       callGateway: callGateway as never,
     });
 
@@ -359,11 +374,7 @@ describe("sessions tool", () => {
         reason: "reset",
       },
     });
-    expect(work[0]?.receipt).toMatchObject({
-      action: { family: "session", operation: "reset" },
-      decision: { outcome: "allowed", reasonCode: "session_reset_committed" },
-      enforcement: { coverageState: "attribution-only" },
-    });
+    expectReceipt(work, "reset");
   });
 
   it("records a committed restore result", async () => {
@@ -373,22 +384,14 @@ describe("sessions tool", () => {
       key: "agent:main:main",
       entry: { sessionId: "session-main" },
     });
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      agentSessionId: "session-main",
-      config: {},
-    });
+    const tool = makeTool({ agentSessionId: "session-main" });
 
     const { work } = await captureSessionDecisionWork(
       async () => await tool.execute("committed-restore", { action: "patch", archived: false }),
     );
 
     expect(work).toHaveLength(1);
-    expect(work[0]?.receipt).toMatchObject({
-      action: { family: "session", operation: "restore" },
-      decision: { outcome: "allowed", reasonCode: "session_restore_committed" },
-      enforcement: { coverageState: "attribution-only" },
-    });
+    expectReceipt(work, "restore");
   });
 
   it("records a typed archive conflict", async () => {
@@ -400,12 +403,7 @@ describe("sessions tool", () => {
         details: { reason: "session-changed" },
       });
     });
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      agentSessionId: "session-main",
-      config: {},
-      callGateway,
-    });
+    const tool = makeTool({ agentSessionId: "session-main", callGateway });
 
     const { work } = await captureSessionDecisionWork(async () => {
       await expect(
@@ -414,23 +412,10 @@ describe("sessions tool", () => {
     });
 
     expect(work).toHaveLength(1);
-    expect(work[0]?.receipt).toMatchObject({
-      action: { family: "session", operation: "archive" },
-      decision: { outcome: "denied", reasonCode: "session_archive_conflict" },
-      enforcement: { coverageState: "attribution-only" },
-    });
+    expectReceipt(work, "archive", "conflict", "denied");
   });
 
   it("drops a session result when receipt authority closes across its awaited RPC", async () => {
-    const work: ExecutionDecisionWork[] = [];
-    const clear = configureExecutionDecisionWorkSink((item) => {
-      work.push(item);
-      return true;
-    });
-    const token = createExecutionIdentityAdmissionToken("sessions-tool-closed", {
-      contextId: "sessions-tool-closed-context",
-      executionId: "sessions-tool-closed-execution",
-    });
     let authorityActive = true;
     gatewayMocks.callGateway.mockImplementation(async () => {
       authorityActive = false;
@@ -441,34 +426,18 @@ describe("sessions tool", () => {
         entry: { sessionId: "session-main" },
       };
     });
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-    try {
-      await withGatewayToolCallerIdentity(
-        {
-          agentId: "main",
-          sessionKey: "agent:main:main",
-          executionIdentityToken: token,
-          receiptAuthority: () => authorityActive,
-        },
-        async () => await tool.execute("closed-patch", { action: "patch", label: "Updated" }),
-      );
-      expect(gatewayMocks.callGateway).toHaveBeenCalledOnce();
-      expect(work).toEqual([]);
-    } finally {
-      clear();
-    }
+    const tool = makeTool();
+    const { work } = await captureSessionDecisionWork(
+      async () => await tool.execute("closed-patch", { action: "patch", label: "Updated" }),
+      () => authorityActive,
+    );
+    expect(gatewayMocks.callGateway).toHaveBeenCalledOnce();
+    expect(work).toEqual([]);
   });
 
   it("refuses to delete its currently running session", async () => {
     const callGateway = vi.fn();
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-      callGateway,
-    });
+    const tool = makeTool({ callGateway });
 
     await expect(
       tool.execute("self-delete", { action: "delete", sessionKey: "agent:main:main" }),
@@ -533,7 +502,7 @@ describe("sessions tool", () => {
         return { ok: true };
       },
     );
-    const tool = createSessionsTool({
+    const tool = makeTool({
       agentSessionKey: sessionKey,
       config: cfg,
       callGateway: callGateway as never,
@@ -629,40 +598,15 @@ describe("sessions tool", () => {
   });
 
   it("clears the model fallback marker after a successful run", async () => {
-    const dir = sessionDirs.make();
-    const storePath = path.join(dir, "sessions.json");
-    const sessionKey = "agent:main:main";
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey, storePath },
-      {
-        sessionId: "session-main",
-        updatedAt: 1,
-        modelFallback: {
-          prevModel: "good",
-          prevProvider: "openai",
-          ts: 1,
-          source: "agent-patch",
-        },
-      },
-    );
-
-    const guard = await createAgentPatchedSessionModelRunGuard({
-      cfg: {},
-      agentId: "main",
-      sessionKey,
-      storePath,
-    });
+    const scope = await seedModelSession({ modelFallback: modelFallback() });
+    const guard = await createAgentPatchedSessionModelRunGuard({ cfg: {}, ...scope });
     await guard.finish(true);
-    expect(loadSessionEntry({ agentId: "main", sessionKey, storePath })).not.toHaveProperty(
-      "modelFallback",
-    );
+    expect(loadSessionEntry(scope)).not.toHaveProperty("modelFallback");
   });
 
   it("denies model patches without in-process gateway context", async () => {
     const callGateway = vi.fn();
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
+    const tool = makeTool({
       callGateway,
       hasInProcessGatewayContext: () => false,
     });
@@ -680,32 +624,14 @@ describe("sessions tool", () => {
   });
 
   it("reverts when the patched model fails but a fallback completes the run", async () => {
-    const dir = sessionDirs.make();
-    const storePath = path.join(dir, "sessions.json");
-    const sessionKey = "agent:main:main";
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey, storePath },
-      {
-        sessionId: "session-main",
-        updatedAt: 1,
-        model: "bad",
-        modelProvider: "broken",
-        modelOverride: "bad",
-        providerOverride: "broken",
-        modelFallback: {
-          prevModel: "good",
-          prevProvider: "openai",
-          ts: 1,
-          source: "agent-patch",
-        },
-      },
-    );
-    const runGuard = await createAgentPatchedSessionModelRunGuard({
-      cfg: {},
-      agentId: "main",
-      sessionKey,
-      storePath,
+    const scope = await seedModelSession({
+      model: "bad",
+      modelProvider: "broken",
+      modelOverride: "bad",
+      providerOverride: "broken",
+      modelFallback: modelFallback(),
     });
+    const runGuard = await createAgentPatchedSessionModelRunGuard({ cfg: {}, ...scope });
 
     const needsRevert = runGuard.captureFallbackFailure([
       {
@@ -716,83 +642,41 @@ describe("sessions tool", () => {
     ]);
     await runGuard.finish(!needsRevert);
 
-    expect(loadSessionEntry({ agentId: "main", sessionKey, storePath })).toMatchObject({
+    expect(loadSessionEntry(scope)).toMatchObject({
       model: "good",
       modelProvider: "openai",
     });
-    expect(loadSessionEntry({ agentId: "main", sessionKey, storePath })).not.toHaveProperty(
-      "modelFallback",
-    );
+    expect(loadSessionEntry(scope)).not.toHaveProperty("modelFallback");
   });
 
   it("promotes the newest validated model across overlapping patches", async () => {
-    const dir = sessionDirs.make();
-    const storePath = path.join(dir, "sessions.json");
-    const sessionKey = "agent:main:main";
     const cfg: OpenClawConfig = {
       agents: { defaults: { model: { primary: "openai/a" } } },
     };
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey, storePath },
-      {
-        sessionId: "session-main",
-        updatedAt: 1,
-        model: "b",
-        modelProvider: "openai",
-        modelOverride: "b",
-        providerOverride: "openai",
-        modelFallback: {
-          prevModel: "a",
-          prevProvider: "openai",
-          ts: 10,
-          source: "agent-patch",
-        },
-      },
-    );
-    const runB = await createAgentPatchedSessionModelRunGuard({
-      cfg,
-      agentId: "main",
-      sessionKey,
-      storePath,
+    const scope = await seedModelSession({
+      model: "b",
+      modelProvider: "openai",
+      modelOverride: "b",
+      providerOverride: "openai",
+      modelFallback: modelFallback("a", 10),
     });
-    await patchSessionEntryCore({ agentId: "main", sessionKey, storePath }, () => ({
+    const runB = await createAgentPatchedSessionModelRunGuard({ cfg, ...scope });
+    await patchSessionEntryCore(scope, () => ({
       model: "c",
       modelOverride: "c",
-      modelFallback: {
-        prevModel: "a",
-        prevProvider: "openai",
-        ts: 20,
-        source: "agent-patch",
-      },
+      modelFallback: modelFallback("a", 20),
     }));
-    const runC = await createAgentPatchedSessionModelRunGuard({
-      cfg,
-      agentId: "main",
-      sessionKey,
-      storePath,
-    });
-    await patchSessionEntryCore({ agentId: "main", sessionKey, storePath }, () => ({
+    const runC = await createAgentPatchedSessionModelRunGuard({ cfg, ...scope });
+    await patchSessionEntryCore(scope, () => ({
       model: "d",
       modelOverride: "d",
-      modelFallback: {
-        prevModel: "a",
-        prevProvider: "openai",
-        ts: 30,
-        source: "agent-patch",
-      },
+      modelFallback: modelFallback("a", 30),
     }));
-    const runD = await createAgentPatchedSessionModelRunGuard({
-      cfg,
-      agentId: "main",
-      sessionKey,
-      storePath,
-    });
+    const runD = await createAgentPatchedSessionModelRunGuard({ cfg, ...scope });
 
     await runC.finish(true);
     await runB.finish(true);
-    expect(
-      loadSessionEntry({ agentId: "main", sessionKey, storePath })?.modelFallback,
-    ).toMatchObject({
+    expect(loadSessionEntry(scope)?.modelFallback).toMatchObject({
       prevModel: "c",
       prevProvider: "openai",
       lastValidatedPatchTs: 20,
@@ -800,7 +684,7 @@ describe("sessions tool", () => {
     });
 
     await runD.fail({ status: 404, message: "No endpoints found for openai/d." });
-    expect(loadSessionEntry({ agentId: "main", sessionKey, storePath })).toMatchObject({
+    expect(loadSessionEntry(scope)).toMatchObject({
       model: "c",
       modelProvider: "openai",
       modelOverride: "c",
@@ -824,7 +708,7 @@ describe("sessions tool", () => {
       entry: { skillsSnapshot: "s".repeat(47_469) },
       resolved: adversarialResolved,
     }));
-    const tool = createSessionsTool({
+    const tool = makeTool({
       agentSessionKey: sessionKey,
       agentSessionId: sessionId,
       config: { session: { store: storePath } },
@@ -858,14 +742,7 @@ describe("sessions tool", () => {
       expectExactResolvedAcknowledgement(result, adversarialResolved);
       expect(callGateway).toHaveBeenCalledTimes(1);
       expect(work).toHaveLength(1);
-      expect(work[0]).toMatchObject({
-        receipt: {
-          action: { family: "session", operation: "archive" },
-          decision: { outcome: "allowed", reasonCode: "session_archive_scheduled" },
-          enforcement: { coverageState: "attribution-only" },
-        },
-        refs: { target: { namespace: "session", value: `["main","${sessionKey}"]` } },
-      });
+      expectReceipt(work, "archive", "scheduled", "allowed", sessionKey);
     } finally {
       admission.release();
     }
@@ -892,11 +769,7 @@ describe("sessions tool", () => {
 
   it("rejects an empty patch", async () => {
     const callGateway = vi.fn();
-    const tool = createSessionsTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-      callGateway,
-    });
+    const tool = makeTool({ callGateway });
 
     await expect(tool.execute("patch-empty", { action: "patch" })).rejects.toThrow(
       "Patch setting required",
@@ -908,7 +781,7 @@ describe("sessions tool", () => {
     "applies %s visibility when a non-main session categorizes a sibling",
     async (visibility) => {
       const callGateway = vi.fn(async () => ({ sessions: [] }));
-      const tool = createSessionsTool({
+      const tool = makeTool({
         agentSessionKey: "agent:main:cron:organize",
         config: { tools: { sessions: { visibility } } },
         callGateway: callGateway as never,

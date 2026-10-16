@@ -26,6 +26,19 @@ const lifetime = { assertCurrent() {}, assertReadable() {} };
 const targetKey = "agent:research:dashboard:durable-target";
 const actorKey = "agent:main:dashboard:incognito-send-requester";
 const nativeKey = "agent:native:dashboard:incognito-send-requester";
+const privateEntry = (sessionId = "actor-requester") => ({
+  sessionId,
+  lifecycleRevision: "actor-generation",
+  updatedAt: 1,
+  spawnDepth: 1,
+  incognito: true,
+});
+const targetSession = {
+  key: targetKey,
+  agentId: "research",
+  sessionId: "durable-target",
+  kind: "direct",
+};
 const config = {
   agents: { ownership: "explicit", entries: { main: {}, research: {}, native: {} } },
   session: { mainKey: "main", scope: "per-sender" },
@@ -60,15 +73,7 @@ beforeAll(async () => {
       await handle.storage!.mutate(
         {
           type: "session.entry.create",
-          input: {
-            entry: {
-              sessionId,
-              lifecycleRevision: "actor-generation",
-              updatedAt: 1,
-              spawnDepth: 1,
-              incognito: true,
-            },
-          },
+          input: { entry: privateEntry(sessionId) },
         },
         authority,
       ),
@@ -96,20 +101,9 @@ function gateway(beforeAdmission?: () => Promise<void>) {
         case "sessions.resolve":
           return { key: targetKey, agentId: "research" };
         case "sessions.list":
-          return {
-            sessions: [
-              { key: targetKey, agentId: "research", sessionId: "durable-target", kind: "direct" },
-            ],
-          };
+          return { sessions: [targetSession] };
         case "sessions.describe":
-          return {
-            session: {
-              key: targetKey,
-              agentId: "research",
-              sessionId: "durable-target",
-              kind: "direct",
-            },
-          };
+          return { session: targetSession };
         case "agent":
           await beforeAdmission?.();
           request.assertDispatchCurrent?.();
@@ -155,11 +149,7 @@ it.each([
         await replaceSessionEntry(
           { agentId: "main", sessionKey: actorKey },
           {
-            sessionId: change === "incarnation" ? "replacement-requester" : "actor-requester",
-            lifecycleRevision: "actor-generation",
-            updatedAt: 1,
-            spawnDepth: 1,
-            incognito: true,
+            ...privateEntry(change === "incarnation" ? "replacement-requester" : "actor-requester"),
             ...(change === "policy" ? { communication: { send: "never" } } : {}),
           },
         );
@@ -210,16 +200,7 @@ it.each([
       await work.drain();
       observers.forEach((observer) => observer.mockRestore());
       if (change !== "none") {
-        await replaceSessionEntry(
-          { agentId: "main", sessionKey: actorKey },
-          {
-            sessionId: "actor-requester",
-            lifecycleRevision: "actor-generation",
-            updatedAt: 1,
-            spawnDepth: 1,
-            incognito: true,
-          },
-        );
+        await replaceSessionEntry({ agentId: "main", sessionKey: actorKey }, privateEntry());
       }
     }
   },

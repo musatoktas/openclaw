@@ -19,6 +19,21 @@ import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
 
 const { hoisted } = await import("./sessions-spawn-tool.mocks.test-support.js");
 let createSessionsSpawnTool: typeof import("./sessions-spawn-tool.js").createSessionsSpawnTool;
+type SpawnOptions = NonNullable<Parameters<typeof createSessionsSpawnTool>[0]>;
+const makeTool = (options: SpawnOptions = {}) =>
+  createSessionsSpawnTool({
+    agentSessionKey: "agent:main:main",
+    registerRun: vi.fn(),
+    countActiveRuns: () => 0,
+    ...options,
+  });
+const created = (name: string, agent = "main") => ({
+  key: `agent:${agent}:dashboard:${name}`,
+  sessionId: name,
+  runStarted: true,
+  runId: `${name}-run`,
+});
+const primary = { model: "mock-provider/primary" };
 
 describe("sessions_spawn visible work receipts", () => {
   beforeAll(async () => {
@@ -39,14 +54,12 @@ describe("sessions_spawn visible work receipts", () => {
 
   it("delegates an explicitly granted coding target without the front-door local tool ceiling", async () => {
     hoisted.inProcessCreationMock.mockResolvedValue({
-      key: "agent:worker:dashboard:coding-child",
+      ...created("coding-child", "worker"),
       sessionId: "coding-child-session",
-      runStarted: true,
-      runId: "coding-child-run",
     });
     const config = {
       agents: {
-        defaults: { model: "mock-provider/primary" },
+        defaults: primary,
         entries: {
           main: {
             tools: { deny: ["exec", "write", "edit", "apply_patch"] },
@@ -56,8 +69,7 @@ describe("sessions_spawn visible work receipts", () => {
         },
       },
     };
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
+    const tool = makeTool({
       config,
       senderIsOwner: true,
       delegatedToolDenyFloor: prepareDelegatedToolDenyFloor(
@@ -68,8 +80,6 @@ describe("sessions_spawn visible work receipts", () => {
         }),
       ),
       inheritedToolDenylist: ["exec", "write", "edit", "apply_patch"],
-      registerRun: vi.fn(),
-      countActiveRuns: () => 0,
     });
     const result = await tool.execute("authorized-coding-handoff", {
       task: "Implement and test the requested repository fix",
@@ -123,22 +133,17 @@ describe("sessions_spawn visible work receipts", () => {
 
   it("does not accept a delegated ceiling or grant from model arguments", async () => {
     hoisted.inProcessCreationMock.mockResolvedValue({
-      key: "agent:worker:dashboard:ordinary-child",
+      ...created("ordinary-child", "worker"),
       sessionId: "ordinary-child-session",
-      runStarted: true,
-      runId: "ordinary-child-run",
     });
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
+    const tool = makeTool({
       config: {
         agents: {
-          defaults: { model: "mock-provider/primary" },
+          defaults: primary,
           entries: { main: { subagents: { allowAgents: ["worker"] } }, worker: {} },
         },
       },
       inheritedToolDenylist: ["exec"],
-      registerRun: vi.fn(),
-      countActiveRuns: () => 0,
     });
     const result = await tool.execute("forged-delegation", {
       task: "inspect",
@@ -162,18 +167,13 @@ describe("sessions_spawn visible work receipts", () => {
     admitChildSessionPublication(context, run, () => {});
     const publication = readChildSessionPublication(run);
     hoisted.inProcessCreationMock.mockResolvedValue({
-      key: "agent:main:dashboard:public-child",
-      sessionId: "public-child",
-      runStarted: true,
-      runId: "public-child-run",
+      ...created("public-child"),
       publicRead: true,
       entry: { sessionId: "public-child", updatedAt: 1 },
     });
-    const tool = createSessionsSpawnTool({
+    const tool = makeTool({
       agentSessionKey: key,
-      config: { agents: { defaults: { model: "mock-provider/primary" }, entries: { main: {} } } },
-      registerRun: vi.fn(),
-      countActiveRuns: () => 0,
+      config: { agents: { defaults: primary, entries: { main: {} } } },
     });
     const result = await withGatewayToolCallerIdentity(
       { agentId: "main", sessionKey: key, operationalRunInstance: run },
@@ -201,26 +201,20 @@ describe("sessions_spawn visible work receipts", () => {
       createdAt: Date.now(),
     });
     const runs = new Map([[otherAgentRun.runId, otherAgentRun]]);
-    hoisted.inProcessCreationMock.mockResolvedValue({
-      key: "agent:main:dashboard:quota-child",
-      sessionId: "quota-child",
-      runStarted: true,
-      runId: "quota-child-run",
-    });
-    const tool = createSessionsSpawnTool({
+    hoisted.inProcessCreationMock.mockResolvedValue(created("quota-child"));
+    const tool = makeTool({
       agentSessionKey: "global",
       requesterAgentIdOverride: "main",
       config: {
         session: { scope: "global" },
         agents: {
           defaults: {
-            model: "mock-provider/primary",
+            ...primary,
             subagents: { maxChildrenPerAgent: 1 },
           },
           entries: { main: {}, other: {} },
         },
       },
-      registerRun: vi.fn(),
       countActiveRuns: (key, options) => countActiveRunsForSessionFromRuns(runs, key, options),
     });
 
@@ -236,17 +230,14 @@ describe("sessions_spawn visible work receipts", () => {
     "applies visible spawn policy for source %s",
     async (source) => {
       hoisted.inProcessCreationMock.mockResolvedValue({
-        key: "agent:main:dashboard:restricted-child",
-        sessionId: "restricted-child",
-        runStarted: true,
+        ...created("restricted-child"),
         runId: "run-visible-restricted",
       });
       const registerRun = vi.fn();
-      const tool = createSessionsSpawnTool({
-        agentSessionKey: "agent:main:main",
+      const tool = makeTool({
         config: {
           agents: {
-            defaults: { model: "mock-provider/primary" },
+            defaults: primary,
             entries: { main: { identity: { name: "Roboclaw" } } },
           },
           gateway: {
@@ -258,7 +249,6 @@ describe("sessions_spawn visible work receipts", () => {
         inheritedToolAllowlist: ["read", "sessions_spawn"],
         inheritedToolDenylist: ["exec"],
         registerRun,
-        countActiveRuns: () => 0,
       });
 
       const result = await tool.execute("visible-restricted", {

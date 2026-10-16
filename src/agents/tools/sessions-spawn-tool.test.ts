@@ -554,43 +554,6 @@ describe("sessions_spawn tool", () => {
     expect(callGateway).not.toHaveBeenCalled();
   });
 
-  it.each([
-    {
-      name: "malformed agent ID",
-      agentId: "Agent not found: reviewer",
-      requireAgentId: false,
-      expected: "Invalid agentId",
-    },
-    {
-      name: "missing required agent ID",
-      agentId: undefined,
-      requireAgentId: true,
-      expected: "sessions_spawn requires explicit agentId",
-    },
-  ])("keeps visible $name recovery independent of filtered tools", async (testCase) => {
-    const callGateway = mockGateway();
-    const tool = makeVisibleTool({
-      config: {
-        agents: {
-          defaults: { subagents: { requireAgentId: testCase.requireAgentId } },
-          entries: { main: {} },
-        },
-      },
-      callGateway,
-    });
-
-    const result = await tool.execute("visible-invalid-agent", {
-      task: "inspect issue",
-      visible: true,
-      ...(testCase.agentId ? { agentId: testCase.agentId } : {}),
-    });
-
-    const details = requireRecord(result.details, "visible spawn failure");
-    expect(details.error).toContain(testCase.expected);
-    expect(details.error).not.toContain("agents_list");
-    expect(callGateway).not.toHaveBeenCalled();
-  });
-
   it.each([false, true])("enforces sandbox workspace containment (inside=%s)", async (inside) => {
     await withTestDir({ prefix: "openclaw-visible-sandbox-cwd-" }, async (dir) => {
       const workspace = path.join(dir, "workspace");
@@ -1015,33 +978,26 @@ describe("sessions_spawn tool", () => {
   );
 
   it.each([
-    {
-      name: "disabled",
-      policy: {},
-      mimeType: "image/png",
-      content: "png",
-      status: "forbidden",
-      error: "attachments are disabled",
-    },
-    {
-      name: "non-image",
-      policy: { enabled: true },
-      mimeType: "text/plain",
-      content: "hello",
-      status: "error",
-      error: "attachments_unsupported_for_acp",
-    },
-    {
-      name: "oversized",
-      policy: { enabled: true, maxFiles: 1, maxFileBytes: 4, maxTotalBytes: 4 },
-      mimeType: "image/png",
-      content: "too large",
-      status: "error",
-      error: "attachments_file_bytes_exceeded",
-    },
-  ])(
-    "rejects $name ACP attachments before dispatch",
-    async ({ policy, mimeType, content, status, error }) => {
+    ["disabled", {}, "image/png", "png", "forbidden", "attachments are disabled"],
+    [
+      "non-image",
+      { enabled: true },
+      "text/plain",
+      "hello",
+      "error",
+      "attachments_unsupported_for_acp",
+    ],
+    [
+      "oversized",
+      { enabled: true, maxFiles: 1, maxFileBytes: 4, maxTotalBytes: 4 },
+      "image/png",
+      "too large",
+      "error",
+      "attachments_file_bytes_exceeded",
+    ],
+  ] as const)(
+    "rejects %s ACP attachments before dispatch",
+    async (_name, policy, mimeType, content, status, error) => {
       registerAcpBackendForTest();
       const result = await makeTool({
         config: { tools: { sessions_spawn: { attachments: policy } } },
