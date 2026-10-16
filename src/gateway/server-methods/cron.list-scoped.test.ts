@@ -25,6 +25,34 @@ import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
 afterEach(() => vi.restoreAllMocks());
 
+function expectReply(respond: ReturnType<typeof vi.fn>, payload: unknown) {
+  expect(respond).toHaveBeenCalledExactlyOnceWith(true, payload, undefined);
+}
+function expectError(respond: ReturnType<typeof vi.fn>, error: unknown) {
+  expect(respond).toHaveBeenCalledExactlyOnceWith(false, undefined, error);
+}
+
+async function callCron(
+  context: GatewayRequestContext,
+  method: string,
+  params: Record<string, unknown>,
+  client: GatewayClient | null = null,
+) {
+  const respond = vi.fn();
+  await expectDefined(
+    cronHandlers[method],
+    method,
+  )({
+    req: { type: "req", id: method, method },
+    params,
+    context,
+    client,
+    respond,
+    isWebchatConnect: () => false,
+  });
+  return respond;
+}
+
 function createJobs(count: number): CronJob[] {
   return Array.from({ length: count }, (_, index) =>
     createCronJob({
@@ -100,13 +128,10 @@ async function listScoped(
   sessionKey?: string,
   client: GatewayClient | null = createCronCallerClient("ops"),
 ) {
-  const respond = vi.fn();
-  await expectDefined(
-    cronHandlers["cron.list"],
-    "cron.list handler",
-  )({
-    req: { type: "req", id: "cron-list-scoped", method: "cron.list" },
-    params: {
+  const respond = await callCron(
+    context,
+    "cron.list",
+    {
       includeDisabled: true,
       includeDeliveryPreviews: false,
       ...(sessionKey ? { sessionKey, sessionAgentId: "ops" } : {}),
@@ -114,12 +139,9 @@ async function listScoped(
       limit: 1,
       offset,
     },
-    context,
     client,
-    respond,
-    isWebchatConnect: () => false,
-  });
-  expect(respond).toHaveBeenCalledExactlyOnceWith(true, expect.any(Object), undefined);
+  );
+  expectReply(respond, expect.any(Object));
   return respond.mock.calls[0]![1] as {
     jobs: CronJob[];
     snapshotRevision: string;
@@ -156,23 +178,13 @@ describe("cron.list scoped SQLite snapshots", () => {
             }),
           },
         );
-        const respond = vi.fn();
-        await expectDefined(
-          cronHandlers["cron.list"],
-          "cron.list handler",
-        )({
-          req: { type: "req", id: "preview-capacity", method: "cron.list" },
-          params: { includeDisabled: true, limit: 200 },
+        const respond = await callCron(
           context,
-          client: null,
-          respond,
-          isWebchatConnect: () => false,
-        });
-        expect(respond).toHaveBeenCalledExactlyOnceWith(
-          true,
-          expect.objectContaining({ jobs: expect.any(Array), total: 146 }),
-          undefined,
+          "cron.list",
+          { includeDisabled: true, limit: 200 },
+          null,
         );
+        expectReply(respond, expect.objectContaining({ jobs: expect.any(Array), total: 146 }));
         const page = respond.mock.calls[0]?.[1] as { jobs: CronJob[] };
         expect(page.jobs).toHaveLength(146);
         expect(page.jobs.map((job) => job.id).toSorted()).toEqual(
@@ -231,20 +243,14 @@ describe("cron.list scoped SQLite snapshots", () => {
             });
           }
           expect(retained()).toEqual(retainedBefore);
-          const listResponse = vi.fn();
-          await expectDefined(
-            cronHandlers["cron.list"],
-            "cron.list",
-          )({
-            req: { type: "req", id: "legacy-delivery-list", method: "cron.list" },
-            params: { includeDisabled: true, limit: 10 },
+          const listResponse = await callCron(
             context,
-            client: null,
-            respond: listResponse,
-            isWebchatConnect: () => false,
-          });
-          expect(listResponse).toHaveBeenCalledExactlyOnceWith(
-            true,
+            "cron.list",
+            { includeDisabled: true, limit: 10 },
+            null,
+          );
+          expectReply(
+            listResponse,
             expect.objectContaining({
               total: 2,
               jobs: expect.arrayContaining([
@@ -257,7 +263,6 @@ describe("cron.list scoped SQLite snapshots", () => {
               ]),
               deliveryPreviews: expect.any(Object),
             }),
-            undefined,
           );
           expect(JSON.stringify(listResponse.mock.calls[0]![1])).toContain(
             "delivery requires review",
@@ -270,62 +275,38 @@ describe("cron.list scoped SQLite snapshots", () => {
             "job-0000",
             "job-0001",
           ]);
-          const runResponse = vi.fn();
-          await expectDefined(
-            cronHandlers["cron.run"],
-            "cron.run",
-          )({
-            req: { type: "req", id: "legacy-delivery-run", method: "cron.run" },
-            params: { id: "job-0000", mode: "force" },
+          const runResponse = await callCron(
             context,
-            client: null,
-            respond: runResponse,
-            isWebchatConnect: () => false,
-          });
-          expect(runResponse).toHaveBeenCalledExactlyOnceWith(
-            false,
-            undefined,
+            "cron.run",
+            { id: "job-0000", mode: "force" },
+            null,
+          );
+          expectError(
+            runResponse,
             expect.objectContaining({ message: expect.stringContaining("openclaw doctor --fix") }),
           );
           for (const patch of [{ name: "unrelated edit" }, { state: { lastDurationMs: 99 } }]) {
-            const response = vi.fn();
-            await expectDefined(
-              cronHandlers["cron.update"],
-              "cron.update",
-            )({
-              req: { type: "req", id: "legacy-delivery-unrelated", method: "cron.update" },
-              params: { id: "job-0000", patch },
+            const response = await callCron(
               context,
-              client: null,
-              respond: response,
-              isWebchatConnect: () => false,
-            });
-            expect(response).toHaveBeenCalledExactlyOnceWith(
-              false,
-              undefined,
+              "cron.update",
+              { id: "job-0000", patch },
+              null,
+            );
+            expectError(
+              response,
               expect.objectContaining({
                 message: expect.stringContaining("delivery requires an explicit mode"),
               }),
             );
             expect(raw()).toBe(original);
           }
-          const corrected = vi.fn();
-          await expectDefined(
-            cronHandlers["cron.update"],
-            "cron.update",
-          )({
-            req: { type: "req", id: "legacy-delivery-correct", method: "cron.update" },
-            params: { id: "job-0000", patch: { delivery: { mode: "none" } } },
+          const corrected = await callCron(
             context,
-            client: null,
-            respond: corrected,
-            isWebchatConnect: () => false,
-          });
-          expect(corrected).toHaveBeenCalledExactlyOnceWith(
-            true,
-            expect.objectContaining({ id: "job-0000" }),
-            undefined,
+            "cron.update",
+            { id: "job-0000", patch: { delivery: { mode: "none" } } },
+            null,
           );
+          expectReply(corrected, expect.objectContaining({ id: "job-0000" }));
           expect(JSON.parse(String(raw()))).not.toHaveProperty("delivery");
           expect((await cron.readJob("job-0001"))?.name).toBe("healthy sibling still editable");
         },
@@ -361,24 +342,17 @@ describe("cron.list scoped SQLite snapshots", () => {
           0,
         );
         for (const method of ["cron.get", "cron.runs", "cron.update", "cron.remove"] as const) {
-          const respond = vi.fn();
-          await expectDefined(
-            cronHandlers[method],
+          const respond = await callCron(
+            context,
             method,
-          )({
-            req: { type: "req", id: method, method },
-            params: {
+            {
               id: historical.id,
               ...(method === "cron.update" ? { patch: { name: "changed" } } : {}),
             },
-            context,
             client,
+          );
+          expectError(
             respond,
-            isWebchatConnect: () => false,
-          });
-          expect(respond).toHaveBeenCalledExactlyOnceWith(
-            false,
-            undefined,
             expect.objectContaining({
               details: expect.objectContaining({ code: "CRON_JOB_NOT_FOUND" }),
             }),
@@ -398,18 +372,7 @@ describe("cron.list scoped SQLite snapshots", () => {
           if (index % 2 === 0) {
             return listScoped(context, index, undefined, null);
           }
-          const respond = vi.fn();
-          await expectDefined(
-            cronHandlers["cron.status"],
-            "cron.status",
-          )({
-            req: { type: "req", id: `status-${index}`, method: "cron.status" },
-            params: {},
-            context,
-            client: null,
-            respond,
-            isWebchatConnect: () => false,
-          });
+          const respond = await callCron(context, "cron.status", {}, null);
           expect(respond).toHaveBeenCalledWith(
             true,
             expect.objectContaining({ jobs: 300 }),

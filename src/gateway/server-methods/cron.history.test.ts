@@ -51,6 +51,47 @@ import { cronHandlers } from "./cron.js";
 import { disposeSessionReadContexts } from "./sessions-read-cache.test-support.js";
 import type { GatewayRequestHandlerOptions, RespondFn } from "./types.js";
 
+const limitedConfig = (): OpenClawConfig => ({
+  gateway: {
+    roles: {
+      default: "limited",
+      definitions: {
+        limited: { sessions: { others: "none" }, agents: "*", scopes: ["operator.read"] },
+      },
+    },
+  },
+});
+
+function recordDetail(record: CronRunHistoryWrite) {
+  const detail = expectDefined(record.detail, "record detail");
+  if (typeof detail !== "object" || Array.isArray(detail)) {
+    throw new Error("Expected detail object");
+  }
+  return detail;
+}
+
+async function callCron(
+  context: GatewayRequestHandlerOptions["context"],
+  method: string,
+  params: Record<string, unknown>,
+  options: Partial<Pick<GatewayRequestHandlerOptions, "client" | "hasCurrentClientAuthority">> = {},
+) {
+  const respond = vi.fn<RespondFn>();
+  await expectDefined(
+    cronHandlers[method],
+    method,
+  )({
+    req: { type: "req", id: method, method, params },
+    params,
+    client: null,
+    context,
+    respond,
+    isWebchatConnect: () => false,
+    ...options,
+  });
+  return { respond, payload: respond.mock.calls[0]?.[1] as CronHistoryResult | undefined };
+}
+
 async function withHistoryState(run: () => Promise<void>) {
   let registry: ReturnType<typeof captureActivePluginRegistrySnapshot> | undefined;
   try {
@@ -191,20 +232,7 @@ async function setup() {
     > = {},
     readContext = context,
   ) => {
-    const respond = vi.fn<RespondFn>();
-    await expectDefined(
-      cronHandlers["cron.history"],
-      "registered cron.history",
-    )({
-      req: { type: "req", id: "history", method: "cron.history", params },
-      params,
-      client: null,
-      context: readContext,
-      respond,
-      isWebchatConnect: () => false,
-      ...options,
-    });
-    return { respond, payload: respond.mock.calls[0]?.[1] as CronHistoryResult | undefined };
+    return callCron(readContext, "cron.history", params, options);
   };
   return {
     cron,
@@ -224,10 +252,7 @@ async function setup() {
 it("pages the exact archived Cron generation for a limited caller without main-thread SQL", async () => {
   await withCronTranscript(
     async ({ job, query, cron, storePath, profile, record, alias, oldScope }) => {
-      const detail = expectDefined(record.detail, "record detail");
-      if (typeof detail !== "object" || Array.isArray(detail)) {
-        throw new Error("Expected detail object");
-      }
+      const detail = recordDetail(record);
       const recoveryMarker = "cron-recovery-only:";
       persistHistory(
         Array.from({ length: 32 }, (_, index) => ({
@@ -263,16 +288,7 @@ it("pages the exact archived Cron generation for a limited caller without main-t
           ]),
         )
         .digest("base64url");
-      const cfg: OpenClawConfig = {
-        gateway: {
-          roles: {
-            default: "limited",
-            definitions: {
-              limited: { sessions: { others: "none" }, agents: "*", scopes: ["operator.read"] },
-            },
-          },
-        },
-      };
+      const cfg = limitedConfig();
       const context = await createHistoryReadContext({
         cron,
         cronStorePath: storePath,
@@ -362,18 +378,7 @@ it("pages the exact archived Cron generation for a limited caller without main-t
           ["cron.runs", { id: job.id }, { entries: [], total: 0 }],
           ["cron.runs", { scope: "all" }, { entries: [], total: 0 }],
         ] as const) {
-          const respond = vi.fn<RespondFn>();
-          await expectDefined(
-            cronHandlers[method],
-            method,
-          )({
-            req: { type: "req", id: method, method, params },
-            params,
-            client: options.client,
-            context,
-            respond,
-            isWebchatConnect: () => false,
-          });
+          const { respond } = await callCron(context, method, params, options);
           expect(respond.mock.calls[0]?.[0], method).toBe(true);
           expect(respond.mock.calls[0]?.[1], method).toMatchObject(expected);
         }
@@ -394,10 +399,7 @@ it("preserves shared custom-session conversation history across recorded runs", 
     await appendTranscriptMessage(oldScope, {
       message: { role: "assistant", content: "A later run in this same conversation" },
     });
-    const detail = expectDefined(record.detail, "record detail");
-    if (typeof detail !== "object" || Array.isArray(detail)) {
-      throw new Error("Expected detail object");
-    }
+    const detail = recordDetail(record);
     persistHistory([
       record,
       {
@@ -422,16 +424,7 @@ it("does not disclose hidden session keys in cron.history errors", async () => {
     await patchSessionEntryCore({ agentId: "main", sessionKey: baseKey }, () => ({
       visibility: "draft",
     }));
-    const cfg: OpenClawConfig = {
-      gateway: {
-        roles: {
-          default: "limited",
-          definitions: {
-            limited: { sessions: { others: "none" }, agents: "*", scopes: ["operator.read"] },
-          },
-        },
-      },
-    };
+    const cfg = limitedConfig();
     const context = await createHistoryReadContext({
       cron,
       cronStorePath: storePath,
@@ -477,23 +470,11 @@ it("removes runs and totals when detail hydration reveals a hidden session", asy
         createdActor: { type: "human", source: "profile", id: hiddenProfile.id },
       },
     );
-    const detail = expectDefined(record.detail, "record detail");
-    if (typeof detail !== "object" || Array.isArray(detail)) {
-      throw new Error("Expected detail object");
-    }
+    const detail = recordDetail(record);
     persistHistory([
       { ...record, sessionKey: baseKey, detail: { ...detail, sessionKey: baseKey } },
     ]);
-    const cfg: OpenClawConfig = {
-      gateway: {
-        roles: {
-          default: "limited",
-          definitions: {
-            limited: { sessions: { others: "none" }, agents: "*", scopes: ["operator.read"] },
-          },
-        },
-      },
-    };
+    const cfg = limitedConfig();
     const context = await createHistoryReadContext({
       cron,
       cronStorePath: storePath,
@@ -503,20 +484,7 @@ it("removes runs and totals when detail hydration reveals a hidden session", asy
     prepareGatewayRecipientProfile(client);
     expect(operatorSessionCap(client, cfg)).toBe("none");
     const queryRuns = async () => {
-      const params = { id: job.id };
-      const respond = vi.fn<RespondFn>();
-      await expectDefined(
-        cronHandlers["cron.runs"],
-        "registered cron.runs",
-      )({
-        req: { type: "req", id: "runs", method: "cron.runs", params },
-        params,
-        client,
-        context,
-        respond,
-        isWebchatConnect: () => false,
-      });
-      return respond.mock.calls;
+      return (await callCron(context, "cron.runs", { id: job.id }, { client })).respond.mock.calls;
     };
     expect(await queryRuns()).toMatchObject([
       [true, { entries: [{ runId: "public-old-run", sessionKey: baseKey }], total: 1 }, undefined],
@@ -544,10 +512,7 @@ it("refuses ambiguous timestamps and cursors moved to another recorded run", asy
   await withCronTranscript(async ({ job, record, query }) => {
     const first = await query({ id: job.id, runId: "public-old-run", limit: 1 });
     const cursor = expectDefined(first.payload?.nextCursor, "bound cursor");
-    const detail = expectDefined(record.detail, "record detail");
-    if (typeof detail !== "object" || Array.isArray(detail)) {
-      throw new Error("Expected detail object");
-    }
+    const detail = recordDetail(record);
     persistHistory([
       record,
       {
@@ -603,10 +568,7 @@ it.each(["sharing", "binding", "retention", "transcript owner"] as const)(
               visibility: "draft",
             }));
           } else if (change === "binding") {
-            const detail = expectDefined(record.detail, "record detail");
-            if (typeof detail !== "object" || Array.isArray(detail)) {
-              throw new Error("Expected detail object");
-            }
+            const detail = recordDetail(record);
             persistHistory([{ ...record, detail: { ...detail, sessionId: latest.sessionId } }]);
           } else if (change === "retention") {
             storageChanged =

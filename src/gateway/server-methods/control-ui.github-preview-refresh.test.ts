@@ -48,6 +48,10 @@ describe("GitHub preview background refresh authority", () => {
           });
           const originalToken = "synthetic-preview-refresh-original";
           const replacementToken = "synthetic-preview-refresh-replacement";
+          const credentials = new Map([
+            [`Bearer ${originalToken}`, "original"],
+            [`Bearer ${replacementToken}`, "replacement"],
+          ]);
           await githubIdentity.writeManagedGitHubProfileFiles(profileDir, {
             login: "preview-fixture",
             token: originalToken,
@@ -89,12 +93,7 @@ describe("GitHub preview background refresh authority", () => {
             vi.fn<typeof fetch>(async (input, init) => {
               const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
               const authorization = new Headers(init?.headers).get("Authorization");
-              const credential =
-                authorization === `Bearer ${originalToken}`
-                  ? "original"
-                  : authorization === `Bearer ${replacementToken}`
-                    ? "replacement"
-                    : "unexpected";
+              const credential = credentials.get(authorization ?? "") ?? "unexpected";
               trace.push({ path, credential });
               if (retired && credential === "original") {
                 forbiddenDispatch.resolve();
@@ -197,10 +196,6 @@ describe("GitHub preview background refresh authority", () => {
                 { path: repository, credential: "original" },
               ]);
             }
-            console.log(
-              "github-preview-refresh-authority",
-              JSON.stringify({ change, requestsAfterChange: trace.slice(afterChange) }),
-            );
           } finally {
             release.resolve();
             clearGitHubCredentialVerificationCache();

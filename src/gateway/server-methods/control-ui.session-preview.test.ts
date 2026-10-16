@@ -29,6 +29,31 @@ import type { RespondFn } from "./types.js";
 const requestOptions = createControlUiRequestOptions(() => ({
   agents: { entries: { main: {} } },
 }));
+const previewHandler = (fresh = false) =>
+  expectDefined(
+    (fresh ? createControlUiHandlers() : controlUiHandlers)["controlUi.sessionPreview"],
+    "session preview handler",
+  );
+
+function waitForTranscript(key: string, titles: Map<string, string>) {
+  const completions = new Map([...titles.keys()].map((agentId) => [agentId, createDeferred()]));
+  const publish = sessionRows.publishTranscriptFields;
+  const publication = vi
+    .spyOn(sessionRows, "publishTranscriptFields")
+    .mockImplementation((row, ...args) => {
+      const changed = publish(row, ...args);
+      if (
+        row.key === key &&
+        row.lastMessagePreview &&
+        (!titles.get(row.agentId) || row.lastMessagePreview === titles.get(row.agentId))
+      ) {
+        completions.get(row.agentId)?.resolve();
+      }
+      return changed;
+    });
+  onTestFinished(() => publication.mockRestore());
+  return Promise.all([...completions.values()].map((completion) => completion.promise));
+}
 
 async function createPreviewContext(cfg: OpenClawConfig = {}, getRuntimeConfig = () => cfg) {
   const projection = await createSessionRowProjection({ cfg });
@@ -96,7 +121,6 @@ describe("controlUi.sessionPreview", () => {
           const first = await projection.withSelectionPreparation(async () => {
             holdOwnership = true;
             replaceSessionEntrySync(scope, { ...entry, label: "Renamed preview", updatedAt: 2 });
-            const started = performance.now();
             pending = Promise.resolve(
               controlUiHandlers["controlUi.sessionPreview"]!(
                 requestOptions({ sessionKey: scope.sessionKey }, respond, { context }),
@@ -106,11 +130,6 @@ describe("controlUi.sessionPreview", () => {
               pending.then(() => "response" as const),
               entered.promise.then(() => "native ownership" as const),
             ]);
-            console.info("session-preview-readiness", {
-              state,
-              first: winner,
-              elapsedMs: performance.now() - started,
-            });
             release.resolve();
             await pending;
             expect(respond).toHaveBeenCalledWith(
@@ -171,10 +190,7 @@ describe("controlUi.sessionPreview", () => {
         }
         return {};
       });
-      await expectDefined(
-        controlUiHandlers["controlUi.sessionPreview"],
-        "registered preview",
-      )(
+      await previewHandler()(
         requestOptions({ sessionKey }, respond, {
           client: { ...identifiedClient("reader"), connId: "preview-reader" },
           context,
@@ -213,10 +229,7 @@ describe("controlUi.sessionPreview", () => {
         .spyOn(subagentState, "prepareSubagentSessionListReadCache")
         .mockReturnValueOnce(prepared.promise);
       const respond = vi.fn<RespondFn>();
-      const pending = expectDefined(
-        createControlUiHandlers()["controlUi.sessionPreview"],
-        "session preview handler",
-      )(
+      const pending = previewHandler(true)(
         requestOptions({ sessionKey }, respond, {
           client: { ...identifiedClient("reader"), connId: "preview-reader" },
           context,
@@ -258,27 +271,13 @@ describe("controlUi.sessionPreview", () => {
           messages: [{ message: { role: "user", content: `Title from ${agentId}` }, now: 42 }],
         });
       }
-      const handler = expectDefined(
-        createControlUiHandlers()["controlUi.sessionPreview"],
-        "session preview handler",
+      const handler = previewHandler(true);
+      const published = waitForTranscript(
+        "global",
+        new Map(["main", "research"].map((agentId) => [agentId, `Title from ${agentId}`])),
       );
-      const publications = new Map([
-        ["main", createDeferred()],
-        ["research", createDeferred()],
-      ]);
-      const publishTranscriptFields = sessionRows.publishTranscriptFields;
-      const publication = vi
-        .spyOn(sessionRows, "publishTranscriptFields")
-        .mockImplementation((row, ...args) => {
-          const changed = publishTranscriptFields(row, ...args);
-          if (row.key === "global" && row.lastMessagePreview === `Title from ${row.agentId}`) {
-            publications.get(row.agentId)?.resolve();
-          }
-          return changed;
-        });
-      onTestFinished(() => publication.mockRestore());
       const context = await createPreviewContext(cfg);
-      await Promise.all([...publications.values()].map((completion) => completion.promise));
+      await published;
       const statements = observeHostDataSql();
       onTestFinished(() => statements.restore());
       for (const agentId of ["main", "research"]) {
@@ -338,25 +337,13 @@ describe("controlUi.sessionPreview", () => {
           },
         ],
       });
-      const published = createDeferred();
-      const publishTranscriptFields = sessionRows.publishTranscriptFields;
-      const publication = vi
-        .spyOn(sessionRows, "publishTranscriptFields")
-        .mockImplementation((row, ...args) => {
-          const changed = publishTranscriptFields(row, ...args);
-          if (row.key === scope.sessionKey && row.lastMessagePreview) {
-            published.resolve();
-          }
-          return changed;
-        });
-      onTestFinished(() => publication.mockRestore());
+      const published = waitForTranscript(scope.sessionKey, new Map([["main", ""]]));
       const context = await createPreviewContext();
-      await published.promise;
+      await published;
       const respond = vi.fn<RespondFn>();
-      await expectDefined(
-        controlUiHandlers["controlUi.sessionPreview"],
-        "session preview handler",
-      )(requestOptions({ sessionKey: " agent:main:research " }, respond, { context }));
+      await previewHandler()(
+        requestOptions({ sessionKey: " agent:main:research " }, respond, { context }),
+      );
 
       const payload = respond.mock.calls[0]?.[1] as ControlUiSessionPreview | undefined;
       expect(respond.mock.calls[0]?.[0]).toBe(true);
@@ -383,10 +370,9 @@ describe("controlUi.sessionPreview", () => {
   it("rejects malformed preview params", async () => {
     const respond = vi.fn<RespondFn>();
 
-    await expectDefined(
-      controlUiHandlers["controlUi.sessionPreview"],
-      'handlers["controlUi.sessionPreview"] test invariant',
-    )(requestOptions({ sessionKey: "agent:main:research", extra: true }, respond));
+    await previewHandler()(
+      requestOptions({ sessionKey: "agent:main:research", extra: true }, respond),
+    );
 
     expect(respond).toHaveBeenCalledWith(false, undefined, {
       code: "INVALID_REQUEST",

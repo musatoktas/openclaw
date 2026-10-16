@@ -24,6 +24,55 @@ const requestOptions = createControlUiRequestOptions(() => ({
   gateway: { controlUi: { github: { token: "preview-service-token" } } },
 }));
 
+function previewHandler(load?: Parameters<typeof createControlUiHandlers>[0]) {
+  return expectDefined(createControlUiHandlers(load)["controlUi.githubPreview"], "preview handler");
+}
+
+function checksHandler(load: Parameters<typeof createControlUiHandlers>[1]) {
+  return expectDefined(
+    createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
+    "CI checks handler",
+  );
+}
+
+function expectReply(respond: RespondFn, payload: unknown) {
+  expect(respond).toHaveBeenCalledWith(true, payload, undefined);
+}
+
+function expectError(respond: RespondFn, error: unknown) {
+  expect(respond).toHaveBeenCalledWith(false, undefined, error);
+}
+
+function expectUnavailable(respond: RespondFn) {
+  expectError(respond, expect.objectContaining({ code: "UNAVAILABLE" }));
+}
+
+function issueFields(title: string, extra: Record<string, unknown> = {}) {
+  return {
+    created_at: "2026-09-01T08:00:00Z",
+    updated_at: "2026-09-01T09:00:00Z",
+    state: "open",
+    title,
+    user: { login: "octocat" },
+    ...extra,
+  };
+}
+
+function mockGitHubFetch(issue: Record<string, unknown>, repository: Record<string, unknown>) {
+  const fetchMock = vi.fn<typeof fetch>(
+    async (input) =>
+      new Response(
+        JSON.stringify(
+          (input instanceof Request ? input.url : input.toString()).includes("/issues/")
+            ? issue
+            : repository,
+        ),
+      ),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 describe("controlUi.githubPreview", () => {
   afterEach(() => {
     clearRuntimeConfigSnapshot();
@@ -43,10 +92,7 @@ describe("controlUi.githubPreview", () => {
       }
       const loadPreview = vi.fn();
       const respond = vi.fn<RespondFn>();
-      const handler = expectDefined(
-        createControlUiHandlers(loadPreview)["controlUi.githubPreview"],
-        "preview handler",
-      );
+      const handler = previewHandler(loadPreview);
       const pending = handler({
         ...requestOptions({ kind: "issue", number: 1, owner: "octocat", repo: "repo" }, respond, {
           client: state === "copied" ? { ...client } : client,
@@ -64,7 +110,7 @@ describe("controlUi.githubPreview", () => {
       }
       await pending;
       expect(loadPreview).not.toHaveBeenCalled();
-      expect(respond).toHaveBeenCalledWith(false, undefined, {
+      expectError(respond, {
         code: "UNAVAILABLE",
         message: "GitHub request is no longer active. Try again.",
         retryable: false,
@@ -129,15 +175,7 @@ describe("controlUi.githubPreview", () => {
     }
     const title =
       mode === "managed" ? "Use the selected GitHub identity" : "Public metadata without a login";
-    const anonymousResponse = new Response(
-      JSON.stringify({
-        created_at: "2026-09-01T08:00:00Z",
-        updated_at: "2026-09-01T09:00:00Z",
-        state: "open",
-        title,
-        user: { login: "octocat" },
-      }),
-    );
+    const anonymousResponse = new Response(JSON.stringify(issueFields(title)));
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (mode === "anonymous") {
         return anonymousResponse;
@@ -154,18 +192,15 @@ describe("controlUi.githubPreview", () => {
       return new Response(
         JSON.stringify(
           issue
-            ? {
+            ? issueFields(mode === "service" ? "Authenticated reader" : title, {
                 created_at: mode === "service" ? "2026-09-20T08:00:00Z" : "2026-09-01T08:00:00Z",
                 updated_at: mode === "service" ? "2026-09-20T09:00:00Z" : "2026-09-01T09:00:00Z",
-                state: "open",
-                title: mode === "service" ? "Authenticated reader" : title,
-                user: { login: "octocat" },
                 ...(mode === "managed"
                   ? { repository_url: "https://api.github.com/repos/openclaw/openclaw" }
                   : {}),
                 body: mode === "managed" ? "Authenticated reader body" : "Reader body",
                 comments: 0,
-              }
+              })
             : { id: mode === "managed" ? 123 : 124, private: false, visibility: "public" },
         ),
       );
@@ -188,10 +223,9 @@ describe("controlUi.githubPreview", () => {
         { context: { getRuntimeConfig: () => cfg } },
       ),
     );
-    expect(respond).toHaveBeenCalledWith(
-      true,
+    expectReply(
+      respond,
       expect.objectContaining(mode === "service" ? { body: "Reader body" } : { title }),
-      undefined,
     );
     if (mode === "anonymous") {
       expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).has("Authorization")).toBe(false);
@@ -228,26 +262,14 @@ describe("controlUi.githubPreview", () => {
         },
       };
       setRuntimeConfigSnapshot(cfg);
-      const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
-        const url = input instanceof Request ? input.url : input.toString();
-        return new Response(
-          JSON.stringify(
-            url.includes("/issues/")
-              ? {
-                  created_at: "2026-09-01T08:00:00Z",
-                  updated_at: "2026-09-01T09:00:00Z",
-                  repository_url: "https://api.github.com/repos/openclaw/public-routing",
-                  state: "open",
-                  title: "Public issue",
-                  body: "Public body",
-                  comments: 0,
-                  user: { login: "octocat" },
-                }
-              : { id: 125, private: false, visibility: "public" },
-          ),
-        );
-      });
-      vi.stubGlobal("fetch", fetchMock);
+      const fetchMock = mockGitHubFetch(
+        issueFields("Public issue", {
+          repository_url: "https://api.github.com/repos/openclaw/public-routing",
+          body: "Public body",
+          comments: 0,
+        }),
+        { id: 125, private: false, visibility: "public" },
+      );
       const respond = vi.fn<RespondFn>();
       await expectDefined(
         createControlUiHandlers()[method],
@@ -259,11 +281,7 @@ describe("controlUi.githubPreview", () => {
           { context: { getRuntimeConfig: () => cfg } },
         ),
       );
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({ title: "Public issue" }),
-        undefined,
-      );
+      expectReply(respond, expect.objectContaining({ title: "Public issue" }));
       expect(fetchMock).toHaveBeenCalled();
       for (const [url, options] of fetchMock.mock.calls) {
         expect(url).toMatch(/^https:\/\/api.github.com\//);
@@ -278,28 +296,13 @@ describe("controlUi.githubPreview", () => {
       gateway: { controlUi: { github: { token: "configured-preview-token" } } },
     };
     setRuntimeConfigSnapshot(cfg);
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
-      const url = input instanceof Request ? input.url : input.toString();
-      return new Response(
-        JSON.stringify(
-          url.includes("/issues/")
-            ? {
-                title: "Cached preview",
-                state: "open",
-                created_at: "2026-09-01T08:00:00Z",
-                updated_at: "2026-09-01T09:00:00Z",
-                repository_url: "https://api.github.com/repos/openclaw/configured-degraded",
-                user: { login: "octocat" },
-              }
-            : { private: false, visibility: "public" },
-        ),
-      );
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const handler = expectDefined(
-      createControlUiHandlers()["controlUi.githubPreview"],
-      "preview handler",
+    const fetchMock = mockGitHubFetch(
+      issueFields("Cached preview", {
+        repository_url: "https://api.github.com/repos/openclaw/configured-degraded",
+      }),
+      { private: false, visibility: "public" },
     );
+    const handler = previewHandler();
     const respond = vi.fn<RespondFn>();
     const options = requestOptions(
       { kind: "issue", number: 70014, owner: "openclaw", repo: "configured-degraded" },
@@ -307,11 +310,7 @@ describe("controlUi.githubPreview", () => {
       { context: { getRuntimeConfig: () => cfg } },
     );
     await handler(options);
-    expect(respond).toHaveBeenCalledWith(
-      true,
-      expect.objectContaining({ title: "Cached preview" }),
-      undefined,
-    );
+    expectReply(respond, expect.objectContaining({ title: "Cached preview" }));
     setActiveDegradedSecretOwners([
       {
         ownerKind: "capability",
@@ -325,7 +324,7 @@ describe("controlUi.githubPreview", () => {
     ]);
     respond.mockClear();
     await handler(options);
-    expect(respond).toHaveBeenCalledWith(false, undefined, {
+    expectError(respond, {
       code: "UNAVAILABLE",
       message:
         "The configured Control UI GitHub credential is unavailable. Check gateway.controlUi.github.token and its host binding, then retry.",
@@ -356,13 +355,9 @@ describe("controlUi.githubPreview", () => {
         started.resolve();
         return pending.promise;
       });
-      const handlers = createControlUiHandlers(loadPreview);
       const respond = vi.fn<RespondFn>();
 
-      const request = expectDefined(
-        handlers["controlUi.githubPreview"],
-        'handlers["controlUi.githubPreview"] test invariant',
-      )(
+      const request = previewHandler(loadPreview)(
         requestOptions(
           { kind: "issue", number: 99815, owner: "openclaw", repo: "openclaw" },
           respond,
@@ -379,7 +374,7 @@ describe("controlUi.githubPreview", () => {
       pending.resolve(preview);
       await request;
 
-      expect(respond).toHaveBeenCalledWith(false, undefined, {
+      expectError(respond, {
         code: "UNAVAILABLE",
         message: new githubIdentity.GitHubIdentityError("changed").message,
         retryable: false,
@@ -406,10 +401,9 @@ describe("controlUi.githubPreview", () => {
       loadPreview.mockResolvedValue(preview);
     }
     const respond = vi.fn<RespondFn>();
-    await expectDefined(
-      createControlUiHandlers(loadPreview)["controlUi.githubPreview"],
-      "preview handler",
-    )(requestOptions({ ...target, ...(refresh !== undefined ? { refresh } : {}) }, respond));
+    await previewHandler(loadPreview)(
+      requestOptions({ ...target, ...(refresh !== undefined ? { refresh } : {}) }, respond),
+    );
     if (valid) {
       expect(loadPreview).toHaveBeenCalledExactlyOnceWith(
         target,
@@ -418,10 +412,10 @@ describe("controlUi.githubPreview", () => {
         true,
         undefined,
       );
-      expect(respond).toHaveBeenCalledWith(true, preview, undefined);
+      expectReply(respond, preview);
     } else {
       expect(loadPreview).not.toHaveBeenCalled();
-      expect(respond).toHaveBeenCalledWith(false, undefined, {
+      expectError(respond, {
         code: "INVALID_REQUEST",
         message: "invalid controlUi.githubPreview params",
       });
@@ -475,13 +469,9 @@ describe("controlUi.githubPreview", () => {
       } else {
         loadPreview.mockRejectedValue(error);
       }
-      const handlers = createControlUiHandlers(loadPreview);
       const respond = vi.fn<RespondFn>();
 
-      await expectDefined(
-        handlers["controlUi.githubPreview"],
-        'handlers["controlUi.githubPreview"] test invariant',
-      )(
+      await previewHandler(loadPreview)(
         requestOptions(
           {
             kind: managed ? "issue" : "pull",
@@ -507,7 +497,7 @@ describe("controlUi.githubPreview", () => {
       if (managed) {
         expect(loadPreview).not.toHaveBeenCalled();
       }
-      expect(respond).toHaveBeenCalledWith(false, undefined, {
+      expectError(respond, {
         code: "UNAVAILABLE",
         message,
         retryable,
@@ -556,7 +546,7 @@ describe("controlUi.sessionPullRequests.subscribe", () => {
         undefined,
         expect.any(Function),
       );
-      expect(respond).toHaveBeenCalledWith(true, { subscribed }, undefined);
+      expectReply(respond, { subscribed });
       finishHydration();
       await request;
     },
@@ -578,7 +568,7 @@ describe("controlUi.sessionPullRequests.subscribe", () => {
     );
 
     expect(replace).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(false, undefined, {
+    expectError(respond, {
       code: "INVALID_REQUEST",
       message: "invalid controlUi.sessionPullRequests.subscribe params",
     });
@@ -611,18 +601,11 @@ describe("controlUi.sessionPullRequests.checks", () => {
     { ...params, sessionKey: "" },
   ])("rejects invalid or client-URL parameters before loading: %j", async (input) => {
     const load = vi.fn().mockResolvedValue(result);
-    const handler = expectDefined(
-      createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-      "CI checks handler",
-    );
+    const handler = checksHandler(load);
     const respond = vi.fn<RespondFn>();
     await handler(requestOptions(input, respond));
     expect(load).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: "INVALID_REQUEST" }),
-    );
+    expectError(respond, expect.objectContaining({ code: "INVALID_REQUEST" }));
   });
 
   it.each(["missing session", "unavailable projection"])(
@@ -642,21 +625,14 @@ describe("controlUi.sessionPullRequests.checks", () => {
           );
         }
         const load = vi.fn().mockResolvedValue(result);
-        const handler = expectDefined(
-          createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-          "CI checks handler",
-        );
+        const handler = checksHandler(load);
         const respond = vi.fn<RespondFn>();
         await handler({
           ...requestOptions(params, respond),
           ...(missing === "unavailable projection" ? { client: identifiedClient("viewer") } : {}),
         });
         expect(load).not.toHaveBeenCalled();
-        expect(respond).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({ code: "UNAVAILABLE" }),
-        );
+        expectUnavailable(respond);
       });
     },
   );
@@ -680,10 +656,7 @@ describe("controlUi.sessionPullRequests.checks", () => {
         started.resolve();
         return deferred.promise;
       });
-      const handler = expectDefined(
-        createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-        "CI checks handler",
-      );
+      const handler = checksHandler(load);
       const respond = vi.fn<RespondFn>();
       const request = handler(requestOptions(params, respond));
       await started.promise;
@@ -701,9 +674,8 @@ describe("controlUi.sessionPullRequests.checks", () => {
       });
       deferred.resolve(result);
       await request;
-      expect(respond).toHaveBeenCalledWith(
-        false,
-        undefined,
+      expectError(
+        respond,
         expect.objectContaining({
           code: "UNAVAILABLE",
           message: "Session changed; reopen CI details",
@@ -734,16 +706,11 @@ describe("controlUi.sessionPullRequests.checks", () => {
           return result;
         });
         const respond = vi.fn<RespondFn>();
-        await expectDefined(
-          createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-          "CI checks handler",
-        )(requestOptions(params, respond, { context: { getRuntimeConfig: () => cfg } }));
-        expect(load).toHaveBeenCalledTimes(when === "before" ? 0 : 1);
-        expect(respond).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({ code: "UNAVAILABLE" }),
+        await checksHandler(load)(
+          requestOptions(params, respond, { context: { getRuntimeConfig: () => cfg } }),
         );
+        expect(load).toHaveBeenCalledTimes(when === "before" ? 0 : 1);
+        expectUnavailable(respond);
       });
     },
   );
@@ -763,18 +730,11 @@ describe("controlUi.sessionPullRequests.checks", () => {
           },
         );
         const load = vi.fn().mockResolvedValue(result);
-        const handler = expectDefined(
-          createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-          "CI checks handler",
-        );
+        const handler = checksHandler(load);
         const respond = vi.fn<RespondFn>();
         await handler({ ...requestOptions(params, respond), client: identifiedClient("viewer") });
         expect(load).not.toHaveBeenCalled();
-        expect(respond).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({ code: "UNAVAILABLE" }),
-        );
+        expectUnavailable(respond);
       });
     },
   );
@@ -791,10 +751,7 @@ describe("controlUi.sessionPullRequests.checks", () => {
         { sessionId: "research-ci", updatedAt: 1 },
       );
       const load = vi.fn().mockResolvedValue(result);
-      const handler = expectDefined(
-        createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-        "CI checks handler",
-      );
+      const handler = checksHandler(load);
       const respond = vi.fn<RespondFn>();
       await handler(
         requestOptions({ ...params, sessionKey: "agent:research:main" }, respond, {
@@ -805,7 +762,7 @@ describe("controlUi.sessionPullRequests.checks", () => {
         expect.objectContaining({ agentId: "research" }),
         expect.objectContaining({ sessionScope: expect.stringContaining("research-ci") }),
       );
-      expect(respond).toHaveBeenCalledWith(true, result, undefined);
+      expectReply(respond, result);
     });
   });
 });
@@ -826,11 +783,7 @@ describe("controlUi.linkPreview", () => {
     vi.stubGlobal("fetch", fetch);
     const respond = vi.fn();
     await createControlUiHandlers()["controlUi.linkPreview"]!(requestOptions(params, respond));
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: "INVALID_REQUEST" }),
-    );
+    expectError(respond, expect.objectContaining({ code: "INVALID_REQUEST" }));
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -874,7 +827,7 @@ describe("controlUi.linkPreview", () => {
         }),
       );
       await pending;
-      expect(respond).toHaveBeenCalledWith(true, {}, undefined);
+      expectReply(respond, {});
       expect(fetch).toHaveBeenCalledOnce();
     },
   );
@@ -909,11 +862,7 @@ describe("controlUi.linkPreview", () => {
               },
         ),
       );
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        enabled ? { title: "Handler preview" } : {},
-        undefined,
-      );
+      expectReply(respond, enabled ? { title: "Handler preview" } : {});
       if (enabled) {
         expect(fetch).toHaveBeenCalledTimes(2);
       } else {
