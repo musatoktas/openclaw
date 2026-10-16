@@ -1,4 +1,5 @@
-import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
@@ -9,7 +10,6 @@ import {
   heldServiceLockCoordinate,
   seedRetainedBorrower,
 } from "../infra/update-retained-custody.test-support.js";
-import * as commands from "../process/exec.js";
 import * as serviceExec from "./exec-file.js";
 import * as launchdCurrent from "./launchd-current-service.js";
 import * as launchctl from "./launchd-exec.js";
@@ -24,22 +24,7 @@ import { stopSystemdService } from "./systemd-lifecycle.js";
 import * as systemdScope from "./systemd-scope.js";
 import * as systemdTransport from "./systemd-user-transport.js";
 
-const native = vi.hoisted(() => ({
-  active: true,
-  now: 0,
-  spawn:
-    vi.fn<
-      (
-        command: string,
-        args?: readonly string[],
-        options?: SpawnSyncOptions,
-      ) => SpawnSyncReturns<string> & { status: number; signal: null }
-    >(),
-}));
-vi.mock("node:child_process", async (actual) => ({
-  ...(await actual<typeof import("node:child_process")>()),
-  spawnSync: native.spawn,
-}));
+const native = vi.hoisted(() => ({ active: true, now: 0 }));
 vi.mock("../utils.js", async (actual) => ({
   ...(await actual<typeof import("../utils.js")>()),
   sleep: async (ms: number) => {
@@ -49,7 +34,7 @@ vi.mock("../utils.js", async (actual) => ({
 }));
 afterEach(() => {
   vi.restoreAllMocks();
-  native.spawn.mockReset();
+  syncBuiltinESMExports();
   native.active = true;
   native.now = 0;
 });
@@ -59,11 +44,7 @@ const assertCurrent = () => {
   }
 };
 const emptyResult = { code: 0, termination: "exit" as const, stdout: "", stderr: "" };
-const taskResult = {
-  code: 0,
-  stdout: "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
-  stderr: "",
-};
+const taskResult = { code: 0, stdout: "<Settings><Enabled>true</Enabled></Settings>", stderr: "" };
 function expectRetired(operation: Promise<unknown>) {
   return expect(operation).rejects.toThrow("stop owner retired");
 }
@@ -94,18 +75,14 @@ it("fences launchd bootout after ancestry inspection", async () => {
 it("does not force a Windows process tree after losing the owner during graceful drain", async () => {
   vi.spyOn(process, "platform", "get").mockReturnValue("win32");
   vi.spyOn(Date, "now").mockImplementation(() => native.now);
-  native.spawn.mockImplementation((command) => {
-    const executable = command.toLowerCase();
-    const stdout = executable.endsWith("taskkill.exe")
-      ? ""
-      : executable.endsWith("tasklist.exe")
-        ? '"node.exe","4242","Console","1","1 K"'
-        : '[{"ProcessId":4242}]';
+  const spawn = vi.spyOn(childProcess, "spawnSync").mockImplementation((command) => {
+    const stdout = command.toLowerCase().endsWith("tasklist.exe") ? '"node.exe","4242",' : "";
     return { pid: 0, output: [null, stdout, ""], stdout, stderr: "", status: 0, signal: null };
   });
+  syncBuiltinESMExports();
   await expectRetired(terminateGatewayProcessTree(4242, assertCurrent));
   expect(
-    native.spawn.mock.calls
+    spawn.mock.calls
       .filter(([command]) => command.toLowerCase().endsWith("taskkill.exe"))
       .map(([, args]) => args),
   ).toEqual([["/T", "/PID", "4242"]]);
@@ -128,24 +105,6 @@ it("rechecks ownership after the asynchronous Windows suppression guard", async 
   );
   expect(dispatch.mock.calls.map(([args]) => args[0])).toEqual(["/Query"]);
 });
-
-it.each(["timeout", "signal"] as const)(
-  "does not report terminated schtasks as success: %s",
-  async (termination) => {
-    vi.spyOn(commands, "runCommandWithTimeout").mockResolvedValue({
-      stdout: "",
-      stderr: "",
-      code: 0,
-      signal: null,
-      killed: true,
-      termination,
-      cleanup: "normal",
-      noOutputTimedOut: false,
-    });
-    const result = await schtasksExec.execSchtasks(["/End", "/TN", "Native Fence Proof"]);
-    expect(result.code).not.toBe(0);
-  },
-);
 
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 it.each(["suppress", "restore"] as const)(

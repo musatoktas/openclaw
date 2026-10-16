@@ -22,6 +22,9 @@ afterEach(() => vi.restoreAllMocks());
 
 const retired = "fixture owner retired";
 const doctorAuthority = { updateOwned: false, assertRecoveryCurrent: () => {} };
+function asDoctor<T>(operation: () => Promise<T>, originalRoot?: string) {
+  return withUpdateAuthority(assertUpdateCurrent, operation, { ...doctorAuthority, originalRoot });
+}
 const owner = {
   current: true,
   assertCurrent(): void {
@@ -29,10 +32,7 @@ const owner = {
       throw new Error(retired);
     }
   },
-  run<T>(
-    operation: () => Promise<T>,
-    options?: Parameters<typeof withUpdateAuthority>[2],
-  ): Promise<T> {
+  run<T>(operation: () => Promise<T>, options?: Parameters<typeof withUpdateAuthority>[2]) {
     return withUpdateAuthority(owner.assertCurrent, operation, options);
   },
 };
@@ -43,25 +43,21 @@ beforeEach(() => {
 it("retains the live original installation through nested guards and compensation", async () => {
   await owner.run(
     () =>
-      withUpdateAuthority(
-        undefined,
-        async () => {
-          expect(readOriginalRoot()).toBe("/original-install");
-          owner.current = false;
-          expect(readOriginalRoot).toThrow(retired);
-          owner.current = true;
-          await expect(
-            recoverInstallation(
-              () => Promise.reject(new Error("installation failed")),
-              async () => {
-                expect(readOriginalRoot()).toBe("/original-install");
-                return false;
-              },
-            ),
-          ).rejects.toThrow("installation failed");
-        },
-        { ...doctorAuthority, originalRoot: "/replacement-install" },
-      ),
+      asDoctor(async () => {
+        expect(readOriginalRoot()).toBe("/original-install");
+        owner.current = false;
+        expect(readOriginalRoot).toThrow(retired);
+        owner.current = true;
+        await expect(
+          recoverInstallation(
+            () => Promise.reject(new Error("installation failed")),
+            async () => {
+              expect(readOriginalRoot()).toBe("/original-install");
+              return false;
+            },
+          ),
+        ).rejects.toThrow("installation failed");
+      }, "/replacement-install"),
     { originalRoot: "/original-install" },
   );
   expect(readOriginalRoot()).toBeUndefined();
@@ -79,13 +75,8 @@ it("retains recovery material when a native writer has not settled", async () =>
   });
   const restore = vi.fn(async () => true);
   await expect(
-    withUpdateAuthority(
-      () => {},
-      () =>
-        recoverInstallation(
-          () => execFileUtf8(process.execPath, ["-e", "process.exit(0)"]),
-          restore,
-        ),
+    owner.run(() =>
+      recoverInstallation(() => execFileUtf8(process.execPath, ["-e", "process.exit(0)"]), restore),
     ),
   ).rejects.toMatchObject({ code: "ERR_COMMAND_PROCESS_CLEANUP_UNCERTAIN" });
   expect(restore).not.toHaveBeenCalled();
@@ -97,8 +88,7 @@ it.each([
   [false, true],
   [true, true],
 ])("native subprocess retains its owner (revoked=%s, nested=%s)", async (revoked, nested) => {
-  const root = dirs.make("native-authority-");
-  const effect = path.join(root, "effect");
+  const effect = path.join(dirs.make("native-authority-"), "effect");
   const parentGroup =
     process.platform === "win32" || revoked || nested
       ? undefined
@@ -131,58 +121,36 @@ it.each([
   }
 });
 
-it("Doctor compensation retains the original updater fence", async () => {
-  const restore = vi.fn(async () => true);
-  await expect(
-    owner.run(() =>
-      withUpdateAuthority(
-        assertUpdateCurrent,
-        () =>
-          recoverInstallation(async () => {
-            expect(isUpdateOwned()).toBe(true);
-            await Promise.resolve();
-            owner.current = false;
-          }, restore),
-        doctorAuthority,
-      ),
-    ),
-  ).rejects.toMatchObject({ code: "service-authority-revoked", outcome: "recovery-pending" });
-  expect(restore).not.toHaveBeenCalled();
-});
-
-it("compensation closes with its callback and cannot grant an unmanaged fallback", async () => {
+it.each([true, false])("retains Doctor compensation custody (%s)", async (updater) => {
   const ready = createDeferred();
   let late!: Promise<void>;
+  const restore = vi.fn(async () => {
+    expect(() => assertFallbackAllowed("detached launch")).toThrow("not an update-owned");
+    late = ready.promise.then(() => assertUpdateCurrent());
+    return true;
+  });
+  const install = () =>
+    recoverInstallation(async () => {
+      expect(isUpdateOwned()).toBe(updater);
+      await Promise.resolve();
+      owner.current = false;
+    }, restore);
   await expect(
-    owner.run(
-      () =>
-        recoverInstallation(
-          async () => {
-            expect(isUpdateOwned()).toBe(false);
-            owner.current = false;
-          },
-          async () => {
-            expect(() => assertFallbackAllowed("detached launch")).toThrow("not an update-owned");
-            late = ready.promise.then(() => {
-              assertUpdateCurrent();
-            });
-            return true;
-          },
-        ),
-      doctorAuthority,
-    ),
-  ).rejects.toMatchObject({ code: "service-authority-revoked", outcome: "restored" });
-  ready.resolve();
-  await expect(late).rejects.toThrow("has closed");
+    owner.run(updater ? () => asDoctor(install) : install, updater ? undefined : doctorAuthority),
+  ).rejects.toMatchObject({
+    code: "service-authority-revoked",
+    outcome: updater ? "recovery-pending" : "restored",
+  });
+  if (updater) {
+    expect(restore).not.toHaveBeenCalled();
+  } else {
+    ready.resolve();
+    await expect(late).rejects.toThrow("has closed");
+  }
 });
 
 it("native plist publication rechecks after asynchronous preparation, without stale rollback", async () => {
-  const root = dirs.make("native-plist-authority-");
-  const env = {
-    HOME: root,
-    OPENCLAW_STATE_DIR: path.join(root, "state"),
-    OPENCLAW_LAUNCHD_LABEL: "ai.openclaw.native-test",
-  };
+  const env = { HOME: dirs.make("native-plist-authority-") };
   const plistPath = resolveLaunchAgentPlistPath(env);
   await fs.mkdir(path.dirname(plistPath), { recursive: true });
   await fs.writeFile(plistPath, "original");
@@ -193,34 +161,27 @@ it("native plist publication rechecks after asynchronous preparation, without st
   });
   await expect(
     owner.run(() =>
-      writeLaunchAgentPlist({
-        env,
-        stdout: process.stdout,
-        programArguments: [process.execPath, "gateway"],
-      }),
+      writeLaunchAgentPlist({ env, stdout: process.stdout, programArguments: [process.execPath] }),
     ),
   ).rejects.toThrow(retired);
   expect(await fs.readFile(plistPath, "utf8")).toBe("original");
 });
 
-it.each([true, false])(
-  "retained guards and async work lose authority at scope closure (update=%s)",
-  async (updateOwned) => {
-    const ready = createDeferred();
-    let late!: Promise<void>;
-    const retained = await withUpdateAuthority(
-      undefined,
-      async (assertCurrent) => {
-        await Promise.resolve();
-        assertCurrent();
-        late = ready.promise.then(() => assertFallbackAllowed("late detached launch"));
-        return assertCurrent;
-      },
-      { ...doctorAuthority, updateOwned },
-    );
-    expect(retained).toThrow("has closed");
-    ready.resolve();
-    await expect(late).rejects.toThrow("has closed");
-    expect(assertUpdateCurrent).not.toThrow();
-  },
-);
+it.each([true, false])("closes retained guards and async work (update=%s)", async (updateOwned) => {
+  const ready = createDeferred();
+  let late!: Promise<void>;
+  const retained = await withUpdateAuthority(
+    undefined,
+    async (assertCurrent) => {
+      await Promise.resolve();
+      assertCurrent();
+      late = ready.promise.then(() => assertFallbackAllowed("late detached launch"));
+      return assertCurrent;
+    },
+    { ...doctorAuthority, updateOwned },
+  );
+  expect(retained).toThrow("has closed");
+  ready.resolve();
+  await expect(late).rejects.toThrow("has closed");
+  expect(assertUpdateCurrent).not.toThrow();
+});

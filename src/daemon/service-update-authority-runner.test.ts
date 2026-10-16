@@ -1,3 +1,5 @@
+import assert from "node:assert/strict";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import {
@@ -18,18 +20,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function nativeRunner() {
-  const runner = getNativeCommand();
-  if (!runner) {
-    throw new Error("missing native fixture");
-  }
-  return runner;
-}
-function assertLive(current: boolean, message = "nested custody revoked") {
-  if (!current) {
-    throw new Error(message);
-  }
-}
+const nativeRunner = () => expectDefined(getNativeCommand(), "missing native fixture");
 
 function blockedNative() {
   const entered = createDeferred();
@@ -49,7 +40,10 @@ function blockedNative() {
       state.running = false;
     }
   };
-  return { entered, release, commands, nativeCommand, state };
+  function run<T>(operation: () => Promise<T>, assertOwner?: () => void) {
+    return withUpdateAuthority(assertOwner, operation, { nativeCommand });
+  }
+  return { entered, release, commands, state, run };
 }
 
 it("revokes a captured native runner when its service authority scope closes", async () => {
@@ -72,151 +66,127 @@ const result = {
 
 it("expires a queued deadline without invoking it or releasing its predecessor", async () => {
   vi.useFakeTimers();
-  const { entered, release, commands, nativeCommand } = blockedNative();
+  const { entered, release, commands, run } = blockedNative();
   let expired = false;
   try {
-    const scope = withUpdateAuthority(
-      () => undefined,
-      async () => {
-        const runner = nativeRunner();
-        const first = runner(["first"], {});
-        await entered.promise;
-        const queued = runner(["expired"], { timeoutMs: 20 });
-        const refusal = expect(queued).rejects.toThrow("timed out");
-        await vi.advanceTimersByTimeAsync(25);
-        await refusal;
-        expired = true;
-        expect(commands).toEqual(["first"]);
-        release.resolve();
-        await first;
-        throw new Error("fixture complete after expiry");
-      },
-      { nativeCommand },
-    );
+    const scope = run(async () => {
+      const runner = nativeRunner();
+      const first = runner(["first"], {});
+      await entered.promise;
+      const refusal = expect(runner(["expired"], { timeoutMs: 20 })).rejects.toThrow("timed out");
+      await vi.advanceTimersByTimeAsync(25);
+      await refusal;
+      expired = true;
+      expect(commands).toEqual(["first"]);
+      release.resolve();
+      await first;
+      throw new Error("fixture complete after expiry");
+    });
     await expect(scope).rejects.toThrow();
-    expect(expired).toBe(true);
-    expect(commands).toEqual(["first"]);
+    expect({ expired, commands }).toEqual({ expired: true, commands: ["first"] });
   } finally {
     release.resolve();
   }
 });
 
 it("closes unstarted submissions but joins the already running native call", async () => {
-  const { entered, release, commands, nativeCommand } = blockedNative();
+  const { entered, release, commands, run } = blockedNative();
   let done = false;
-  const work = withUpdateAuthority(
-    () => undefined,
-    async () => {
-      const runner = nativeRunner();
-      void runner(["first"], {}).catch(() => undefined);
-      await entered.promise;
-      void runner(["never"], {}).catch(() => undefined);
-      throw new Error("initiating failure");
-    },
-    { nativeCommand },
-  ).finally(() => {
+  const work = run(async () => {
+    const runner = nativeRunner();
+    void runner(["first"], {}).catch(() => undefined);
+    await entered.promise;
+    void runner(["never"], {}).catch(() => undefined);
+    throw new Error("initiating failure");
+  }).finally(() => {
     done = true;
   });
   const refused = expect(work).rejects.toThrow();
   await entered.promise;
   await Promise.resolve();
   await Promise.resolve();
-  expect(done).toBe(false);
-  expect(commands).toEqual(["first"]);
+  expect({ done, commands }).toEqual({ done: false, commands: ["first"] });
   release.resolve();
   await refused;
   expect(commands).toEqual(["first"]);
 });
 
-it.each(["direct", "nested", "revoked"] as const)(
-  "serializes native reads before checking suspended custody: %s",
-  async (scope) => {
-    const { entered, release, commands, nativeCommand, state } = blockedNative();
-    let current = true;
-    const invoke = async () => {
-      const first = execFileUtf8("first", []);
-      await entered.promise;
-      const second = execFileUtf8("second", []);
-      expect(commands).toEqual(["first"]);
-      const settled = Promise.allSettled([first, second]);
-      current = scope !== "revoked";
-      release.resolve();
-      const outcomes = await settled;
-      const expected =
-        scope === "revoked" ? { status: "rejected" } : { status: "fulfilled", value: { code: 0 } };
-      expect(outcomes).toMatchObject([expected, expected]);
-    };
-    const work = withUpdateAuthority(
-      () => assertLive(!state.running, "parent is suspended"),
-      () =>
-        scope === "direct"
-          ? invoke()
-          : withUpdateAuthority(() => assertLive(current), invoke, {
-              updateOwned: false,
-              nativeCommand: getNativeCommand(),
-            }),
-      { nativeCommand },
-    );
-    if (scope === "revoked") {
-      await expect(work).rejects.toThrow("nested custody revoked");
-    } else {
-      await work;
-    }
-    expect(commands).toEqual(scope === "revoked" ? ["first"] : ["first", "second"]);
-  },
-);
-
-it.each(["settled", "thrown", "returned"] as const)(
-  "compensates revoked nested custody only after native settlement: %s",
-  async (kind) => {
-    const commands: string[] = [];
-    let current = true;
-    const restore = vi.fn(async () => {
-      await execFileUtf8("restore", []);
-      return true;
-    });
-    const failure = new CommandProcessCleanupError();
-    const work = withUpdateAuthority(
-      () => undefined,
-      () =>
-        withUpdateAuthority(
-          () => assertLive(current),
-          () => recoverInstallation(() => execFileUtf8("publish", []), restore),
-          {
+it.each(["direct", "nested", "revoked"] as const)("serializes custody (%s)", async (scope) => {
+  const { entered, release, commands, run, state } = blockedNative();
+  let current = true;
+  const invoke = async () => {
+    const first = execFileUtf8("first", []);
+    await entered.promise;
+    const second = execFileUtf8("second", []);
+    expect(commands).toEqual(["first"]);
+    const settled = Promise.allSettled([first, second]);
+    current = scope !== "revoked";
+    release.resolve();
+    const expected =
+      scope === "revoked" ? { status: "rejected" } : { status: "fulfilled", value: { code: 0 } };
+    expect(await settled).toMatchObject([expected, expected]);
+  };
+  const work = run(
+    () =>
+      scope === "direct"
+        ? invoke()
+        : withUpdateAuthority(() => assert(current, "nested custody revoked"), invoke, {
             updateOwned: false,
-            assertRecoveryCurrent: () => undefined,
             nativeCommand: getNativeCommand(),
-          },
-        ),
-      {
-        nativeCommand: async (argv) => {
-          commands.push(argv[0]!);
-          if (argv[0] === "publish") {
-            current = false;
-            if (kind === "thrown") {
-              throw failure;
-            }
-            if (kind === "returned") {
-              return { ...result, cleanup: "uncertain" };
-            }
-          }
-          return result;
-        },
-      },
-    );
-    if (kind === "settled") {
-      await expect(work).rejects.toMatchObject({
-        code: "service-authority-revoked",
-        outcome: "restored",
-      });
-      expect(commands).toEqual(["publish", "restore"]);
-    } else {
-      await expect(work).rejects.toSatisfy(hasCommandProcessCleanupError);
-      expect(restore).not.toHaveBeenCalled();
-      expect(commands).toEqual(["publish"]);
+          }),
+    () => assert(!state.running, "parent is suspended"),
+  );
+  if (scope === "revoked") {
+    await expect(work).rejects.toThrow("nested custody revoked");
+  } else {
+    await work;
+  }
+  expect(commands).toEqual(scope === "revoked" ? ["first"] : ["first", "second"]);
+});
+
+it.each(["settled", "thrown", "returned"] as const)("guards compensation (%s)", async (kind) => {
+  const commands: string[] = [];
+  let current = true;
+  const restore = vi.fn(async () => {
+    await execFileUtf8("restore", []);
+    return true;
+  });
+  const nativeCommand: GatewayServiceNativeCommand = async ([command]) => {
+    commands.push(command!);
+    if (command !== "publish") {
+      return result;
     }
-  },
-);
+    current = false;
+    if (kind === "thrown") {
+      throw new CommandProcessCleanupError();
+    }
+    return kind === "returned" ? { ...result, cleanup: "uncertain" } : result;
+  };
+  const work = withUpdateAuthority(
+    undefined,
+    () =>
+      withUpdateAuthority(
+        () => assert(current, "nested custody revoked"),
+        () => recoverInstallation(() => execFileUtf8("publish", []), restore),
+        {
+          updateOwned: false,
+          assertRecoveryCurrent: () => undefined,
+          nativeCommand: getNativeCommand(),
+        },
+      ),
+    { nativeCommand },
+  );
+  if (kind === "settled") {
+    await expect(work).rejects.toMatchObject({
+      code: "service-authority-revoked",
+      outcome: "restored",
+    });
+  } else {
+    await expect(work).rejects.toSatisfy(hasCommandProcessCleanupError);
+    expect(restore).not.toHaveBeenCalled();
+  }
+  expect(commands).toEqual(kind === "settled" ? ["publish", "restore"] : ["publish"]);
+});
 
 it("does not spend a native inspection queue's execution allowance on live custody", async () => {
   let now = 0;
@@ -231,9 +201,7 @@ it("does not spend a native inspection queue's execution allowance on live custo
       () => {
         now += 2_000;
       },
-      async () => {
-        await execFileUtf8("busctl", [], { timeout: 100 });
-      },
+      () => execFileUtf8("busctl", [], { timeout: 100 }),
       { nativeCommand: native },
     );
     expect(budget.now()).toBe(10);

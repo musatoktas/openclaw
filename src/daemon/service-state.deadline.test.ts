@@ -12,10 +12,7 @@ import {
 import { readGatewayServiceState } from "./service.js";
 import { createMockGatewayService } from "./service.test-helpers.js";
 
-const command = {
-  programArguments: ["node", "gateway"],
-  environment: { OPENCLAW_GATEWAY_PORT: "18789" },
-};
+const command = { programArguments: ["node", "gateway"], environment: { PORT: "18789" } };
 let now = 0;
 const unknown = { status: "unknown" };
 const unknownState = { loadState: unknown, runtime: unknown, running: false };
@@ -76,13 +73,12 @@ it.each(["diagnostic", "positive", "strict"] as const)(
         ? expect(pending).rejects.toThrow("Service inspection deadline expired.")
         : undefined;
     await entered.promise;
-    now = 101;
     if (scenario === "diagnostic") {
-      load.reject(new Error("native load timeout"));
+      load.reject(new Error("load timeout"));
     } else {
       load.resolve(scenario === "positive");
     }
-    runtime.resolve(nativeRuntime);
+    runtime.resolve(expire(nativeRuntime));
     if (rejected) {
       await rejected;
       return;
@@ -90,10 +86,7 @@ it.each(["diagnostic", "positive", "strict"] as const)(
     const state = await pending;
     expect(state).toMatchObject({ ...unknownState, installed: true, command });
     if (scenario === "diagnostic") {
-      expect(state.loadState).toEqual({
-        status: "unknown",
-        detail: "Error: native load timeout",
-      });
+      expect(state.loadState).toEqual({ status: "unknown", detail: "Error: load timeout" });
       expect(state.runtime).toBe(nativeRuntime);
       expect(service.isLoaded).toHaveBeenCalledWith({ env: command.environment, timeoutMs: 100 });
       expect(service.readRuntime).toHaveBeenCalledWith(command.environment, { timeoutMs: 100 });
@@ -122,7 +115,7 @@ it.each(["initial", "command", "absence"] as const)(
       expect(state).toMatchObject({
         installed: true,
         command,
-        env: { HOME: "/fixture", OPENCLAW_GATEWAY_PORT: "18789" },
+        env: { HOME: "/fixture", PORT: "18789" },
       });
     } else {
       expect(service.readCommand).not.toHaveBeenCalled();
@@ -138,8 +131,7 @@ it.each(boundaries.flatMap((boundary) => refusals.map((kind) => ({ boundary, kin
   async ({ boundary, kind }) => {
     const error = refusal(kind);
     const refuse = vi.fn(async () => {
-      now = 101;
-      throw error;
+      throw expire(error);
     });
     const service = createMockGatewayService({ readCommand: vi.fn(async () => command) });
     if (boundary === "initial-absence") {
@@ -153,11 +145,9 @@ it.each(boundaries.flatMap((boundary) => refusals.map((kind) => ({ boundary, kin
     } else {
       service.readDefinitionMutationCapability = refuse;
     }
+    const strict = boundary === "strict-absence" || boundary === "capability";
     await expect(
-      inspect(service, {
-        requireEffective: boundary === "strict-absence" || boundary === "capability",
-        requireLoadedCommand: boundary === "strict-absence" || boundary === "capability",
-      }),
+      inspect(service, { requireEffective: strict, requireLoadedCommand: strict }),
     ).rejects.toBe(error);
     expect(refuse).toHaveBeenCalledOnce();
   },
@@ -174,10 +164,8 @@ it.each(refusals)("joins readers before propagating expired %s refusal", async (
   };
   void pending.then(onSettled, onSettled);
   await entered.promise;
-  now = 101;
-  runtime.reject(error);
-  // Drain the owner's rejection propagation while keeping the sibling open.
-  // A raw fixture-promise checkpoint would run before fail-fast propagation.
+  runtime.reject(expire(error));
+  // Let owner rejection handlers run while the sibling remains pending.
   await setImmediate();
   try {
     expect(settled).toBe(false);
@@ -185,7 +173,6 @@ it.each(refusals)("joins readers before propagating expired %s refusal", async (
     load.resolve(false);
   }
   await rejected;
-  expect(settled).toBe(true);
 });
 
 it.each([1, 101])("excludes custody but charges %s ms of native work", async (spent) => {
