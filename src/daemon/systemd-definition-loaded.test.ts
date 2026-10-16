@@ -1,4 +1,3 @@
-// Exercise the real definition inspector with files and native query responses.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -54,7 +53,6 @@ async function definitionFixture(legacy = false) {
           ? buildSystemdUnitPropertyOutput({ fragmentPath: unitPath, loadState: state.loadState })
           : buildSystemdManagerPropertyOutput({
               programArguments: ["/usr/bin/node", "gateway"],
-              environment: [],
             }),
   }));
   return { env, unitName, unitPath, state };

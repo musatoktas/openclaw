@@ -64,29 +64,30 @@ const taskResult = {
   stdout: "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
   stderr: "",
 };
+function expectRetired(operation: Promise<unknown>) {
+  return expect(operation).rejects.toThrow("stop owner retired");
+}
+function retire<T>(value: T) {
+  native.active = false;
+  return value;
+}
+const stopArgs = () => ({ env: {}, stdout: new PassThrough(), assertCurrent });
 
-it("rechecks the original owner after systemd routing reads and before dispatch", async () => {
-  vi.spyOn(systemdScope, "findInstalledSystemdGatewayScope").mockImplementation(async () => {
-    native.active = false;
-    return { scope: "user", unitName: "openclaw-gateway.service", unitPath: "/unused/service" };
-  });
+it("fences systemd stop after routing", async () => {
+  vi.spyOn(systemdScope, "findInstalledSystemdGatewayScope").mockImplementation(async () =>
+    retire({ scope: "user" as const, unitName: "test.service", unitPath: "/unit" }),
+  );
   vi.spyOn(systemdTransport, "resolveSystemdUserTransport").mockResolvedValue(undefined);
   const dispatch = vi.spyOn(serviceExec, "execFileUtf8").mockResolvedValue(emptyResult);
-  await expect(
-    stopSystemdService({ env: {}, stdout: new PassThrough(), assertCurrent }),
-  ).rejects.toThrow("stop owner retired");
+  await expectRetired(stopSystemdService(stopArgs()));
   expect(dispatch).not.toHaveBeenCalled();
 });
-
-it("rechecks the original owner after launchd ancestry reads and before bootout", async () => {
-  vi.spyOn(launchdCurrent, "isCurrentProcessInsideLaunchdService").mockImplementation(async () => {
-    native.active = false;
-    return false;
-  });
+it("fences launchd bootout after ancestry inspection", async () => {
+  vi.spyOn(launchdCurrent, "isCurrentProcessInsideLaunchdService").mockImplementation(async () =>
+    retire(false),
+  );
   const dispatch = vi.spyOn(launchctl, "execLaunchctl").mockResolvedValue(emptyResult);
-  await expect(
-    stopLaunchAgent({ env: {}, stdout: new PassThrough(), assertCurrent }),
-  ).rejects.toThrow("stop owner retired");
+  await expectRetired(stopLaunchAgent(stopArgs()));
   expect(dispatch).not.toHaveBeenCalled();
 });
 
@@ -102,9 +103,7 @@ it("does not force a Windows process tree after losing the owner during graceful
         : '[{"ProcessId":4242}]';
     return { pid: 0, output: [null, stdout, ""], stdout, stderr: "", status: 0, signal: null };
   });
-  await expect(terminateGatewayProcessTree(4242, assertCurrent)).rejects.toThrow(
-    "stop owner retired",
-  );
+  await expectRetired(terminateGatewayProcessTree(4242, assertCurrent));
   expect(
     native.spawn.mock.calls
       .filter(([command]) => command.toLowerCase().endsWith("taskkill.exe"))
@@ -114,21 +113,19 @@ it("does not force a Windows process tree after losing the owner during graceful
 
 it("rechecks ownership after the asynchronous Windows suppression guard", async () => {
   const dispatch = vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue(taskResult);
-  await expect(
+  await expectRetired(
     suspendScheduledTaskAutoStartForUpdate(
       { HOME: "/unused", OPENCLAW_WINDOWS_TASK_NAME: "Native Fence Proof" },
       {
         restoreOnFailure: false,
         beforeMutation: async () => {
           assertCurrent();
-          queueMicrotask(() => {
-            native.active = false;
-          });
+          queueMicrotask(() => retire(false));
         },
         assertCurrent,
       },
     ),
-  ).rejects.toThrow("stop owner retired");
+  );
   expect(dispatch.mock.calls.map(([args]) => args[0])).toEqual(["/Query"]);
 });
 

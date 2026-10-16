@@ -1,70 +1,70 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import * as processExec from "../process/exec.js";
 import { execFileUtf8 } from "./exec-file.js";
 import { resolveLaunchAgentPlistPath, writeLaunchAgentPlist } from "./launchd-service-files.js";
 import {
-  assertGatewayServiceFallbackAllowed,
-  assertGatewayServiceUpdateCurrent,
-  isUpdateOwnedGatewayServiceCommand,
-  readGatewayServiceUpdateOriginalRoot,
-  withGatewayServiceInstallationRecovery,
-  withGatewayServiceUpdateAuthority,
+  assertGatewayServiceFallbackAllowed as assertFallbackAllowed,
+  assertGatewayServiceUpdateCurrent as assertUpdateCurrent,
+  isUpdateOwnedGatewayServiceCommand as isUpdateOwned,
+  readGatewayServiceUpdateOriginalRoot as readOriginalRoot,
+  withGatewayServiceInstallationRecovery as recoverInstallation,
+  withGatewayServiceUpdateAuthority as withUpdateAuthority,
 } from "./service-update-authority.js";
 
 vi.mock("./launchd-system.js", () => ({ assertNoSystemLaunchDaemonOwnership: async () => {} }));
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
 
-function authority(message: string) {
-  const owner = {
-    current: true,
-    assertCurrent() {
-      if (!owner.current) {
-        throw new Error(message);
-      }
-    },
-  };
-  return owner;
-}
+const retired = "fixture owner retired";
+const doctorAuthority = { updateOwned: false, assertRecoveryCurrent: () => {} };
+const owner = {
+  current: true,
+  assertCurrent(): void {
+    if (!owner.current) {
+      throw new Error(retired);
+    }
+  },
+  run<T>(
+    operation: () => Promise<T>,
+    options?: Parameters<typeof withUpdateAuthority>[2],
+  ): Promise<T> {
+    return withUpdateAuthority(owner.assertCurrent, operation, options);
+  },
+};
+beforeEach(() => {
+  owner.current = true;
+});
 
 it("retains the live original installation through nested guards and compensation", async () => {
-  const owner = authority("original updater retired");
-  await withGatewayServiceUpdateAuthority(
-    owner.assertCurrent,
+  await owner.run(
     () =>
-      withGatewayServiceUpdateAuthority(
+      withUpdateAuthority(
         undefined,
         async () => {
-          expect(readGatewayServiceUpdateOriginalRoot()).toBe("/original-install");
+          expect(readOriginalRoot()).toBe("/original-install");
           owner.current = false;
-          expect(readGatewayServiceUpdateOriginalRoot).toThrow("original updater retired");
+          expect(readOriginalRoot).toThrow(retired);
           owner.current = true;
           await expect(
-            withGatewayServiceInstallationRecovery(
+            recoverInstallation(
+              () => Promise.reject(new Error("installation failed")),
               async () => {
-                throw new Error("installation failed");
-              },
-              async () => {
-                expect(readGatewayServiceUpdateOriginalRoot()).toBe("/original-install");
+                expect(readOriginalRoot()).toBe("/original-install");
                 return false;
               },
             ),
           ).rejects.toThrow("installation failed");
         },
-        {
-          originalRoot: "/replacement-install",
-          updateOwned: false,
-          assertRecoveryCurrent: () => {},
-        },
+        { ...doctorAuthority, originalRoot: "/replacement-install" },
       ),
     { originalRoot: "/original-install" },
   );
-  expect(readGatewayServiceUpdateOriginalRoot()).toBeUndefined();
+  expect(readOriginalRoot()).toBeUndefined();
 });
 
 it("retains recovery material when a native writer has not settled", async () => {
@@ -79,10 +79,10 @@ it("retains recovery material when a native writer has not settled", async () =>
   });
   const restore = vi.fn(async () => true);
   await expect(
-    withGatewayServiceUpdateAuthority(
+    withUpdateAuthority(
       () => {},
       () =>
-        withGatewayServiceInstallationRecovery(
+        recoverInstallation(
           () => execFileUtf8(process.execPath, ["-e", "process.exit(0)"]),
           restore,
         ),
@@ -92,14 +92,13 @@ it("retains recovery material when a native writer has not settled", async () =>
 });
 
 it.each([
-  { revoked: false, nested: false },
-  { revoked: true, nested: false },
-  { revoked: false, nested: true },
-  { revoked: true, nested: true },
-])("native subprocess retains its owner: %j", async ({ revoked, nested }) => {
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+])("native subprocess retains its owner (revoked=%s, nested=%s)", async (revoked, nested) => {
   const root = dirs.make("native-authority-");
   const effect = path.join(root, "effect");
-  const owner = authority("original update owner revoked");
   const parentGroup =
     process.platform === "win32" || revoked || nested
       ? undefined
@@ -107,7 +106,7 @@ it.each([
   if (parentGroup) {
     expect(parentGroup.status).toBe(0);
   }
-  const run = withGatewayServiceUpdateAuthority(owner.assertCurrent, async () => {
+  const run = owner.run(async () => {
     const invoke = async () => {
       await Promise.resolve();
       owner.current = !revoked;
@@ -121,10 +120,10 @@ it.each([
         expect(result.stdout.trim()).toBe(parentGroup.stdout.trim());
       }
     };
-    await (nested ? withGatewayServiceUpdateAuthority(() => {}, invoke) : invoke());
+    await (nested ? withUpdateAuthority(() => {}, invoke) : invoke());
   });
   if (revoked) {
-    await expect(run).rejects.toThrow("original update owner revoked");
+    await expect(run).rejects.toThrow(retired);
     await expect(fs.stat(effect)).rejects.toMatchObject({ code: "ENOENT" });
   } else {
     await run;
@@ -133,19 +132,18 @@ it.each([
 });
 
 it("Doctor compensation retains the original updater fence", async () => {
-  const owner = authority("original updater retired");
   const restore = vi.fn(async () => true);
   await expect(
-    withGatewayServiceUpdateAuthority(owner.assertCurrent, () =>
-      withGatewayServiceUpdateAuthority(
-        assertGatewayServiceUpdateCurrent,
+    owner.run(() =>
+      withUpdateAuthority(
+        assertUpdateCurrent,
         () =>
-          withGatewayServiceInstallationRecovery(async () => {
-            expect(isUpdateOwnedGatewayServiceCommand()).toBe(true);
+          recoverInstallation(async () => {
+            expect(isUpdateOwned()).toBe(true);
             await Promise.resolve();
             owner.current = false;
           }, restore),
-        { updateOwned: false, assertRecoveryCurrent: () => {} },
+        doctorAuthority,
       ),
     ),
   ).rejects.toMatchObject({ code: "service-authority-revoked", outcome: "recovery-pending" });
@@ -153,29 +151,25 @@ it("Doctor compensation retains the original updater fence", async () => {
 });
 
 it("compensation closes with its callback and cannot grant an unmanaged fallback", async () => {
-  const owner = authority("Doctor custody released");
   const ready = createDeferred();
   let late!: Promise<void>;
   await expect(
-    withGatewayServiceUpdateAuthority(
-      owner.assertCurrent,
+    owner.run(
       () =>
-        withGatewayServiceInstallationRecovery(
+        recoverInstallation(
           async () => {
-            expect(isUpdateOwnedGatewayServiceCommand()).toBe(false);
+            expect(isUpdateOwned()).toBe(false);
             owner.current = false;
           },
           async () => {
-            expect(() => assertGatewayServiceFallbackAllowed("detached launch")).toThrow(
-              "not an update-owned",
-            );
+            expect(() => assertFallbackAllowed("detached launch")).toThrow("not an update-owned");
             late = ready.promise.then(() => {
-              assertGatewayServiceUpdateCurrent();
+              assertUpdateCurrent();
             });
             return true;
           },
         ),
-      { updateOwned: false, assertRecoveryCurrent: () => {} },
+      doctorAuthority,
     ),
   ).rejects.toMatchObject({ code: "service-authority-revoked", outcome: "restored" });
   ready.resolve();
@@ -192,21 +186,20 @@ it("native plist publication rechecks after asynchronous preparation, without st
   const plistPath = resolveLaunchAgentPlistPath(env);
   await fs.mkdir(path.dirname(plistPath), { recursive: true });
   await fs.writeFile(plistPath, "original");
-  const owner = authority("original update owner revoked");
   const originalWrite = fs.writeFile;
   vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
     await originalWrite(...args);
     owner.current = false;
   });
   await expect(
-    withGatewayServiceUpdateAuthority(owner.assertCurrent, () =>
+    owner.run(() =>
       writeLaunchAgentPlist({
         env,
         stdout: process.stdout,
         programArguments: [process.execPath, "gateway"],
       }),
     ),
-  ).rejects.toThrow("original update owner revoked");
+  ).rejects.toThrow(retired);
   expect(await fs.readFile(plistPath, "utf8")).toBe("original");
 });
 
@@ -215,22 +208,19 @@ it.each([true, false])(
   async (updateOwned) => {
     const ready = createDeferred();
     let late!: Promise<void>;
-    let retained!: () => void;
-    await withGatewayServiceUpdateAuthority(
+    const retained = await withUpdateAuthority(
       undefined,
       async (assertCurrent) => {
-        retained = assertCurrent;
         await Promise.resolve();
         assertCurrent();
-        late = ready.promise.then(() =>
-          assertGatewayServiceFallbackAllowed("late detached launch"),
-        );
+        late = ready.promise.then(() => assertFallbackAllowed("late detached launch"));
+        return assertCurrent;
       },
-      { updateOwned, assertRecoveryCurrent: () => {} },
+      { ...doctorAuthority, updateOwned },
     );
-    expect(() => retained()).toThrow("has closed");
+    expect(retained).toThrow("has closed");
     ready.resolve();
     await expect(late).rejects.toThrow("has closed");
-    expect(assertGatewayServiceUpdateCurrent).not.toThrow();
+    expect(assertUpdateCurrent).not.toThrow();
   },
 );
