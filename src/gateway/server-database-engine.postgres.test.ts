@@ -23,6 +23,7 @@ import {
 import { acquireTestPortBlock } from "../test-utils/port-claims.js";
 import { installGatewayDatabaseEngine } from "./server-database-engine.js";
 import { prepareGatewayServerBootstrap } from "./server-startup-bootstrap.js";
+import { createWorkerEnvironmentStore } from "./worker-environments/store.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
 const connection = typeof configured === "string" ? configured : undefined;
@@ -156,7 +157,6 @@ describe.skipIf(!connection)("Gateway PostgreSQL shared-state bootstrap", () => 
       },
       plugins: { enabled: false },
       skills: { load: { watch: false } },
-      meta: { migrations: { webhookListeners: true } },
     });
     return state;
   }
@@ -169,8 +169,19 @@ describe.skipIf(!connection)("Gateway PostgreSQL shared-state bootstrap", () => 
       ["state"],
     );
     expect(metadata).toEqual([{ store_id: anchor.storeId }]);
+    const completion = await queryRows(
+      `SELECT value_json FROM ${quoteIdentifier(anchor.namespace)}.config_machine_state WHERE state_key = $1`,
+      [`webhookListeners:${current.configPath}`],
+    );
+    expect(completion).toEqual([{ value_json: "true" }]);
 
     await installGatewayDatabaseEngine(snapshot);
+    const workerStore = await createWorkerEnvironmentStore();
+    try {
+      expect(workerStore.list()).toEqual([]);
+    } finally {
+      await workerStore.close();
+    }
     const context = captureOpenClawStateWorkerContext({ env: current.env });
     // A captured lifetime must not re-resolve its SecretRef when a worker opens later.
     await withEnvAsync({ [DSN_ENV]: "postgresql://127.0.0.1:1/unreachable" }, async () => {
