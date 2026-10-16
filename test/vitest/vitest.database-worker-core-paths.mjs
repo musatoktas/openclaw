@@ -46,6 +46,7 @@ export const databaseWorkerCoreTestFiles = [
   // Physical admission and descriptor custody belong to the application host, not an unhosted test Worker.
   "src/infra/database-engine/mixed-agent-readers.conformance.test.ts",
   "src/infra/database-engine/mixed-agent-lifecycle.conformance.test.ts",
+  "src/infra/database-engine/gateway-session-startup.conformance.test.ts",
   "src/infra/database-engine/physical-facts.test.ts",
   "src/infra/database-engine/port.test.ts",
   "src/infra/database-engine/maintenance-custody.conformance.test.ts",

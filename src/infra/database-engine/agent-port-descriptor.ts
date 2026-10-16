@@ -19,6 +19,7 @@ import {
   readExistingAgentSchemaMeta,
 } from "../../state/openclaw-agent-db-schema-helpers.js";
 import { ensureOpenClawAgentDatabaseSchema } from "../../state/openclaw-agent-db-schema.js";
+import type { DB } from "../../state/openclaw-agent-db.generated.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "../../state/openclaw-agent-schema.js";
 import { agentTranscriptSearchSchema } from "../../state/openclaw-agent-search-schema.js";
 import { withLegacyAgentPostgresWriteLayout } from "../../state/openclaw-agent-write-layout-migration.js";
@@ -26,6 +27,11 @@ import metadata from "../../state/postgres-schema.generated/agent-port.json" wit
 import { agentPostgresRuntime } from "../../state/postgres-schema.generated/agent-runtime.js";
 import { agentSearchPostgresRuntime } from "../../state/postgres-schema.generated/agent-search-runtime.js";
 import manifest from "../../state/postgres-schema.generated/manifest.json" with { type: "json" };
+import {
+  executeSqliteQuerySync,
+  executeSqliteQueryTakeFirstSync,
+  getNodeSqliteKysely,
+} from "../kysely-sync.js";
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
 import { LEGACY_USAGE_COST_PARTITION_SCOPE } from "../session-cost-usage-partitions.js";
 import { admitSqliteSchema } from "../sqlite-schema-facts.js";
@@ -236,9 +242,14 @@ export async function loadAgentPortDescriptor(
         version < 23 ? "legacy" : "current",
         true,
       );
-      const hasRetiredUsagePartitions = db
-        .prepare("SELECT 1 FROM cache_entries WHERE scope = ? LIMIT 1")
-        .get(LEGACY_USAGE_COST_PARTITION_SCOPE);
+      const hasRetiredUsagePartitions = executeSqliteQueryTakeFirstSync(
+        db,
+        getNodeSqliteKysely<Pick<DB, "cache_entries">>(db)
+          .selectFrom("cache_entries")
+          .select("scope")
+          .where("scope", "=", LEGACY_USAGE_COST_PARTITION_SCOPE)
+          .limit(1),
+      );
       return {
         version,
         migrationRequired:
@@ -269,8 +280,11 @@ export async function loadAgentPortDescriptor(
             async () => {
               ensureOpenClawAgentDatabaseSchema(db, { agentId, register: false });
               // Retired partitions are rebuilt from retained transcripts; their NUL keys cannot port.
-              db.prepare("DELETE FROM cache_entries WHERE scope = ?").run(
-                LEGACY_USAGE_COST_PARTITION_SCOPE,
+              executeSqliteQuerySync(
+                db,
+                getNodeSqliteKysely<Pick<DB, "cache_entries">>(db)
+                  .deleteFrom("cache_entries")
+                  .where("scope", "=", LEGACY_USAGE_COST_PARTITION_SCOPE),
               );
             },
           ),

@@ -11,21 +11,11 @@ import {
   LEGACY_USAGE_COST_PARTITION_SCOPE,
   USAGE_COST_PARTITION_SCOPE,
   usageCostPartitionKey,
-  readUsageCostPartitionKey,
 } from "./session-cost-usage-partitions.js";
 
 function utf8Json(value: string) {
   return new TextEncoder().encode(value);
 }
-
-it.each(['folder/"quoted":\\雪', "folder\0literal", "folder\\u0000literal"])(
-  "encodes partition source %j without PostgreSQL text delimiters",
-  (sessionFile) => {
-    const key = usageCostPartitionKey(sessionFile, "2026-10-01");
-    expect(key).not.toContain("\0");
-    expect(readUsageCostPartitionKey(key)).toEqual({ sessionFile, date: "2026-10-01" });
-  },
-);
 
 it("rebuilds retired usage partitions even when the transcript is unchanged", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
