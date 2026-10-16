@@ -20,14 +20,30 @@ async function manifestWorkspace(name: string) {
   const home = path.join(root, "home");
   const workspace = path.join(root, "workspace");
   await Promise.all([fs.mkdir(home), fs.mkdir(workspace)]);
-  return { root, home, workspace };
+  const manifestRoot = path.join(home, ".openclaw-worker", "manifests");
+  const run = (
+    args: string[] = [],
+    options: Parameters<typeof runCommandWithTimeout>[1] = {},
+    script = REMOTE_WORKSPACE_MANIFEST_JS,
+  ) =>
+    runCommandWithTimeout([process.execPath, "-e", script, workspace, ...args], {
+      timeoutMs: 10_000,
+      baseEnv: { ...process.env, HOME: home },
+      ...options,
+    });
+  const readManifest = async (
+    ref: string,
+  ): Promise<{ entries: Array<{ path: string; type: string; size?: number; target?: string }> }> =>
+    JSON.parse(await fs.readFile(path.join(manifestRoot, ref.slice(7) + ".json"), "utf8"));
+  return { root, home, workspace, manifestRoot, run, readManifest };
 }
 
 async function gitWorkspace(name: string) {
-  const { home, workspace } = await manifestWorkspace(name);
+  const fixture = await manifestWorkspace(name);
+  const { workspace } = fixture;
   await fs.writeFile(path.join(workspace, ".gitignore"), "");
   const baseCommit = await initializeScriptGitWorkspace(workspace, ".gitignore");
-  return { home, workspace, baseCommit };
+  return { ...fixture, baseCommit };
 }
 
 it.each([
@@ -37,7 +53,9 @@ it.each([
 ])(
   "budgets opened files ($firstSize + $secondSize) and symlink bytes with cached=$cached",
   async ({ firstSize, secondSize, cached, accepted }) => {
-    const { root, home, workspace } = await manifestWorkspace("openclaw-manifest-open-budget");
+    const { root, workspace, manifestRoot, run, readManifest } = await manifestWorkspace(
+      "openclaw-manifest-open-budget",
+    );
     const first = path.join(workspace, "a.txt");
     const second = path.join(workspace, "b.txt");
     const auditPath = path.join(root, "handles.json");
@@ -81,12 +99,12 @@ it.each([
       "const MAX_WORKSPACE_INVENTORY_TOTAL_BYTES = 24;",
     );
     expect(script).not.toBe(REMOTE_WORKSPACE_MANIFEST_JS);
-    const result = await runCommandWithTimeout(
-      [process.execPath, "-e", prelude + script, workspace, "", "all", "memo-v1"],
-      { timeoutMs: 10_000, baseEnv: { ...process.env, HOME: home }, input: JSON.stringify(memo) },
+    const result = await run(
+      ["", "all", "memo-v1"],
+      { input: JSON.stringify(memo) },
+      prelude + script,
     );
     expect(JSON.parse(await fs.readFile(auditPath, "utf8"))).toEqual([true, true]);
-    const manifestRoot = path.join(home, ".openclaw-worker", "manifests");
     if (!accepted) {
       expect(result.code).not.toBe(0);
       expect(result.stderr).toContain("eligible byte limit");
@@ -103,9 +121,7 @@ it.each([
       contentHashCount: cached ? 1 : 2,
       memoHitCount: cached ? 1 : 0,
     });
-    const manifest = JSON.parse(
-      await fs.readFile(path.join(manifestRoot, `${response.manifestRef.slice(7)}.json`), "utf8"),
-    ) as { entries: Array<{ path: string; type: string; size?: number; target?: string }> };
+    const manifest = await readManifest(response.manifestRef);
     expect(manifest.entries).toEqual([
       expect.objectContaining({ path: "a.txt", type: "file", size: firstSize }),
       expect.objectContaining({ path: "b.txt", type: "file", size: secondSize }),
@@ -115,7 +131,7 @@ it.each([
 );
 
 it("stops hashing a growing file at its opened size and settles its stream and handle", async () => {
-  const { root, home, workspace } = await manifestWorkspace("openclaw-manifest-stream-budget");
+  const { root, home, workspace, run } = await manifestWorkspace("openclaw-manifest-stream-budget");
   const target = path.join(workspace, "growing.txt");
   const auditPath = path.join(root, "stream.json");
   await fs.writeFile(target, "12345678");
@@ -162,10 +178,7 @@ it("stops hashing a growing file at its opened size and settles its stream and h
     })));
   }
   `;
-  const result = await runCommandWithTimeout(
-    [process.execPath, "-e", prelude + REMOTE_WORKSPACE_MANIFEST_JS, workspace],
-    { timeoutMs: 10_000, baseEnv: { ...process.env, HOME: home } },
-  );
+  const result = await run([], {}, prelude + REMOTE_WORKSPACE_MANIFEST_JS);
   expect(result.code).not.toBe(0);
   expect(result.stderr).toContain("file changed while it was being read");
   expect(result.stdout).toBe("");
@@ -186,23 +199,19 @@ it("stops hashing a growing file at its opened size and settles its stream and h
 });
 
 it("rejects a full workspace above 4 GiB before hashing its files", async () => {
-  const { home, workspace, baseCommit } = await gitWorkspace("openclaw-manifest-byte-budget");
+  const { workspace, baseCommit, run } = await gitWorkspace("openclaw-manifest-byte-budget");
   const oversizedPath = path.join(workspace, "oversized.bin");
   await fs.writeFile(oversizedPath, "");
   await fs.truncate(oversizedPath, MAX_WORKSPACE_INVENTORY_TOTAL_BYTES + 1);
 
-  const result = await runCommandWithTimeout(
-    [process.execPath, "-e", REMOTE_WORKSPACE_MANIFEST_JS, workspace, baseCommit, "eligible"],
-    { timeoutMs: 10_000, baseEnv: { ...process.env, HOME: home } },
-  );
+  const result = await run([baseCommit, "eligible"]);
 
   expect(result.code).not.toBe(0);
   expect(result.stderr).toContain("eligible byte limit");
 });
 
 it("rejects prior manifests above the full-inventory entry limit", async () => {
-  const { home, workspace, baseCommit } = await gitWorkspace("openclaw-manifest-entry-budget");
-  const manifestRoot = path.join(home, ".openclaw-worker", "manifests");
+  const { baseCommit, manifestRoot, run } = await gitWorkspace("openclaw-manifest-entry-budget");
   await fs.mkdir(manifestRoot, { recursive: true });
   const priorRaw = JSON.stringify({
     version: 1,
@@ -212,18 +221,7 @@ it("rejects prior manifests above the full-inventory entry limit", async () => {
   const priorDigest = createHash("sha256").update(priorRaw).digest("hex");
   await fs.writeFile(path.join(manifestRoot, `${priorDigest}.json`), priorRaw);
 
-  const result = await runCommandWithTimeout(
-    [
-      process.execPath,
-      "-e",
-      REMOTE_WORKSPACE_MANIFEST_JS,
-      workspace,
-      baseCommit,
-      "eligible",
-      priorDigest,
-    ],
-    { timeoutMs: 10_000, baseEnv: { ...process.env, HOME: home } },
-  );
+  const result = await run([baseCommit, "eligible", priorDigest]);
 
   expect(result.code).not.toBe(0);
   expect(result.stderr).toContain("invalid prior workspace manifest");
@@ -231,7 +229,9 @@ it("rejects prior manifests above the full-inventory entry limit", async () => {
 
 it("budgets raw Git candidates separately from materialized eligible inventory", async () => {
   expect(MAX_WORKSPACE_GIT_CANDIDATES).toBe(4 * MAX_WORKSPACE_INVENTORY_ENTRIES);
-  const { home, workspace, baseCommit } = await gitWorkspace("openclaw-raw-git-candidate-budget");
+  const { home, baseCommit, run, readManifest } = await gitWorkspace(
+    "openclaw-raw-git-candidate-budget",
+  );
   const bin = path.join(home, "bin");
   const mockGit = path.join(bin, "git");
   await fs.mkdir(bin);
@@ -250,31 +250,20 @@ process.stdout.write("missing\\0".repeat(count));
     OPENCLAW_TEST_GIT_CANDIDATES: String(MAX_WORKSPACE_INVENTORY_ENTRIES + 1),
   };
 
-  const accepted = await runCommandWithTimeout(
-    [process.execPath, "-e", REMOTE_WORKSPACE_MANIFEST_JS, workspace, baseCommit, "eligible"],
-    { timeoutMs: 20_000, baseEnv },
-  );
+  const accepted = await run([baseCommit, "eligible"], { timeoutMs: 20_000, baseEnv });
   expect(accepted.code, accepted.stderr).toBe(0);
   const manifestRef = accepted.stdout.trim();
   expect(manifestRef).toMatch(/^sha256:[a-f0-9]{64}$/u);
-  const manifest = JSON.parse(
-    await fs.readFile(
-      path.join(home, ".openclaw-worker", "manifests", `${manifestRef.slice(7)}.json`),
-      "utf8",
-    ),
-  );
+  const manifest = await readManifest(manifestRef);
   expect(manifest.entries).toEqual([]);
 
-  const rejected = await runCommandWithTimeout(
-    [process.execPath, "-e", REMOTE_WORKSPACE_MANIFEST_JS, workspace, baseCommit, "eligible"],
-    {
-      timeoutMs: 20_000,
-      baseEnv: {
-        ...baseEnv,
-        OPENCLAW_TEST_GIT_CANDIDATES: String(MAX_WORKSPACE_GIT_CANDIDATES + 1),
-      },
+  const rejected = await run([baseCommit, "eligible"], {
+    timeoutMs: 20_000,
+    baseEnv: {
+      ...baseEnv,
+      OPENCLAW_TEST_GIT_CANDIDATES: String(MAX_WORKSPACE_GIT_CANDIDATES + 1),
     },
-  );
+  });
   expect(rejected.code).not.toBe(0);
   expect(rejected.stderr).toContain("too many Git path candidates");
 }, 30_000);
