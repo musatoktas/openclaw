@@ -9,7 +9,40 @@ import { SYSTEM_AGENT_ID } from "./agent-id.js";
 import {
   projectInferenceRoute,
   resolveSystemAgentConfiguredRouteFromConfig,
+  type SystemAgentConfiguredRoute,
 } from "./inference-route.js";
+
+function model(
+  id: string,
+  name: string,
+  reasoning: boolean,
+  contextWindow: number,
+  maxTokens: number,
+) {
+  return {
+    id,
+    name,
+    reasoning,
+    input: ["text" as const],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    maxTokens,
+  };
+}
+
+async function expectSameProjection(
+  before: OpenClawConfig,
+  after: OpenClawConfig,
+  same: boolean,
+  modelTarget?: "utility",
+) {
+  expect(
+    isDeepStrictEqual(
+      await projectInferenceRoute(before, undefined, { modelTarget }),
+      await projectInferenceRoute(after, undefined, { modelTarget }),
+    ),
+  ).toBe(same);
+}
 
 function devConfig(agentRuntime?: string): OpenClawConfig {
   return {
@@ -25,17 +58,7 @@ function devConfig(agentRuntime?: string): OpenClawConfig {
           api: "openai-responses",
           baseUrl: "https://api.openai.com/v1",
           ...(agentRuntime ? { agentRuntime: { id: agentRuntime } } : {}),
-          models: [
-            {
-              id: "gpt-5.5",
-              name: "GPT-5.5",
-              reasoning: true,
-              input: ["text"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 128_000,
-              maxTokens: 8_192,
-            },
-          ],
+          models: [model("gpt-5.5", "GPT-5.5", true, 128_000, 8_192)],
         },
       },
     },
@@ -57,26 +80,14 @@ function utilityConfig(primary?: string): OpenClawConfig {
         "local-utility": {
           api: "openai-completions",
           baseUrl: "http://127.0.0.1:9999/v1",
-          models: [
-            {
-              id: "tiny",
-              name: "Local utility fixture",
-              reasoning: false,
-              input: ["text"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 8_192,
-              maxTokens: 2_048,
-            },
-          ],
+          models: [model("tiny", "Local utility fixture", false, 8_192, 2_048)],
         },
       },
     },
   };
 }
 
-afterEach(() => {
-  clearAgentHarnesses();
-});
+afterEach(clearAgentHarnesses);
 
 describe("resolveSystemAgentConfiguredRouteFromConfig", () => {
   it.each([false, true])(
@@ -128,12 +139,7 @@ describe("resolveSystemAgentConfiguredRouteFromConfig", () => {
       modelTarget: "utility",
     });
     expect(isDeepStrictEqual(primary, utility)).toBe(false);
-    expect(
-      isDeepStrictEqual(
-        await projectInferenceRoute(legacy, undefined, { modelTarget: "utility" }),
-        await projectInferenceRoute(separated, undefined, { modelTarget: "utility" }),
-      ),
-    ).toBe(true);
+    await expectSameProjection(legacy, separated, true, "utility");
   });
 
   it.each([undefined, "openai/gpt-5.5"])(
@@ -173,32 +179,12 @@ describe("resolveSystemAgentConfiguredRouteFromConfig", () => {
     "invalidates utility verification after a %s utility change while preserving the primary route",
     async (scope) => {
       const before = utilityConfig("openai/gpt-5.5");
-      const after: OpenClawConfig = {
-        ...before,
-        agents: {
-          ...before.agents,
-          defaults: {
-            ...before.agents?.defaults,
-            ...(scope === "defaults" ? { utilityModel: "local-utility/other" } : {}),
-          },
-          entries: {
-            dev: {
-              ...before.agents?.entries?.dev,
-              ...(scope === "agent" ? { utilityModel: "local-utility/other" } : {}),
-            },
-          },
-        },
-      };
-
-      expect(
-        isDeepStrictEqual(
-          await projectInferenceRoute(before, undefined, { modelTarget: "utility" }),
-          await projectInferenceRoute(after, undefined, { modelTarget: "utility" }),
-        ),
-      ).toBe(false);
-      expect(
-        isDeepStrictEqual(await projectInferenceRoute(before), await projectInferenceRoute(after)),
-      ).toBe(true);
+      const after = structuredClone(before);
+      const target = scope === "defaults" ? after.agents?.defaults : after.agents?.entries?.dev;
+      assert(target);
+      target.utilityModel = "local-utility/other";
+      await expectSameProjection(before, after, false, "utility");
+      await expectSameProjection(before, after, true);
     },
   );
 
@@ -239,12 +225,7 @@ describe("resolveSystemAgentConfiguredRouteFromConfig", () => {
       },
     };
 
-    expect(
-      isDeepStrictEqual(
-        await projectInferenceRoute(withoutRoster),
-        await projectInferenceRoute(withFirstAgent),
-      ),
-    ).toBe(true);
+    await expectSameProjection(withoutRoster, withFirstAgent, true);
   });
 
   it.each([
@@ -291,39 +272,26 @@ describe("resolveSystemAgentConfiguredRouteFromConfig", () => {
       baseUrl: "https://api.openai.com/v1",
       requestTransportOverrides: "present" as const,
     };
-
-    const implicitRoute = await resolveSystemAgentConfiguredRouteFromConfig(devConfig());
-    expect(implicitRoute).toMatchObject({ runner: "embedded" });
-    expect(implicitRoute).not.toHaveProperty("agentHarnessRuntimeOverride");
-    expect(
+    const select = (route: SystemAgentConfiguredRoute | null) =>
       selectAgentHarness({
         provider: "openai",
         modelId: "gpt-5.5",
         modelProvider: preparedModelProvider,
-        config: implicitRoute!.runConfig,
+        config: route!.runConfig,
         agentHarnessRuntimeOverride:
-          implicitRoute!.runner === "embedded"
-            ? implicitRoute!.agentHarnessRuntimeOverride
-            : undefined,
-      }).id,
-    ).toBe("openclaw");
+          route!.runner === "embedded" ? route!.agentHarnessRuntimeOverride : undefined,
+      });
+
+    const implicitRoute = await resolveSystemAgentConfiguredRouteFromConfig(devConfig());
+    expect(implicitRoute).toMatchObject({ runner: "embedded" });
+    expect(implicitRoute).not.toHaveProperty("agentHarnessRuntimeOverride");
+    expect(select(implicitRoute).id).toBe("openclaw");
 
     const explicitRoute = await resolveSystemAgentConfiguredRouteFromConfig(devConfig("codex"));
     expect(explicitRoute).toMatchObject({
       runner: "embedded",
       agentHarnessRuntimeOverride: "codex",
     });
-    expect(() =>
-      selectAgentHarness({
-        provider: "openai",
-        modelId: "gpt-5.5",
-        modelProvider: preparedModelProvider,
-        config: explicitRoute!.runConfig,
-        agentHarnessRuntimeOverride:
-          explicitRoute!.runner === "embedded"
-            ? explicitRoute!.agentHarnessRuntimeOverride
-            : undefined,
-      }),
-    ).toThrow("authored request transport overrides");
+    expect(() => select(explicitRoute)).toThrow("authored request transport overrides");
   });
 });

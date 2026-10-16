@@ -22,7 +22,6 @@ import {
   installSystemAgentClaudeCliBackendTestFixture,
   createSystemAgentPluginMetadataTestSnapshot,
   readLastSystemAgentAuditEntry as readLastAuditEntry,
-  requireTestRecord as requireRecord,
   type SystemAgentPluginMetadataTestSnapshot,
 } from "./system-agent.test-helpers.js";
 
@@ -197,6 +196,15 @@ function setup(
 function setModel(options: Options) {
   return run({ kind: "set-default-model", model }, options);
 }
+function setupWithVerifier(verifyInferenceConfig: Verify) {
+  return setup({ deps: { verifyInferenceConfig } });
+}
+async function expectRejectedSetup(result: ReturnType<typeof setup>, error: string) {
+  await expect(result).rejects.toThrow(error);
+  expect(applySetup).not.toHaveBeenCalled();
+  expect(lines.join("\n")).not.toContain("[openclaw] running: openclaw.setup");
+  expectNoAudit("openclaw.setup");
+}
 const verified = () => ({ ok: true as const, modelRef: model, latencyMs: 5 });
 const withModel = (primary = model): OpenClawConfig => ({
   agents: { defaults: { model: { primary } }, entries: { main: {} } },
@@ -312,6 +320,14 @@ function expectPending(pending: LocalOnboardingState) {
   expect(localOnboarding.states.get(configPath)).toEqual(pending);
   expect(lines.join("\n")).not.toContain("[openclaw] done: openclaw.setup");
 }
+function afterFirstAuthorization(effect: () => void) {
+  let authorizations = 0;
+  return vi.fn(() => {
+    if (++authorizations > 1) {
+      effect();
+    }
+  });
+}
 async function rejectsRecovery(
   pending: LocalOnboardingState,
   apply: ApplySetup,
@@ -411,50 +427,31 @@ describe("setup inference", () => {
 
   it("rejects setup without a model before workspace or Gateway writes", async () => {
     mockConfig.set({ agents: { entries: { main: {} } } });
-    await expect(
+    await expectRejectedSetup(
       setup({
         deps: {
-          applySetup,
           setupSurface: "gateway",
           loadOverview: async () => ({ ...overview(), defaultModel: undefined }),
         },
       }),
-    ).rejects.toThrow("requires working inference first");
-    expect(applySetup).not.toHaveBeenCalled();
-    expect(lines.join("\n")).not.toContain("[openclaw] running: openclaw.setup");
-    expectNoAudit("openclaw.setup");
+      "requires working inference first",
+    );
   });
 
   it("rejects setup when the current route fails live inference", async () => {
-    await expect(
-      setup({
-        deps: {
-          applySetup,
-          verifyInferenceConfig: async () => ({
-            ok: false,
-            status: "auth",
-            error: "not authenticated",
-          }),
-        },
-      }),
-    ).rejects.toThrow("failed a live check");
-    expect(applySetup).not.toHaveBeenCalled();
-    expect(lines.join("\n")).not.toContain("[openclaw] running: openclaw.setup");
-    expectNoAudit("openclaw.setup");
+    await expectRejectedSetup(
+      setupWithVerifier(async () => ({ ok: false, status: "auth", error: "not authenticated" })),
+      "failed a live check",
+    );
   });
 
   it("rejects setup route drift while preserving the concurrent edit", async () => {
     mockConfig.set({ ...withModel(), auth: { order: { openai: ["openai:old"] } } });
 
     await expect(
-      setup({
-        deps: {
-          applySetup,
-          verifyInferenceConfig: async () => {
-            mockConfig.set({ ...withModel(), auth: { order: { openai: ["openai:new"] } } });
-            return verified();
-          },
-        },
+      setupWithVerifier(async () => {
+        mockConfig.set({ ...withModel(), auth: { order: { openai: ["openai:new"] } } });
+        return verified();
       }),
     ).rejects.toThrow("changed during setup verification");
     expect(applySetup).not.toHaveBeenCalled();
@@ -510,11 +507,7 @@ describe("model changes", () => {
     const verifyInferenceConfig = vi.fn<Verify>(
       async ({ config, onVerifiedExecution, requireExecutionOwner }) => {
         expect(requireExecutionOwner).toBe(true);
-        const stagedDefaults = requireRecord(
-          requireRecord(config.agents, "agents").defaults,
-          "defaults",
-        );
-        expect(stagedDefaults.model).toEqual({
+        expect(config.agents?.defaults?.model).toEqual({
           primary: model,
           fallbacks: ["openai/gpt-5.2"],
         });
@@ -571,13 +564,9 @@ describe("model changes", () => {
     expect(verify).toHaveBeenCalledOnce();
   });
   it("rechecks inference authority after the live probe", async () => {
-    let calls = 0;
-    const verify = vi.fn<Verify>(async () => {
-      calls++;
-      return verified();
-    });
+    const verify = vi.fn<Verify>(async () => verified());
     const beforePersistentApply = vi.fn(() => {
-      if (calls > 0) {
+      if (verify.mock.calls.length > 0) {
         throw new SystemAgentInferenceUnavailableError("conversation");
       }
     });
@@ -814,11 +803,8 @@ describe("local setup recovery", () => {
 
   it("rechecks setup authority immediately before completing onboarding", async () => {
     const pending = pendingOwner();
-    let authorizations = 0;
-    const beforePersistentApply = vi.fn(() => {
-      if (++authorizations > 1) {
-        throw new SystemAgentInferenceUnavailableError("conversation");
-      }
+    const beforePersistentApply = afterFirstAuthorization(() => {
+      throw new SystemAgentInferenceUnavailableError("conversation");
     });
     await expect(setup({ beforePersistentApply })).rejects.toBeInstanceOf(
       SystemAgentInferenceUnavailableError,
@@ -830,12 +816,9 @@ describe("local setup recovery", () => {
 
   it("reads final config only after the completion authority check", async () => {
     const pending = pendingOwner();
-    let authorizations = 0;
-    const beforePersistentApply = vi.fn(() => {
-      if (++authorizations > 1) {
-        recoveryConfig(pending, "2026-08-03T00:00:00.000Z");
-      }
-    });
+    const beforePersistentApply = afterFirstAuthorization(() =>
+      recoveryConfig(pending, "2026-08-03T00:00:00.000Z"),
+    );
     await rejectsRecovery(pending, async () => setupResult(), undefined, { beforePersistentApply });
     expect(beforePersistentApply).toHaveBeenCalledTimes(2);
   });

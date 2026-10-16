@@ -21,19 +21,18 @@ function route(agentId: string, provider: string): SystemAgentConfiguredRoute {
   };
 }
 
-const config: OpenClawConfig = {
-  agents: {
-    defaults: {
-      model: { primary: "zeta/model" },
-      systemAgent: { agentId: "requester" },
+function fallbackConfig(
+  primary: string,
+  entries: Record<string, string>,
+  systemAgent?: { agentId: string },
+): OpenClawConfig {
+  return {
+    agents: {
+      defaults: { model: { primary }, ...(systemAgent ? { systemAgent } : {}) },
+      entries: Object.fromEntries(Object.entries(entries).map(([id, model]) => [id, { model }])),
     },
-    entries: {
-      requester: { model: "zeta/model" },
-      beta: { model: "beta/model" },
-      alpha: { model: "alpha/model" },
-    },
-  },
-};
+  };
+}
 
 async function verifyAfterFailure(
   failure: Extract<VerifySetupInferenceResult, { ok: false }>,
@@ -43,16 +42,11 @@ async function verifyAfterFailure(
   }: { includeBeta?: boolean; successfulAgentId?: "alpha-other" | "beta" } = {},
 ) {
   const attempts: string[] = [];
-  const cfg: OpenClawConfig = {
-    agents: {
-      defaults: { model: { primary: "alpha/model" } },
-      entries: {
-        requester: { model: "alpha/model" },
-        "alpha-other": { model: "alpha/model" },
-        ...(includeBeta ? { beta: { model: "beta/model" } } : {}),
-      },
-    },
-  };
+  const cfg = fallbackConfig("alpha/model", {
+    requester: "alpha/model",
+    "alpha-other": "alpha/model",
+    ...(includeBeta ? { beta: "beta/model" } : {}),
+  });
   const result = await verifySystemAgentInferenceWithFallback({
     requestingAgentId: "requester",
     runtime,
@@ -161,16 +155,11 @@ describe("system-agent inference fallback", () => {
 
   it("uses a later authenticated route for one fallback provider", async () => {
     const attempts: string[] = [];
-    const duplicateProviderConfig: OpenClawConfig = {
-      agents: {
-        defaults: { model: { primary: "zeta/model" } },
-        entries: {
-          requester: { model: "zeta/model" },
-          "alpha-bad": { model: "alpha/model" },
-          "alpha-good": { model: "alpha/model" },
-        },
-      },
-    };
+    const duplicateProviderConfig = fallbackConfig("zeta/model", {
+      requester: "zeta/model",
+      "alpha-bad": "alpha/model",
+      "alpha-good": "alpha/model",
+    });
 
     const result = await verifySystemAgentInferenceWithFallback({
       requestingAgentId: "requester",
@@ -193,47 +182,22 @@ describe("system-agent inference fallback", () => {
     expect(attempts).toEqual(["requester", "alpha-good"]);
   });
 
-  it("tries another credential owner of the same provider after an auth failure", async () => {
-    const { result, attempts } = await verifyAfterFailure({
-      ok: false,
-      status: "auth",
-      error: "stale key",
-    });
-
-    expect(result.ok).toBe(true);
-    expect(attempts).toEqual(["requester", "alpha-other"]);
-  });
-
-  it("treats a rate limit as credential-scoped and tries another owner", async () => {
-    const { result, attempts } = await verifyAfterFailure({
-      ok: false,
-      status: "rate_limit",
-      error: "429",
-    });
-
-    expect(result.ok).toBe(true);
-    expect(attempts).toEqual(["requester", "alpha-other"]);
-  });
-
-  it("tries another route of the same provider after a malformed response", async () => {
-    const { result, attempts } = await verifyAfterFailure(
-      { ok: false, status: "format", error: "bad response" },
-      { includeBeta: true },
-    );
-
-    expect(result.ok).toBe(true);
-    expect(attempts).toEqual(["requester", "alpha-other"]);
-  });
-
-  it("retires the whole provider after a provider-wide failure", async () => {
-    const { result, attempts } = await verifyAfterFailure(
-      { ok: false, status: "unavailable", error: "down" },
-      { includeBeta: true, successfulAgentId: "beta" },
-    );
-
-    expect(result.ok).toBe(true);
-    expect(attempts).toEqual(["requester", "beta"]);
-  });
+  it.each([
+    ["auth", "stale key", false, "alpha-other"],
+    ["rate_limit", "429", false, "alpha-other"],
+    ["format", "bad response", true, "alpha-other"],
+    ["unavailable", "down", true, "beta"],
+  ] as const)(
+    "retries %s at the correct owner scope",
+    async (status, error, includeBeta, successfulAgentId) => {
+      const { result, attempts } = await verifyAfterFailure(
+        { ok: false, status, error },
+        { includeBeta, successfulAgentId },
+      );
+      expect(result.ok).toBe(true);
+      expect(attempts).toEqual(["requester", successfulAgentId]);
+    },
+  );
 
   it("does not fail over on owner or identity uncertainty", async () => {
     const verify = vi.fn(
@@ -244,7 +208,12 @@ describe("system-agent inference fallback", () => {
       requestingAgentId: "requester",
       runtime,
       deps: {
-        readConfig: async () => config,
+        readConfig: async () =>
+          fallbackConfig(
+            "zeta/model",
+            { requester: "zeta/model", beta: "beta/model", alpha: "alpha/model" },
+            { agentId: "requester" },
+          ),
         resolveRoute: async (_cfg, agentId) =>
           route(agentId, agentId === "requester" ? "zeta" : agentId),
         hasAuth: async () => true,
