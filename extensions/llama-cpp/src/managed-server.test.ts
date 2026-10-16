@@ -58,7 +58,51 @@ async function createPresetFixture(label: string) {
     command: path.join(tempRoot, "llama-server"),
     presetPath,
   });
-  return { tempRoot, presetPath };
+  return { tempRoot, presetPath, asset };
+}
+
+const prepareEmbedding = (port: number, reconcileBaseUrl?: string) =>
+  prepareManagedLlamaServer({
+    chatModel: { mode: "remove" },
+    configuredChatModelIds: [],
+    embeddingModelPath: "/models/embedding.gguf",
+    port,
+    reconcileBaseUrl,
+  });
+
+function chatModel(id: string, modelPath: string, contextSize: number, maxTokens: number) {
+  return {
+    id,
+    name: id,
+    reasoning: false,
+    input: ["text" as const],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    params: { modelPath, contextSize },
+    maxTokens,
+  };
+}
+
+function expectContents(contents: string, fragments: string[]) {
+  for (const fragment of fragments) {
+    expect(contents).toContain(fragment);
+  }
+}
+
+async function serveInspection(routes: Record<string, () => unknown>) {
+  const server = http.createServer((req, res) => {
+    const endpoint = Object.keys(routes).find((route) =>
+      route.endsWith("?") ? req.url?.startsWith(route) : req.url === route,
+    );
+    const body = endpoint ? routes[endpoint]?.() : undefined;
+    res.statusCode = body === undefined ? 404 : 200;
+    res.setHeader(
+      "content-type",
+      endpoint === "/metrics?" && body !== undefined ? "text/plain" : "application/json",
+    );
+    res.end(Buffer.isBuffer(body) || typeof body === "string" ? body : JSON.stringify(body ?? {}));
+  });
+  servers.push(server);
+  return await listen(server);
 }
 
 afterEach(async () => {
@@ -75,28 +119,16 @@ afterEach(async () => {
 });
 
 describe("managed llama-server", () => {
-  it.each([
-    [
-      "darwin",
-      "x64",
-      "cpu",
-      "tar.gz",
-      "llama-b10809-bin-macos-x64.tar.gz",
-      "13b34aa8a5d87341a21065a83f54a8167e1aaa6fe0d66065de01632a1ed64be6",
-    ],
-  ] as const)(
-    "selects the pinned %s/%s asset",
-    (platform, arch, backend, archive, name, sha256) => {
-      expect(selectLlamaServerAsset(platform, arch)).toMatchObject({
-        platform,
-        arch,
-        backend,
-        archive,
-        name,
-        sha256,
-      });
-    },
-  );
+  it("selects the pinned darwin/x64 asset", () => {
+    expect(selectLlamaServerAsset("darwin", "x64")).toMatchObject({
+      platform: "darwin",
+      arch: "x64",
+      backend: "cpu",
+      archive: "tar.gz",
+      name: "llama-b10809-bin-macos-x64.tar.gz",
+      sha256: "13b34aa8a5d87341a21065a83f54a8167e1aaa6fe0d66065de01632a1ed64be6",
+    });
+  });
 
   it("fails unsupported platforms with an actionable manual path", () => {
     expect(() => selectLlamaServerAsset("freebsd", "x64")).toThrow(
@@ -105,18 +137,9 @@ describe("managed llama-server", () => {
   });
 
   it("prepares an isolated candidate without changing the active restart preset", async () => {
-    const root = tempDirs.make("llama-server-candidate-");
-    const presetPath = path.join(root, "models.ini");
+    const { presetPath, asset } = await createPresetFixture("candidate");
     const active = "version = 1\n\n[active-chat]\nmodel = /models/active.gguf\n";
     await fs.writeFile(presetPath, active);
-    const asset = selectLlamaServerAsset("darwin", "arm64");
-    const command = path.join(root, "llama-server");
-    installMocks.ensureLlamaServerInstalled.mockResolvedValue({ command, asset });
-    installMocks.resolveManagedLlamaServerPaths.mockReturnValue({
-      installDir: root,
-      command,
-      presetPath,
-    });
 
     const candidate = await prepareManagedLlamaServer({
       chatModel: {
@@ -134,10 +157,10 @@ describe("managed llama-server", () => {
     expect(candidatePreset).not.toBe(presetPath);
     expect(await fs.readFile(presetPath, "utf8")).toBe(active);
     const contents = await fs.readFile(candidatePreset, "utf8");
-    expect(contents).toContain(
+    expectContents(contents, [
       "[candidate-chat]\nmodel = /models/candidate.gguf\nctx-size = 16384",
-    );
-    expect(contents).toContain("[embeddinggemma-300m-qat-q8_0]\nmodel = /models/embedding.gguf");
+      "[embeddinggemma-300m-qat-q8_0]\nmodel = /models/embedding.gguf",
+    ]);
     expect(contents).not.toContain("active-chat");
   });
 
@@ -238,7 +261,7 @@ describe("managed llama-server", () => {
   );
 
   it("preserves both model stanzas and the configured CUDA runtime during concurrent preparation", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "llama-server-chat-preset-"));
+    const tempRoot = tempDirs.make("llama-server-chat-preset-");
     const presetPath = path.join(tempRoot, "models.ini");
     const chatModelPath = path.join(tempRoot, "chat.gguf");
     const embeddingModelPath = path.join(tempRoot, "custom-embedding.gguf");
@@ -247,70 +270,50 @@ describe("managed llama-server", () => {
       args: ["--models-preset", presetPath],
     };
 
-    try {
-      await Promise.all([
-        fs.writeFile(chatModelPath, "GGUF"),
-        fs.writeFile(embeddingModelPath, "GGUF"),
-      ]);
-      const [embeddingRuntime] = await Promise.all([
-        prepareManagedLlamaServer({
-          chatModel: { mode: "preserve" },
-          embeddingModelPath,
-          port: 19_434,
+    await Promise.all([
+      fs.writeFile(chatModelPath, "GGUF"),
+      fs.writeFile(embeddingModelPath, "GGUF"),
+    ]);
+    const [embeddingRuntime] = await Promise.all([
+      prepareManagedLlamaServer({
+        chatModel: { mode: "preserve" },
+        embeddingModelPath,
+        port: 19_434,
+        localService,
+      }),
+      ensureManagedLlamaServerForChat({
+        provider: {
+          baseUrl: "http://127.0.0.1:19434/v1",
           localService,
-        }),
-        ensureManagedLlamaServerForChat({
-          provider: {
-            baseUrl: "http://127.0.0.1:19434/v1",
-            localService,
-            models: [],
-            params: { modelCacheDir: tempRoot },
-          },
-          model: {
-            id: "chat-model",
-            params: { modelPath: chatModelPath, contextSize: 8192 },
-            maxTokens: 2048,
-          },
-        }),
-      ]);
+          models: [],
+          params: { modelCacheDir: tempRoot },
+        },
+        model: {
+          id: "chat-model",
+          params: { modelPath: chatModelPath, contextSize: 8192 },
+          maxTokens: 2048,
+        },
+      }),
+    ]);
 
-      expect(embeddingRuntime.command).toBe(localService.command);
-      expect(embeddingRuntime.args).toContain(presetPath);
-      expect(installMocks.ensureLlamaServerInstalled).not.toHaveBeenCalled();
-      expect(installMocks.resolveManagedLlamaServerPaths).not.toHaveBeenCalled();
-      const preset = await fs.readFile(presetPath, "utf8");
-      expect(preset).toContain(`[chat-model]\nmodel = ${chatModelPath}\nctx-size = 8192`);
-      expect(preset).toContain(
-        `[embeddinggemma-300m-qat-q8_0]\nmodel = ${embeddingModelPath}\nembedding = true`,
-      );
-      expect(preset).toContain("parallel = 1\nctx-size = 2048\nubatch-size = 2048\n");
-    } finally {
-      await fs.rm(tempRoot, { recursive: true, force: true });
-    }
+    expect(embeddingRuntime.command).toBe(localService.command);
+    expect(embeddingRuntime.args).toContain(presetPath);
+    expect(installMocks.ensureLlamaServerInstalled).not.toHaveBeenCalled();
+    expect(installMocks.resolveManagedLlamaServerPaths).not.toHaveBeenCalled();
+    const preset = await fs.readFile(presetPath, "utf8");
+    expectContents(preset, [
+      `[chat-model]\nmodel = ${chatModelPath}\nctx-size = 8192`,
+      `[embeddinggemma-300m-qat-q8_0]\nmodel = ${embeddingModelPath}\nembedding = true`,
+      "parallel = 1\nctx-size = 2048\nubatch-size = 2048\n",
+    ]);
   });
 
   it("retains the chat inventory across A to B to A and reapplies changed limits", async () => {
     const { tempRoot, presetPath } = await createPresetFixture("chat-transitions");
     const firstPath = path.join(tempRoot, "first.gguf");
     const secondPath = path.join(tempRoot, "second.gguf");
-    const first = {
-      id: "first",
-      name: "First",
-      reasoning: false,
-      input: ["text" as const],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      params: { modelPath: firstPath, contextSize: 16_384 },
-      maxTokens: 1024,
-    };
-    const second = {
-      id: "second",
-      name: "Second",
-      reasoning: false,
-      input: ["text" as const],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      params: { modelPath: secondPath, contextSize: 32_768 },
-      maxTokens: 2048,
-    };
+    const first = chatModel("first", firstPath, 16_384, 1024);
+    const second = chatModel("second", secondPath, 32_768, 2048);
     const provider = {
       baseUrl: "http://127.0.0.1:29432/v1",
       localService: {
@@ -329,12 +332,10 @@ describe("managed llama-server", () => {
       await ensureManagedLlamaServerForChat({ provider, model });
     }
     const preset = await fs.readFile(presetPath, "utf8");
-    expect(preset).toContain(
+    expectContents(preset, [
       `[first]\nmodel = ${firstPath}\nctx-size = 32768\nn-predict = 4096\njinja = true`,
-    );
-    expect(preset).toContain(
       `[second]\nmodel = ${secondPath}\nctx-size = 32768\nn-predict = 2048\njinja = true`,
-    );
+    ]);
     expect(preset.indexOf("[first]")).toBeLessThan(preset.indexOf("[second]"));
   });
 
@@ -351,18 +352,8 @@ describe("managed llama-server", () => {
     servers.push(firstServer, secondServer);
     const firstPort = await listen(firstServer);
     const secondPort = await listen(secondServer);
-    await prepareManagedLlamaServer({
-      chatModel: { mode: "remove" },
-      configuredChatModelIds: [],
-      embeddingModelPath: "/models/embedding.gguf",
-      port: firstPort,
-    });
-    await prepareManagedLlamaServer({
-      chatModel: { mode: "remove" },
-      configuredChatModelIds: [],
-      embeddingModelPath: "/models/embedding.gguf",
-      port: secondPort,
-    });
+    await prepareEmbedding(firstPort);
+    await prepareEmbedding(secondPort);
     const firstBaseUrl = `http://127.0.0.1:${firstPort}/v1`;
     const secondBaseUrl = `http://127.0.0.1:${secondPort}/v1`;
 
@@ -389,13 +380,7 @@ describe("managed llama-server", () => {
       throw new Error("missing test server address");
     }
     const baseUrl = `http://localhost:${address.port}/v1`;
-    await prepareManagedLlamaServer({
-      chatModel: { mode: "remove" },
-      configuredChatModelIds: [],
-      embeddingModelPath: "/models/embedding.gguf",
-      port: address.port,
-      reconcileBaseUrl: baseUrl,
-    });
+    await prepareEmbedding(address.port, baseUrl);
 
     await reconcileManagedLlamaServer({ baseUrl });
 
@@ -413,12 +398,7 @@ describe("managed llama-server", () => {
     });
     servers.push(server);
     const port = await listen(server);
-    await prepareManagedLlamaServer({
-      chatModel: { mode: "remove" },
-      configuredChatModelIds: [],
-      embeddingModelPath: "/models/embedding.gguf",
-      port,
-    });
+    await prepareEmbedding(port);
     await expect(
       reconcileManagedLlamaServer({ baseUrl: `http://127.0.0.1:${port}/v1` }),
     ).rejects.toThrow("llama.cpp preset reload failed: HTTP 500");
@@ -449,12 +429,7 @@ describe("managed llama-server", () => {
     });
     servers.push(server);
     const port = await listen(server);
-    await prepareManagedLlamaServer({
-      chatModel: { mode: "remove" },
-      configuredChatModelIds: [],
-      embeddingModelPath: "/models/embedding.gguf",
-      port,
-    });
+    await prepareEmbedding(port);
 
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const controller = new AbortController();
@@ -578,15 +553,7 @@ describe("managed llama-server", () => {
           command: path.join(cacheDir, "llama-server"),
           args: ["--models-preset", presetPath],
         };
-        const model = {
-          id: "custom-chat",
-          name: "Custom Chat",
-          reasoning: false,
-          input: ["text" as const],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          params: { modelPath: source, contextSize: 8192 },
-          maxTokens: 1024,
-        };
+        const model = chatModel("custom-chat", source, 8192, 1024);
         const provider = {
           baseUrl: "http://127.0.0.1:19432/v1",
           localService,
@@ -607,46 +574,24 @@ describe("managed llama-server", () => {
 
   it("reports optional metrics separately from runtime readiness and load errors", async () => {
     let metricsAvailable = true;
-    const server = http.createServer((req, res) => {
-      res.setHeader("content-type", "application/json");
-      if (req.url === "/health") {
-        res.end(JSON.stringify({ status: "ok" }));
-        return;
-      }
-      if (req.url === "/models") {
-        res.end(
-          JSON.stringify({
-            data: [
-              {
-                id: "embedding-model",
-                path: "/models/from-models.gguf",
-                status: { value: "loaded" },
-              },
-            ],
-          }),
-        );
-        return;
-      }
-      if (req.url?.startsWith("/props?")) {
-        res.end(
-          JSON.stringify({
-            build_info: "b10357 (689e227db)",
-            model_path: "/models/from-props.gguf",
-            modalities: { vision: false },
-          }),
-        );
-        return;
-      }
-      if (metricsAvailable && req.url?.startsWith("/metrics?")) {
-        res.setHeader("content-type", "text/plain");
-        res.end("llamacpp:prompt_tokens_total 1\n");
-        return;
-      }
-      res.statusCode = 404;
-      res.end("{}");
+    const port = await serveInspection({
+      "/health": () => ({ status: "ok" }),
+      "/models": () => ({
+        data: [
+          {
+            id: "embedding-model",
+            path: "/models/from-models.gguf",
+            status: { value: "loaded" },
+          },
+        ],
+      }),
+      "/props?": () => ({
+        build_info: "b10357 (689e227db)",
+        model_path: "/models/from-props.gguf",
+        modalities: { vision: false },
+      }),
+      "/metrics?": () => (metricsAvailable ? "llamacpp:prompt_tokens_total 1\n" : undefined),
     });
-    servers.push(server);
-    const port = await listen(server);
     const inspect = (loadError?: string) =>
       inspectLlamaServerRuntime({
         baseUrl: `http://127.0.0.1:${port}/v1`,
@@ -691,44 +636,16 @@ describe("managed llama-server", () => {
       };
       // Fixture serialization must not consume the concurrent inspection deadlines.
       let body = responseBytes(1024 * 1024);
-      const server = http.createServer((req, res) => {
-        if (req.url?.startsWith(`/${endpoint}?`)) {
-          res.setHeader("content-type", endpoint === "metrics" ? "text/plain" : "application/json");
-          res.end(body);
-          return;
-        }
-        res.setHeader("content-type", "application/json");
-        if (req.url === "/health") {
-          res.end(JSON.stringify({ status: "ok" }));
-          return;
-        }
-        if (req.url === "/models") {
-          res.end(JSON.stringify({ data: [{ id: "embedding-model" }] }));
-          return;
-        }
-        if (req.url?.startsWith("/props?")) {
-          res.end(JSON.stringify({ modalities: { vision: false } }));
-          return;
-        }
-        if (req.url?.startsWith("/metrics?")) {
-          res.setHeader("content-type", "text/plain");
-          res.end("llamacpp:requests_total 1\n");
-          return;
-        }
-        res.statusCode = 404;
-        res.end("{}");
+      const port = await serveInspection({
+        "/health": () => ({ status: "ok" }),
+        "/models": () => ({ data: [{ id: "embedding-model" }] }),
+        "/props?": () => ({ modalities: { vision: false } }),
+        "/metrics?": () => "llamacpp:requests_total 1\n",
+        [`/${endpoint}?`]: () => body,
       });
-      servers.push(server);
-      await new Promise<void>((resolve) => {
-        server.listen(0, "127.0.0.1", resolve);
-      });
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        throw new Error("missing test server address");
-      }
       const inspect = () =>
         inspectLlamaServerRuntime({
-          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+          baseUrl: `http://127.0.0.1:${port}/v1`,
           modelId: "embedding-model",
         });
 

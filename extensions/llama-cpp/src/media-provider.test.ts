@@ -1,3 +1,4 @@
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type {
   describeImageWithModel,
   describeImagesWithModel,
@@ -88,6 +89,44 @@ function providerMethods() {
   return { single: provider.describeImage, multiple: provider.describeImages };
 }
 
+function configured(cfg: OpenClawConfig) {
+  const provider = cfg.models?.providers?.["llama-cpp"];
+  if (!provider) {
+    throw new Error("fixture provider missing");
+  }
+  return provider;
+}
+
+function visionModel(cfg: OpenClawConfig) {
+  const model = configured(cfg).models.find((entry) => entry.id === VISION);
+  if (!model) {
+    throw new Error("fixture model missing");
+  }
+  return model;
+}
+
+function singleRequest({ images, ...req }: ImagesDescriptionRequest): ImageDescriptionRequest {
+  const image = images[0];
+  if (!image) {
+    throw new Error("fixture image missing");
+  }
+  return { ...req, ...image };
+}
+
+function prepare(req: ImagesDescriptionRequest, config = req.cfg) {
+  req.preparedModelRuntime = { agentDir: req.agentDir, config, createStores: () => ({}) };
+}
+
+function expectNoGenericTransport() {
+  expect(transport.single).not.toHaveBeenCalled();
+  expect(transport.multiple).not.toHaveBeenCalled();
+}
+
+async function expectRejected(req: ImagesDescriptionRequest, message?: string) {
+  await expect(providerMethods().multiple(req)).rejects.toThrow(message);
+  expect(transport.managed).not.toHaveBeenCalled();
+}
+
 async function transformedPayload(payload: unknown) {
   const call = transport.managed.mock.calls[0];
   if (!call?.[1]) {
@@ -103,67 +142,51 @@ beforeEach(() => {
   transport.managed.mockResolvedValue({ text: "local result" });
 });
 
-afterEach(() => {
-  vi.unstubAllEnvs();
-});
+afterEach(() => vi.unstubAllEnvs());
 
 describe("llama-cpp registered media provider", () => {
-  it.each(["Describe the colors."])(
-    "uses the OCR recipe task token for the selected OCR model: %s",
-    async (prompt) => {
-      const req = request({ model: OCR, prompt });
-      const original = structuredClone(req.images);
-      await providerMethods().multiple(req);
-      expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({ model: OCR, prompt: "Text Recognition:" }),
-        expect.any(Function),
-      );
-      const imagePart = { type: "image_url", image_url: { url: "data:image/png;base64,fixture" } };
-      const payload = {
-        model: OCR,
-        messages: [
-          { role: "system", content: "Text Recognition:" },
-          { role: "user", content: [imagePart] },
-        ],
-        max_tokens: 2048,
-      };
-      expect(await transformedPayload(payload)).toEqual({
-        model: OCR,
-        messages: [
-          { role: "user", content: [imagePart, { type: "text", text: "Text Recognition:" }] },
-        ],
-        max_tokens: 2048,
-        temperature: 0,
-        seed: 4827,
-      });
-      expect(payload.messages).toHaveLength(2);
-      expect(Buffer.from(original[0]?.buffer ?? [])).toEqual(req.images[0]?.buffer);
-      expect(transport.single).not.toHaveBeenCalled();
-      expect(transport.multiple).not.toHaveBeenCalled();
-    },
-  );
+  it("uses the selected OCR recipe task token", async () => {
+    const req = request({ model: OCR, prompt: "Describe the colors." });
+    const original = structuredClone(req.images);
+    await providerMethods().multiple(req);
+    expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ model: OCR, prompt: "Text Recognition:" }),
+      expect.any(Function),
+    );
+    const imagePart = { type: "image_url", image_url: { url: "data:image/png;base64,fixture" } };
+    const payload = {
+      model: OCR,
+      messages: [
+        { role: "system", content: "Text Recognition:" },
+        { role: "user", content: [imagePart] },
+      ],
+      max_tokens: 2048,
+    };
+    expect(await transformedPayload(payload)).toEqual({
+      model: OCR,
+      messages: [
+        { role: "user", content: [imagePart, { type: "text", text: "Text Recognition:" }] },
+      ],
+      max_tokens: 2048,
+      temperature: 0,
+      seed: 4827,
+    });
+    expect(payload.messages).toHaveLength(2);
+    expect(Buffer.from(original[0]?.buffer ?? [])).toEqual(req.images[0]?.buffer);
+    expectNoGenericTransport();
+  });
 
   it("routes a single image through the same managed images transport with signal and prepared facts", async () => {
     const signal = new AbortController().signal;
     const base = request({ signal, prompt: undefined });
-    base.preparedModelRuntime = {
-      agentDir: base.agentDir,
-      config: base.cfg,
-      createStores: () => ({}),
-    };
-    const { images, ...req } = base;
-    const image = images[0];
-    if (!image) {
-      throw new Error("fixture image missing");
-    }
-    const single: ImageDescriptionRequest = { ...req, ...image };
-    await providerMethods().single(single);
+    prepare(base);
+    await providerMethods().single(singleRequest(base));
     expect(transport.managed).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        images: [image],
+        images: base.images,
         signal,
-        cfg: req.cfg,
-        preparedModelRuntime: req.preparedModelRuntime,
+        cfg: base.cfg,
+        preparedModelRuntime: base.preparedModelRuntime,
         prompt: "Describe the image.",
       }),
       expect.any(Function),
@@ -175,13 +198,8 @@ describe("llama-cpp registered media provider", () => {
     const req = request({ cfg: {}, model: "external-custom-vision" });
     await hooks.multiple(req);
     expect(transport.multiple).toHaveBeenCalledExactlyOnceWith(req);
-    const { images, ...single } = req;
-    const image = images[0];
-    if (!image) {
-      throw new Error("fixture image missing");
-    }
-    await hooks.single({ ...single, ...image });
-    expect(transport.single).toHaveBeenCalledExactlyOnceWith({ ...single, ...image });
+    await hooks.single(singleRequest(req));
+    expect(transport.single).toHaveBeenCalledExactlyOnceWith(singleRequest(req));
     await hooks.multiple(request({ model: "my-other-image-model" }));
     expect(transport.managed).not.toHaveBeenCalled();
   });
@@ -190,87 +208,46 @@ describe("llama-cpp registered media provider", () => {
     transport.managed.mockRejectedValueOnce(new Error("projector load failed"));
     await expect(providerMethods().multiple(request())).rejects.toThrow("projector load failed");
     expect(transport.managed).toHaveBeenCalledTimes(1);
-    expect(transport.single).not.toHaveBeenCalled();
-    expect(transport.multiple).not.toHaveBeenCalled();
+    expectNoGenericTransport();
   });
 
-  it.each([{ ocr: OCR }])(
-    "fails closed for incomplete saved local routes: %j",
-    async (mediaModels) => {
-      const req = request();
-      const configured = req.cfg.models?.providers?.["llama-cpp"];
-      const image = req.images[0];
-      if (!configured || !image) {
-        throw new Error("fixture provider or image missing");
-      }
-      configured.params = { mediaModels };
-      configured.baseUrl = "https://cloud.example.test/v1";
-      const hooks = providerMethods();
-      await expect(hooks.multiple(req)).rejects.toThrow("local media routes are incomplete");
-      const { images: _images, ...single } = req;
-      await expect(hooks.single({ ...single, ...image })).rejects.toThrow(
-        "local media routes are incomplete",
-      );
-      expect(transport.managed).not.toHaveBeenCalled();
-      expect(transport.single).not.toHaveBeenCalled();
-      expect(transport.multiple).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["https://cloud.example.test/v1", "http://127.0.0.1.example.test:19432/v1", "not-a-url"])(
-    "rejects an untrusted managed endpoint before transport: %s",
-    async (baseUrl) => {
-      const req = request();
-      const provider = req.cfg.models?.providers?.["llama-cpp"];
-      if (!provider) {
-        throw new Error("fixture provider missing");
-      }
-      provider.baseUrl = baseUrl;
-      await expect(providerMethods().multiple(req)).rejects.toThrow("loopback");
-      expect(transport.managed).not.toHaveBeenCalled();
-    },
-  );
+  it("fails closed for incomplete saved local routes", async () => {
+    const req = request();
+    const provider = configured(req.cfg);
+    provider.params = { mediaModels: { ocr: OCR } };
+    provider.baseUrl = "https://cloud.example.test/v1";
+    const hooks = providerMethods();
+    await expect(hooks.multiple(req)).rejects.toThrow("local media routes are incomplete");
+    await expect(hooks.single(singleRequest(req))).rejects.toThrow(
+      "local media routes are incomplete",
+    );
+    expect(transport.managed).not.toHaveBeenCalled();
+    expectNoGenericTransport();
+  });
 
   it.each([
-    { username: "fixture-user", password: "" },
-    { username: "", password: "fixture-password" },
-  ])("rejects synthetic URL credentials before transport: %j", async (credentials) => {
-    const endpoint = new URL("http://127.0.0.1:19432/v1");
-    endpoint.username = credentials.username;
-    endpoint.password = credentials.password;
+    "https://cloud.example.test/v1",
+    "http://127.0.0.1.example.test:19432/v1",
+    "not-a-url",
+    "http://fixture-user@127.0.0.1:19432/v1",
+    "http://:fixture-password@127.0.0.1:19432/v1",
+  ])("rejects an untrusted managed endpoint before transport: %s", async (baseUrl) => {
     const req = request();
-    const provider = req.cfg.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
-    provider.baseUrl = endpoint.href;
-    await expect(providerMethods().multiple(req)).rejects.toThrow("loopback");
-    expect(transport.managed).not.toHaveBeenCalled();
-    expect(transport.single).not.toHaveBeenCalled();
-    expect(transport.multiple).not.toHaveBeenCalled();
+    configured(req.cfg).baseUrl = baseUrl;
+    await expectRejected(req, "loopback");
+    expectNoGenericTransport();
   });
 
-  it.each(["http://[::1]:19432/v1"])(
-    "accepts numeric loopback managed endpoints: %s",
-    async (baseUrl) => {
-      const req = request();
-      const provider = req.cfg.models?.providers?.["llama-cpp"];
-      if (!provider) {
-        throw new Error("fixture provider missing");
-      }
-      provider.baseUrl = baseUrl;
-      await providerMethods().multiple(req);
-      expect(transport.managed).toHaveBeenCalledOnce();
-    },
-  );
+  it("accepts numeric IPv6 loopback endpoints", async () => {
+    const req = request();
+    configured(req.cfg).baseUrl = "http://[::1]:19432/v1";
+    await providerMethods().multiple(req);
+    expect(transport.managed).toHaveBeenCalledOnce();
+  });
 
   it("rejects missing managed ownership and provider identity substitution", async () => {
     const req = request();
-    const provider = req.cfg.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
-    delete provider.localService;
+    delete configured(req.cfg).localService;
     await expect(providerMethods().multiple(req)).rejects.toThrow("loopback");
     await expect(providerMethods().multiple(request({ provider: "openai" }))).rejects.toThrow(
       "loopback",
@@ -280,67 +257,37 @@ describe("llama-cpp registered media provider", () => {
 
   it("rejects text-only configured image inventory", async () => {
     const req = request();
-    const provider = req.cfg.models?.providers?.["llama-cpp"];
-    const model = provider?.models.find((entry) => entry.id === VISION);
-    if (!provider || !model) {
-      throw new Error("fixture model missing");
-    }
-    model.input = ["text"];
-    await expect(providerMethods().multiple(req)).rejects.toThrow("model is unavailable");
-    expect(transport.managed).not.toHaveBeenCalled();
+    visionModel(req.cfg).input = ["text"];
+    await expectRejected(req, "model is unavailable");
   });
 
-  it.each(["https://cloud.example.test/v1"])(
-    "rejects a configured model endpoint override: %s",
-    async (baseUrl) => {
-      const req = request();
-      const model = req.cfg.models?.providers?.["llama-cpp"]?.models.find(
-        (entry) => entry.id === VISION,
-      );
-      if (!model) {
-        throw new Error("fixture model missing");
-      }
-      model.baseUrl = baseUrl;
-      req.preparedModelRuntime = {
-        agentDir: req.agentDir,
-        config: req.cfg,
-        createStores: () => ({}),
-      };
-      await expect(providerMethods().multiple(req)).rejects.toThrow("endpoint must match");
-      expect(transport.managed).not.toHaveBeenCalled();
-      expect(transport.multiple).not.toHaveBeenCalled();
-    },
-  );
+  it("rejects a configured model endpoint override", async () => {
+    const req = request();
+    visionModel(req.cfg).baseUrl = "https://cloud.example.test/v1";
+    prepare(req);
+    await expectRejected(req, "endpoint must match");
+    expect(transport.multiple).not.toHaveBeenCalled();
+  });
 
   it.each([
     { field: "modelPath", source: "hf:unknown/model/model.gguf" },
     { field: "mmprojPath", source: "hf:unknown/projector/mmproj.gguf" },
   ])("rejects a changed or missing curated artifact: $field $source", async ({ field, source }) => {
     const req = request();
-    const model = req.cfg.models?.providers?.["llama-cpp"]?.models.find(
-      (entry) => entry.id === VISION,
-    );
+    const model = visionModel(req.cfg);
     if (!model?.params) {
       throw new Error("fixture model artifacts missing");
     }
     model.params[field] = source;
-    await expect(providerMethods().multiple(req)).rejects.toThrow(
-      "must match the verified recipe artifacts. Rerun local media setup",
-    );
-    expect(transport.managed).not.toHaveBeenCalled();
-    expect(transport.single).not.toHaveBeenCalled();
-    expect(transport.multiple).not.toHaveBeenCalled();
+    await expectRejected(req, "must match the verified recipe artifacts. Rerun local media setup");
+    expectNoGenericTransport();
   });
 
   it.each([{ provider: "openai" }, { id: OCR }, { baseUrl: "https://cloud.example.test/v1" }])(
     "blocks a prepared runtime's changed final transport target: %j",
     async (override) => {
       const req = request();
-      req.preparedModelRuntime = {
-        agentDir: req.agentDir,
-        config: req.cfg,
-        createStores: () => ({}),
-      };
+      prepare(req);
       const send = vi.fn();
       transport.managed.mockImplementationOnce(async (_req, transform) => {
         if (!transform) {
@@ -357,8 +304,7 @@ describe("llama-cpp registered media provider", () => {
         "resolved local image model must match",
       );
       expect(send).not.toHaveBeenCalled();
-      expect(transport.single).not.toHaveBeenCalled();
-      expect(transport.multiple).not.toHaveBeenCalled();
+      expectNoGenericTransport();
     },
   );
 
@@ -395,23 +341,17 @@ describe("llama-cpp registered media provider", () => {
     const result = providerMethods().multiple(request());
     await expect(result).rejects.toThrow("NO_PROXY");
     expect(send).not.toHaveBeenCalled();
-    expect(transport.single).not.toHaveBeenCalled();
-    expect(transport.multiple).not.toHaveBeenCalled();
+    expectNoGenericTransport();
   });
 
   it("rejects a retained runtime's explicit proxy before transport", async () => {
     const req = request();
     const config = structuredClone(req.cfg);
-    const provider = config.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
-    provider.request = {
+    configured(config).request = {
       proxy: { mode: "explicit-proxy", url: "http://proxy.example.test:8080" },
     };
-    req.preparedModelRuntime = { agentDir: req.agentDir, config, createStores: () => ({}) };
-    await expect(providerMethods().multiple(req)).rejects.toThrow("direct loopback");
-    expect(transport.managed).not.toHaveBeenCalled();
+    prepare(req, config);
+    await expectRejected(req, "direct loopback");
   });
 
   it.each(["modelPath", "mmprojPath"] as const)(
@@ -419,30 +359,19 @@ describe("llama-cpp registered media provider", () => {
     async (field) => {
       const req = request();
       const config = structuredClone(req.cfg);
-      const model = config.models?.providers?.["llama-cpp"]?.models.find(
-        (entry) => entry.id === req.model,
-      );
-      if (!model) {
-        throw new Error("fixture model missing");
-      }
+      const model = visionModel(config);
       model.params = { ...model.params, [field]: "hf:custom/model/other.gguf" };
-      req.preparedModelRuntime = { agentDir: req.agentDir, config, createStores: () => ({}) };
-      await expect(providerMethods().multiple(req)).rejects.toThrow("verified recipe artifacts");
-      expect(transport.managed).not.toHaveBeenCalled();
+      prepare(req, config);
+      await expectRejected(req, "verified recipe artifacts");
     },
   );
 
   it("rejects a retained runtime's changed loopback endpoint before transport", async () => {
     const req = request();
     const config = structuredClone(req.cfg);
-    const provider = config.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
-    provider.baseUrl = "http://127.0.0.1:19433/v1";
-    req.preparedModelRuntime = { agentDir: req.agentDir, config, createStores: () => ({}) };
-    await expect(providerMethods().multiple(req)).rejects.toThrow("endpoint must match");
-    expect(transport.managed).not.toHaveBeenCalled();
+    configured(config).baseUrl = "http://127.0.0.1:19433/v1";
+    prepare(req, config);
+    await expectRejected(req, "endpoint must match");
   });
 
   it.each([
@@ -452,15 +381,11 @@ describe("llama-cpp registered media provider", () => {
       { buffer: IMAGE, fileName: "two.png" },
     ],
   ])("rejects empty, oversized, or multiple image input before transport", async (...images) => {
-    await expect(providerMethods().multiple(request({ images }))).rejects.toThrow();
-    expect(transport.managed).not.toHaveBeenCalled();
+    await expectRejected(request({ images }));
   });
 
-  it.each([0])("rejects invalid output token budget %s", async (maxTokens) => {
-    await expect(providerMethods().multiple(request({ maxTokens }))).rejects.toThrow(
-      "positive finite",
-    );
-    expect(transport.managed).not.toHaveBeenCalled();
+  it("rejects a zero output token budget", async () => {
+    await expectRejected(request({ maxTokens: 0 }), "positive finite");
   });
 
   it("carries cancellation to shared inference and refuses results after cancellation", async () => {
@@ -485,10 +410,7 @@ describe("llama-cpp registered media provider", () => {
     await expect(
       transformedPayload({ messages: [{ role: "user", content: "plain text" }] }),
     ).rejects.toThrow("OpenAI image request format");
-    const provider = req.cfg.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
+    const provider = configured(req.cfg);
     provider.params = { mediaModels: { ocr: OCR, vision: "missing-recipe" } };
     provider.models.push({ ...provider.models[0]!, id: "missing-recipe" });
     await expect(providerMethods().multiple({ ...req, model: "missing-recipe" })).rejects.toThrow(

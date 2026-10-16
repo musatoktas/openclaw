@@ -24,6 +24,55 @@ import {
 import * as mediaCatalog from "./media-catalog.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const activeChat = "version = 1\n\n[chat]\nmodel = /models/chat.gguf\n";
+const visionModel = {
+  id: "vision",
+  path: "/models/vision.gguf",
+  projectorPath: "/models/mmproj.gguf",
+};
+type ChatRequest = Parameters<typeof ensureManagedLlamaServerForChat>[0];
+
+function mediaRequest(
+  root: string,
+  recipe: mediaCatalog.LlamaCppMediaRecipe,
+  provider: Partial<ChatRequest["provider"]> = {},
+  modelParams: Record<string, unknown> = {},
+): ChatRequest {
+  return {
+    provider: {
+      baseUrl: "http://127.0.0.1:19432/v1",
+      localService: {
+        command: path.join(root, "llama-server"),
+        args: ["--models-preset", path.join(root, "models.ini")],
+      },
+      models: [],
+      params: { modelCacheDir: root, mediaModels: { ocr: recipe.id, vision: "vision" } },
+      ...provider,
+    },
+    model: {
+      id: recipe.id,
+      params: {
+        modelPath: recipe.model.source,
+        mmprojPath: recipe.projector.source,
+        ...modelParams,
+      },
+    },
+  };
+}
+
+function prepareMedia(options: Partial<Parameters<typeof prepareManagedLlamaServer>[0]> = {}) {
+  return prepareManagedLlamaServer({
+    chatModel: { mode: "preserve" },
+    mediaModels: [visionModel],
+    isolated: true,
+    modelsMax: 1,
+    ...options,
+  });
+}
+
+function presetPathFor(candidate: Awaited<ReturnType<typeof prepareManagedLlamaServer>>) {
+  return resolveLlamaCppPresetPath({ command: candidate.command, args: candidate.args })!;
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -62,127 +111,88 @@ function useSmallMediaArtifacts(payload = "GGUF") {
 }
 
 describe("managed llama.cpp media artifacts and presets", () => {
-  it.each(["none"])(
-    "isolates media verification and pins both model and projector to %s",
-    async (device) => {
-      const { tempRoot, presetPath } = await createPresetFixture("media-candidate");
-      const header = "version = 1\r\n; operator defaults\r\n[*]\r\nthreads = 6\r\n\r\n";
-      const chat =
-        "[chat]\r\n; chat stays available\r\nmodel = /models/chat.gguf\r\nn-gpu-layers = 7";
-      const custom = "[custom]\r\nmodel = /models/custom.gguf\r\nctx-size = 8192";
-      const embedding =
-        "[embeddinggemma-300m-qat-q8_0]\r\nmodel = /models/embedding.gguf\r\nembedding = true\r\npooling = mean";
-      const oldMedia = [
-        "[ocr]",
-        "mm = /models/old-projector.gguf ; projector comment",
-        "LLAMA_ARG_IMAGE_MAX_TOKENS = 4096",
-        "np = 8",
-        "dev = CUDA0,CUDA1",
-        "mmdev = CUDA0",
-        "sm = layer",
-        "load-on-startup = true",
-      ].join("\r\n");
-      const active = header + [chat, custom, oldMedia, embedding].join("\r\n\r\n") + "\r\n";
-      await fs.writeFile(presetPath, active);
-      const asset = selectLlamaServerAsset("linux", "x64");
-      const controller = new AbortController();
-      const localService = {
-        command: path.join(tempRoot, "old-server"),
-        args: [
-          "--host=0.0.0.0",
-          "--port",
-          "19431",
-          `--models-preset=${presetPath}`,
-          "--models-max",
-          "2",
-          "--threads",
-          "6",
-          "--metrics",
-        ],
-        healthUrl: "http://127.0.0.1:19431/health",
-      };
-      const candidate = await prepareManagedLlamaServer({
-        chatModel: { mode: "preserve" },
-        mediaModels: ["ocr", "vision"].map((id) => ({
-          id,
-          path: `/models/${id}.gguf`,
-          projectorPath: `/models/${id}-projector.gguf`,
-          contextSize: 4096,
-          maxTokens: 512,
-          imageMaxTokens: 1024,
-          device,
-        })),
-        asset,
-        localService,
-        isolated: true,
-        modelsMax: 1,
-        port: 19435,
-        signal: controller.signal,
-      });
+  it("isolates media verification and pins both model and projector to none", async () => {
+    const device = "none";
+    const { tempRoot, presetPath } = await createPresetFixture("media-candidate");
+    const header = "version = 1\r\n; operator defaults\r\n[*]\r\nthreads = 6\r\n\r\n";
+    const chat =
+      "[chat]\r\n; chat stays available\r\nmodel = /models/chat.gguf\r\nn-gpu-layers = 7";
+    const custom = "[custom]\r\nmodel = /models/custom.gguf\r\nctx-size = 8192";
+    const embedding =
+      "[embeddinggemma-300m-qat-q8_0]\r\nmodel = /models/embedding.gguf\r\nembedding = true\r\npooling = mean";
+    const oldMedia =
+      "[ocr]\r\nmm = /models/old-projector.gguf ; projector comment\r\nLLAMA_ARG_IMAGE_MAX_TOKENS = 4096\r\nnp = 8\r\ndev = CUDA0,CUDA1\r\nmmdev = CUDA0\r\nsm = layer\r\nload-on-startup = true";
+    const active = header + [chat, custom, oldMedia, embedding].join("\r\n\r\n") + "\r\n";
+    await fs.writeFile(presetPath, active);
+    const asset = selectLlamaServerAsset("linux", "x64");
+    const controller = new AbortController();
+    const localService = {
+      command: path.join(tempRoot, "old-server"),
+      args: [
+        ..."--host=0.0.0.0 --port 19431".split(" "),
+        `--models-preset=${presetPath}`,
+        ..."--models-max 2 --threads 6 --metrics".split(" "),
+      ],
+      healthUrl: "http://127.0.0.1:19431/health",
+    };
+    const candidate = await prepareMedia({
+      mediaModels: ["ocr", "vision"].map((id) => ({
+        id,
+        path: `/models/${id}.gguf`,
+        projectorPath: `/models/${id}-projector.gguf`,
+        contextSize: 4096,
+        maxTokens: 512,
+        imageMaxTokens: 1024,
+        device,
+      })),
+      asset,
+      localService,
+      port: 19435,
+      signal: controller.signal,
+    });
 
-      expect(candidate.command).toBe(path.join(tempRoot, "llama-server"));
-      expect(installMocks.ensureLlamaServerInstalled).toHaveBeenCalledWith(
-        expect.objectContaining({ asset, signal: controller.signal }),
-      );
-      expect(candidate.baseUrl).toBe("http://127.0.0.1:19435/v1");
-      expect(candidate.healthUrl).toBe("http://127.0.0.1:19435/health");
-      const candidatePreset = resolveLlamaCppPresetPath({
-        command: candidate.command,
-        args: candidate.args,
-      })!;
-      expect(candidatePreset).not.toBe(presetPath);
-      expect(candidate.args).toEqual([
-        "--threads",
-        "6",
-        "--metrics",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "19435",
-        "--models-preset",
-        candidatePreset,
-        "--models-max",
-        "1",
-      ]);
-      expect(await fs.readFile(presetPath, "utf8")).toBe(active);
-      const prepared = await fs.readFile(candidatePreset, "utf8");
-      expect(prepared.startsWith(header)).toBe(true);
-      for (const retained of [chat, custom, embedding]) {
-        expect(prepared).toContain(retained);
-      }
-      for (const id of ["ocr", "vision"]) {
-        expect(prepared).toContain(`mmproj = /models/${id}-projector.gguf`);
-      }
-      expect(prepared).toContain("mmproj = /models/ocr-projector.gguf ; projector comment");
-      expect(prepared.match(new RegExp(`^device = ${device}$`, "gm"))).toHaveLength(2);
-      expect(prepared.match(new RegExp(`^mmproj-device = ${device}$`, "gm"))).toHaveLength(2);
-      expect(prepared.match(/^split-mode = none$/gm)).toHaveLength(2);
-      expect(prepared.match(/^load-on-startup = false$/gm)).toHaveLength(2);
-      expect(prepared.match(/^parallel = 1$/gm)).toHaveLength(2);
-      expect(prepared).not.toMatch(/^(?:mm|dev|mmdev|sm|np|LLAMA_ARG_IMAGE_MAX_TOKENS) =/m);
-    },
-  );
+    expect(candidate).toMatchObject({
+      command: path.join(tempRoot, "llama-server"),
+      baseUrl: "http://127.0.0.1:19435/v1",
+      healthUrl: "http://127.0.0.1:19435/health",
+    });
+    expect(installMocks.ensureLlamaServerInstalled).toHaveBeenCalledWith(
+      expect.objectContaining({ asset, signal: controller.signal }),
+    );
+    const candidatePreset = presetPathFor(candidate);
+    expect(candidatePreset).not.toBe(presetPath);
+    expect(candidate.args).toEqual([
+      ..."--threads 6 --metrics --host 127.0.0.1 --port 19435 --models-preset".split(" "),
+      candidatePreset,
+      "--models-max",
+      "1",
+    ]);
+    expect(await fs.readFile(presetPath, "utf8")).toBe(active);
+    const prepared = await fs.readFile(candidatePreset, "utf8");
+    expect(prepared.startsWith(header)).toBe(true);
+    for (const retained of [chat, custom, embedding]) {
+      expect(prepared).toContain(retained);
+    }
+    for (const id of ["ocr", "vision"]) {
+      expect(prepared).toContain(`mmproj = /models/${id}-projector.gguf`);
+    }
+    expect(prepared).toContain("mmproj = /models/ocr-projector.gguf ; projector comment");
+    expect(prepared.match(new RegExp(`^device = ${device}$`, "gm"))).toHaveLength(2);
+    expect(prepared.match(new RegExp(`^mmproj-device = ${device}$`, "gm"))).toHaveLength(2);
+    expect(prepared.match(/^split-mode = none$/gm)).toHaveLength(2);
+    expect(prepared.match(/^load-on-startup = false$/gm)).toHaveLength(2);
+    expect(prepared.match(/^parallel = 1$/gm)).toHaveLength(2);
+    expect(prepared).not.toMatch(/^(?:mm|dev|mmdev|sm|np|LLAMA_ARG_IMAGE_MAX_TOKENS) =/m);
+  });
 
   it("prepares media-only presets without inventing an embedding model", async () => {
     await createPresetFixture("media-only");
-    const candidate = await prepareManagedLlamaServer({
-      chatModel: { mode: "preserve" },
-      mediaModels: [
-        { id: "vision", path: "/models/vision.gguf", projectorPath: "/models/mmproj.gguf" },
-      ],
-      isolated: true,
-      modelsMax: 1,
-      port: 19437,
-    });
-    const preset = resolveLlamaCppPresetPath({ command: candidate.command, args: candidate.args })!;
-    expect(await fs.readFile(preset, "utf8")).toContain("[vision]");
-    expect(await fs.readFile(preset, "utf8")).not.toContain("embedding");
-    expect(
-      candidate.args.slice(
-        candidate.args.indexOf("--models-max"),
-        candidate.args.indexOf("--models-max") + 2,
-      ),
-    ).toEqual(["--models-max", "1"]);
+    const candidate = await prepareMedia({ port: 19437 });
+    const preset = await fs.readFile(presetPathFor(candidate), "utf8");
+    expect(preset).toContain("[vision]");
+    expect(preset).not.toContain("embedding");
+    const modelsMax = candidate.args.indexOf("--models-max");
+    expect(candidate.args.slice(modelsMax, modelsMax + 2)).toEqual(["--models-max", "1"]);
   });
 
   it("stops cancelled media preparation before publishing a preset", async () => {
@@ -192,17 +202,9 @@ describe("managed llama.cpp media artifacts and presets", () => {
       controller.abort(new Error("setup cancelled"));
       return { command: path.join(tempRoot, "llama-server") };
     });
-    await expect(
-      prepareManagedLlamaServer({
-        chatModel: { mode: "preserve" },
-        mediaModels: [
-          { id: "vision", path: "/models/vision.gguf", projectorPath: "/models/mmproj.gguf" },
-        ],
-        isolated: true,
-        modelsMax: 1,
-        signal: controller.signal,
-      }),
-    ).rejects.toBe(controller.signal.reason);
+    await expect(prepareMedia({ signal: controller.signal })).rejects.toBe(
+      controller.signal.reason,
+    );
     expect(await fs.readdir(tempRoot)).toEqual(["llama-server"]);
   });
 
@@ -211,8 +213,7 @@ describe("managed llama.cpp media artifacts and presets", () => {
     async (outcome) => {
       const recipe = useSmallMediaArtifacts();
       const { tempRoot, presetPath } = await createPresetFixture("media-invalid-projector");
-      const active = "version = 1\n\n[chat]\nmodel = /models/chat.gguf\n";
-      await fs.writeFile(presetPath, active);
+      await fs.writeFile(presetPath, activeChat);
       await fs.writeFile(path.join(tempRoot, recipe.model.fileName), "GGUF");
       if (outcome !== "missing") {
         await fs.writeFile(
@@ -221,24 +222,10 @@ describe("managed llama.cpp media artifacts and presets", () => {
         );
       }
       const fetch = vi.spyOn(globalThis, "fetch");
-      await expect(
-        ensureManagedLlamaServerForChat({
-          provider: {
-            baseUrl: "http://127.0.0.1:19432/v1",
-            localService: {
-              command: path.join(tempRoot, "llama-server"),
-              args: ["--models-preset", presetPath],
-            },
-            models: [],
-            params: { modelCacheDir: tempRoot, mediaModels: { ocr: recipe.id, vision: "vision" } },
-          },
-          model: {
-            id: recipe.id,
-            params: { modelPath: recipe.model.source, mmprojPath: recipe.projector.source },
-          },
-        }),
-      ).rejects.toThrow(/Model is not cached.*--method local-media/u);
-      expect(await fs.readFile(presetPath, "utf8")).toBe(active);
+      await expect(ensureManagedLlamaServerForChat(mediaRequest(tempRoot, recipe))).rejects.toThrow(
+        /Model is not cached.*--method local-media/u,
+      );
+      expect(await fs.readFile(presetPath, "utf8")).toBe(activeChat);
       expect(fetch).not.toHaveBeenCalled();
       expect(installMocks.ensureLlamaServerInstalled).not.toHaveBeenCalled();
     },
@@ -257,29 +244,16 @@ describe("managed llama.cpp media artifacts and presets", () => {
   it("passes media inference cancellation through model preparation before touching the preset", async () => {
     const recipe = useSmallMediaArtifacts();
     const { tempRoot, presetPath } = await createPresetFixture("media-abort-inference");
-    const active = "version = 1\n\n[chat]\nmodel = /models/chat.gguf\n";
-    await fs.writeFile(presetPath, active);
+    await fs.writeFile(presetPath, activeChat);
     const controller = new AbortController();
     controller.abort(new Error("image request cancelled"));
     await expect(
       ensureManagedLlamaServerForChat({
-        provider: {
-          baseUrl: "http://127.0.0.1:19432/v1",
-          localService: {
-            command: path.join(tempRoot, "llama-server"),
-            args: ["--models-preset", presetPath],
-          },
-          models: [],
-          params: { modelCacheDir: tempRoot, mediaModels: { ocr: recipe.id, vision: "vision" } },
-        },
-        model: {
-          id: recipe.id,
-          params: { modelPath: recipe.model.source, mmprojPath: recipe.projector.source },
-        },
+        ...mediaRequest(tempRoot, recipe),
         signal: controller.signal,
       }),
     ).rejects.toBe(controller.signal.reason);
-    expect(await fs.readFile(presetPath, "utf8")).toBe(active);
+    expect(await fs.readFile(presetPath, "utf8")).toBe(activeChat);
     expect(installMocks.ensureLlamaServerInstalled).not.toHaveBeenCalled();
   });
 
@@ -292,28 +266,22 @@ describe("managed llama.cpp media artifacts and presets", () => {
       await fs.writeFile(path.join(tempRoot, artifact.fileName), "GGUF");
     }
     const fetch = vi.spyOn(globalThis, "fetch");
-    await ensureManagedLlamaServerForChat({
-      provider: {
-        baseUrl: "http://127.0.0.1:19432/v1",
-        localService: {
-          command: path.join(tempRoot, "llama-server"),
-          args: ["--models-preset", presetPath, "--models-max", "1"],
+    await ensureManagedLlamaServerForChat(
+      mediaRequest(
+        tempRoot,
+        recipe,
+        {
+          localService: {
+            command: path.join(tempRoot, "llama-server"),
+            args: ["--models-preset", presetPath, "--models-max", "1"],
+          },
+          models: [
+            buildLlamaCppModel({ id: "custom-chat", name: "Chat", source: "/models/chat.gguf" }),
+          ],
         },
-        models: [
-          buildLlamaCppModel({ id: "custom-chat", name: "Chat", source: "/models/chat.gguf" }),
-        ],
-        params: { modelCacheDir: tempRoot, mediaModels: { ocr: recipe.id, vision: "vision" } },
-      },
-      model: {
-        id: recipe.id,
-        params: {
-          modelPath: recipe.model.source,
-          mmprojPath: recipe.projector.source,
-          imageMaxTokens: 512,
-          device: "CUDA1",
-        },
-      },
-    });
+        { imageMaxTokens: 512, device: "CUDA1" },
+      ),
+    );
     const preset = await fs.readFile(presetPath, "utf8");
     expect(preset).toContain(chat);
     expect(preset).not.toContain("[stale]");

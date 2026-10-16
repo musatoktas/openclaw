@@ -50,6 +50,14 @@ function configured(): OpenClawConfig {
   };
 }
 
+function configuredProvider(cfg: OpenClawConfig) {
+  const provider = cfg.models?.providers?.["llama-cpp"];
+  if (!provider) {
+    throw new Error("fixture provider missing");
+  }
+  return provider;
+}
+
 function capture(ctx: OpenClawPluginToolContext = {}, cfg = configured()) {
   const loadWebMedia = vi.fn(async () => ({
     buffer: IMAGE,
@@ -87,19 +95,36 @@ function capture(ctx: OpenClawPluginToolContext = {}, cfg = configured()) {
   if (Array.isArray(tool)) {
     throw new Error("local_image must register one tool");
   }
-  return { api, tool, describeImage, loadWebMedia };
+  async function run(input: unknown = { path: "fixture.png" }, signal?: AbortSignal) {
+    if (!tool) {
+      throw new Error("Expected the configured local_image tool");
+    }
+    return await tool.execute("test", input, signal);
+  }
+  return { api, tool, run, describeImage, loadWebMedia };
 }
 
-function requireTool(fixture: ReturnType<typeof capture>) {
-  if (!fixture.tool) {
-    throw new Error("Expected the configured local_image tool");
-  }
-  return fixture.tool;
+async function expectBlocked(
+  fixture: ReturnType<typeof capture>,
+  input: unknown,
+  message?: string,
+) {
+  await expect(fixture.run(input)).rejects.toThrow(message);
+  expect(fixture.loadWebMedia).not.toHaveBeenCalled();
+  expect(fixture.describeImage).not.toHaveBeenCalled();
+}
+
+async function captureReal(ctx: OpenClawPluginToolContext, cfg = configured()) {
+  const fixture = capture(ctx, cfg);
+  fixture.api.runtime.media.loadWebMedia = (
+    await import("openclaw/plugin-sdk/web-media")
+  ).loadWebMedia;
+  return fixture;
 }
 
 describe("registered local_image tool", () => {
   it("declares the registered tool for manifest-driven lazy discovery", () => {
-    expect(manifest.contracts.tools).toContain(requireTool(capture()).name);
+    expect(manifest.contracts.tools).toContain(capture().tool?.name);
   });
 
   it.each([{ task: "vision", prompt: "Which shape is above the circle?", model: "local-vision" }])(
@@ -107,11 +132,7 @@ describe("registered local_image tool", () => {
     async ({ task, prompt, model }) => {
       const fixture = capture();
       const controller = new AbortController();
-      const result = await requireTool(fixture).execute(
-        "test",
-        { path: "fixture.png", task, prompt },
-        controller.signal,
-      );
+      const result = await fixture.run({ path: "fixture.png", task, prompt }, controller.signal);
       expect(fixture.describeImage).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
           buffer: IMAGE,
@@ -140,45 +161,28 @@ describe("registered local_image tool", () => {
     { path: "fixture.png", prompt: "x".repeat(8193) },
   ])("rejects invalid input without loading or inference: $path", async (input) => {
     const fixture = capture();
-    await expect(requireTool(fixture).execute("test", input)).rejects.toThrow();
-    expect(fixture.loadWebMedia).not.toHaveBeenCalled();
-    expect(fixture.describeImage).not.toHaveBeenCalled();
+    await expectBlocked(fixture, input);
   });
 
   it("fails before reading an image when a selected model is missing", async () => {
     const cfg = configured();
-    const configuredProvider = cfg.models?.providers?.["llama-cpp"];
-    if (!configuredProvider) {
-      throw new Error("fixture provider missing");
-    }
-    configuredProvider.models = configuredProvider.models.filter(
-      (model) => model.id !== "local-ocr",
-    );
+    const provider = configuredProvider(cfg);
+    provider.models = provider.models.filter((model) => model.id !== "local-ocr");
     const fixture = capture({}, cfg);
-    await expect(
-      requireTool(fixture).execute("test", { path: "fixture.png", task: "ocr" }),
-    ).rejects.toThrow("unavailable");
-    expect(fixture.loadWebMedia).not.toHaveBeenCalled();
-    expect(fixture.describeImage).not.toHaveBeenCalled();
+    await expectBlocked(fixture, { path: "fixture.png", task: "ocr" }, "unavailable");
   });
 
   it.each(["https://cloud.example.test/v1"])(
     "rejects a selected model endpoint override before loading input: %s",
     async (baseUrl) => {
       const cfg = configured();
-      const model = cfg.models?.providers?.["llama-cpp"]?.models.find(
-        (entry) => entry.id === "local-vision",
-      );
+      const model = configuredProvider(cfg).models.find((entry) => entry.id === "local-vision");
       if (!model) {
         throw new Error("fixture model missing");
       }
       model.baseUrl = baseUrl;
       const fixture = capture({}, cfg);
-      await expect(requireTool(fixture).execute("test", { path: "fixture.png" })).rejects.toThrow(
-        "endpoint must match",
-      );
-      expect(fixture.loadWebMedia).not.toHaveBeenCalled();
-      expect(fixture.describeImage).not.toHaveBeenCalled();
+      await expectBlocked(fixture, { path: "fixture.png" }, "endpoint must match");
     },
   );
 
@@ -186,10 +190,7 @@ describe("registered local_image tool", () => {
     expect(capture({ sandboxed: true }).tool).toBeNull();
     expect(capture({}, {}).tool).toBeNull();
     const cfg = configured();
-    const provider = cfg.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
+    const provider = configuredProvider(cfg);
     delete provider.localService;
     expect(capture({}, cfg).tool).toBeNull();
     provider.localService = { command: "/runtime/llama-server" };
@@ -201,30 +202,25 @@ describe("registered local_image tool", () => {
     let cfg = configured();
     const fixture = capture({ getRuntimeConfig: () => cfg });
     cfg = {};
-    await expect(requireTool(fixture).execute("test", { path: "fixture.png" })).rejects.toThrow(
-      "setup",
-    );
+    await expect(fixture.run()).rejects.toThrow("setup");
     expect(fixture.loadWebMedia).not.toHaveBeenCalled();
   });
 
   it("blocks an explicit proxy at registration and after runtime configuration changes", async () => {
     const cfg = configured();
-    const provider = cfg.models?.providers?.["llama-cpp"];
-    if (!provider) {
-      throw new Error("fixture provider missing");
-    }
+    const provider = configuredProvider(cfg);
     const fixture = capture({ getRuntimeConfig: () => cfg }, cfg);
     provider.request = {
       proxy: { mode: "explicit-proxy", url: "http://proxy.example.test:8080" },
     };
     const previous = structuredClone(cfg);
     expect(capture({}, cfg).tool).toBeNull();
-    await expect(requireTool(fixture).execute("test", { path: "fixture.png" })).rejects.toThrow(
+    await expectBlocked(
+      fixture,
+      { path: "fixture.png" },
       "without an explicit llama.cpp request proxy",
     );
     expect(cfg).toEqual(previous);
-    expect(fixture.loadWebMedia).not.toHaveBeenCalled();
-    expect(fixture.describeImage).not.toHaveBeenCalled();
   });
 
   it("propagates local failure without trying configured cloud fallbacks", async () => {
@@ -234,22 +230,20 @@ describe("registered local_image tool", () => {
     };
     const fixture = capture({}, cfg);
     fixture.describeImage.mockRejectedValueOnce(new Error("projector missing; rerun setup"));
-    await expect(
-      requireTool(fixture).execute("test", { path: "fixture.png", task: "ocr" }),
-    ).rejects.toThrow("projector missing");
+    await expect(fixture.run({ path: "fixture.png", task: "ocr" })).rejects.toThrow(
+      "projector missing",
+    );
     expect(fixture.describeImage).toHaveBeenCalledTimes(1);
     expect(fixture.describeImage.mock.calls[0]?.[0].provider).toBe("llama-cpp");
     fixture.describeImage.mockResolvedValueOnce({ text: " " });
-    await expect(requireTool(fixture).execute("test", { path: "fixture.png" })).rejects.toThrow(
-      "returned no text",
-    );
+    await expect(fixture.run()).rejects.toThrow("returned no text");
   });
 
   it("honors configured lower image and response budgets", async () => {
     const cfg = configured();
     cfg.tools = { media: { image: { maxBytes: 1024, maxChars: 5, timeoutSeconds: 7 } } };
     const fixture = capture({}, cfg);
-    const result = await requireTool(fixture).execute("test", { path: "fixture.png" });
+    const result = await fixture.run();
     expect(fixture.loadWebMedia).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({ maxBytes: 1024 }),
@@ -263,17 +257,16 @@ describe("registered local_image tool", () => {
 
   it("cancels before input, after input, and during the registered provider inference", async () => {
     const fixture = capture();
-    const tool = requireTool(fixture);
     const before = new AbortController();
     before.abort();
-    await expect(tool.execute("test", { path: "fixture.png" }, before.signal)).rejects.toThrow();
+    await expect(fixture.run(undefined, before.signal)).rejects.toThrow();
     expect(fixture.loadWebMedia).not.toHaveBeenCalled();
     const after = new AbortController();
     fixture.loadWebMedia.mockImplementationOnce(async () => {
       after.abort();
       return { buffer: IMAGE, contentType: "image/png", kind: "image", fileName: "fixture.png" };
     });
-    await expect(tool.execute("test", { path: "fixture.png" }, after.signal)).rejects.toThrow();
+    await expect(fixture.run(undefined, after.signal)).rejects.toThrow();
     expect(fixture.describeImage).not.toHaveBeenCalled();
     const during = new AbortController();
     fixture.describeImage.mockImplementationOnce(async (req) => {
@@ -282,50 +275,42 @@ describe("registered local_image tool", () => {
       req.signal?.throwIfAborted();
       return { text: "unreachable" };
     });
-    await expect(tool.execute("test", { path: "fixture.png" }, during.signal)).rejects.toThrow();
+    await expect(fixture.run(undefined, during.signal)).rejects.toThrow();
   });
 
   it("uses shared safe loading and preserves the original file", async () => {
-    const { loadWebMedia } = await import("openclaw/plugin-sdk/web-media");
     const root = tempDirs.make("llama-media-tool-");
     const workspace = path.join(root, "workspace");
     await fs.mkdir(workspace);
     const source = path.join(workspace, "fixture.png");
     await fs.writeFile(source, IMAGE);
-    const fixture = capture({ workspaceDir: workspace });
-    fixture.api.runtime.media.loadWebMedia = loadWebMedia;
-    const tool = requireTool(fixture);
-    await tool.execute("test", { path: "fixture.png" });
+    const fixture = await captureReal({ workspaceDir: workspace });
+    await fixture.run();
     expect(await fs.readFile(source)).toEqual(IMAGE);
     expect(fixture.describeImage).toHaveBeenCalledWith(
       expect.objectContaining({ mime: "image/png" }),
     );
     const outside = path.join(root, "private.png");
     await fs.writeFile(outside, IMAGE);
-    await expect(tool.execute("test", { path: "../private.png" })).rejects.toThrow();
+    await expect(fixture.run({ path: "../private.png" })).rejects.toThrow();
     if (process.platform !== "win32") {
       await fs.symlink(outside, path.join(workspace, "escape.png"));
-      await expect(tool.execute("test", { path: "escape.png" })).rejects.toThrow();
+      await expect(fixture.run({ path: "escape.png" })).rejects.toThrow();
     }
     expect(fixture.describeImage).toHaveBeenCalledTimes(1);
     await fs.writeFile(path.join(workspace, "not-image.txt"), "not an image");
-    await expect(tool.execute("test", { path: "not-image.txt" })).rejects.toThrow(
-      "must be an image",
-    );
-    const noWorkspace = capture({ workspaceDir: undefined });
-    noWorkspace.api.runtime.media.loadWebMedia = loadWebMedia;
-    await expect(requireTool(noWorkspace).execute("test", { path: source })).rejects.toThrow();
+    await expect(fixture.run({ path: "not-image.txt" })).rejects.toThrow("must be an image");
+    const noWorkspace = await captureReal({ workspaceDir: undefined });
+    await expect(noWorkspace.run({ path: source })).rejects.toThrow();
     expect(noWorkspace.describeImage).not.toHaveBeenCalled();
     const smallConfig = configured();
     smallConfig.tools = { media: { image: { maxBytes: 1 } } };
-    const oversized = capture({ workspaceDir: workspace }, smallConfig);
-    oversized.api.runtime.media.loadWebMedia = loadWebMedia;
-    await expect(requireTool(oversized).execute("test", { path: "fixture.png" })).rejects.toThrow();
+    const oversized = await captureReal({ workspaceDir: workspace }, smallConfig);
+    await expect(oversized.run()).rejects.toThrow();
     expect(oversized.describeImage).not.toHaveBeenCalled();
   });
 
   it("reads inbound media and host-approved read-only paths under workspace-only policy", async () => {
-    const { loadWebMedia } = await import("openclaw/plugin-sdk/web-media");
     const root = tempDirs.make("llama-media-tool-roots-");
     const workspace = path.join(root, "workspace");
     const inbound = path.join(root, "media", "inbound");
@@ -340,17 +325,15 @@ describe("registered local_image tool", () => {
     await fs.writeFile(outside, IMAGE);
     vi.stubEnv("OPENCLAW_STATE_DIR", root);
     vi.stubEnv("OPENCLAW_HOME", root);
-    const fixture = capture({
+    const fixture = await captureReal({
       workspaceDir: workspace,
       fsPolicy: { workspaceOnly: true, readOnlyRoots: [approved] },
     });
-    fixture.api.runtime.media.loadWebMedia = loadWebMedia;
-    const tool = requireTool(fixture);
     for (const source of ["media://inbound/fixture.png", approvedFile, "~/approved/fixture.png"]) {
-      await expect.soft(tool.execute("test", { path: source })).resolves.toMatchObject({
+      await expect.soft(fixture.run({ path: source })).resolves.toMatchObject({
         content: [{ type: "text", text: "local result" }],
       });
     }
-    await expect(tool.execute("test", { path: outside })).rejects.toThrow();
+    await expect(fixture.run({ path: outside })).rejects.toThrow();
   });
 });

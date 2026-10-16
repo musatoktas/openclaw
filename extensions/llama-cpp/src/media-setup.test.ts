@@ -67,6 +67,27 @@ function context(consent = true): ProviderAuthContext {
   };
 }
 
+function managedProvider(args: string[] = []) {
+  return buildLlamaCppProviderConfig({
+    managed: {
+      command: "/old/llama-server",
+      baseUrl: "http://127.0.0.1:19432/v1",
+      healthUrl: "http://127.0.0.1:19432/health",
+      args: ["--models-preset", "/old/models.ini", ...args],
+    },
+  });
+}
+
+function expectNotCalled(...functions: Array<ReturnType<typeof vi.fn>>) {
+  for (const fn of functions) {
+    expect(fn).not.toHaveBeenCalled();
+  }
+}
+
+function modelFile(source: string) {
+  return path.join(root, source.includes("mmproj") ? "projector.gguf" : "model.gguf");
+}
+
 beforeEach(async () => {
   vi.resetAllMocks();
   root = dirs.make("llama-media-setup-");
@@ -87,7 +108,7 @@ beforeEach(async () => {
     if (!download) {
       throw new Error("not cached");
     }
-    return path.join(root, source.includes("mmproj") ? "projector.gguf" : "model.gguf");
+    return modelFile(source);
   });
   mocks.install.mockResolvedValue({ command: path.join(root, "llama-server") });
   mocks.prepare.mockImplementation(async () => {
@@ -142,8 +163,7 @@ describe("registered local media setup transaction", () => {
       const actual =
         await vi.importActual<typeof import("./managed-server.js")>("./managed-server.js");
       let port = 20010;
-      // Hardware, downloads and inference are mocked; the registered setup methods
-      // and on-disk preset/config transitions use their real owners.
+      // Keep real preset/config transitions behind mocked hardware, downloads and inference.
       mocks.prepare.mockImplementation(
         (params: Parameters<typeof actual.prepareManagedLlamaServer>[0]) =>
           actual.prepareManagedLlamaServer({ ...params, port: port++ }),
@@ -154,7 +174,7 @@ describe("registered local media setup transaction", () => {
           throw new Error("not cached");
         }
         cached.add(source);
-        const file = path.join(root, source.includes("mmproj") ? "projector.gguf" : "model.gguf");
+        const file = modelFile(source);
         await fs.writeFile(file, "GGUF");
         return file;
       });
@@ -272,9 +292,7 @@ describe("registered local media setup transaction", () => {
     expect(await setup(ctx)).toEqual({ profiles: [] });
     expect(ctx.config).toEqual(before);
     expect(mocks.ensureModel.mock.calls.every(([arg]) => arg.download === false)).toBe(true);
-    expect(mocks.install).not.toHaveBeenCalled();
-    expect(mocks.prepare).not.toHaveBeenCalled();
-    expect(mocks.inference).not.toHaveBeenCalled();
+    expectNotCalled(mocks.install, mocks.prepare, mocks.inference);
     expect(ctx.prompter.confirm).toHaveBeenCalledWith(
       expect.objectContaining({
         initialValue: false,
@@ -305,10 +323,7 @@ describe("registered local media setup transaction", () => {
         expect.stringContaining("supports Linux x64 with CPU execution only"),
         "Local media unavailable",
       );
-      expect(mocks.ensureModel).not.toHaveBeenCalled();
-      expect(mocks.install).not.toHaveBeenCalled();
-      expect(mocks.prepare).not.toHaveBeenCalled();
-      expect(mocks.inference).not.toHaveBeenCalled();
+      expectNotCalled(mocks.ensureModel, mocks.install, mocks.prepare, mocks.inference);
       expect(ctx.config).toEqual(before);
     },
   );
@@ -334,14 +349,7 @@ describe("registered local media setup transaction", () => {
   it("preserves chat defaults, inventory, embeddings, provider settings and audio/video routes", async () => {
     const ctx = context();
     const describeImage = vi.spyOn(registeredMedia, "describeImage");
-    const provider = buildLlamaCppProviderConfig({
-      managed: {
-        command: "/old/llama-server",
-        baseUrl: "http://127.0.0.1:19432/v1",
-        healthUrl: "http://127.0.0.1:19432/health",
-        args: ["--models-preset", "/old/models.ini"],
-      },
-    });
+    const provider = managedProvider();
     provider.params = { modelCacheDir: root, custom: "retained" };
     provider.headers = { "X-Custom": "retained" };
     if (provider.localService) {
@@ -369,26 +377,24 @@ describe("registered local media setup transaction", () => {
       },
     };
     const before = structuredClone(ctx.config);
-    const result = await setup(ctx);
+    const { configPatch: patch } = await setup(ctx);
     expect(describeImage.mock.calls.map(([request]) => request.timeoutMs)).toEqual([
       30_000, 30_000,
     ]);
     expect(ctx.config).toEqual(before);
-    expect(result.configPatch?.agents?.defaults?.model).toEqual(before.agents?.defaults?.model);
-    expect(result.configPatch?.models?.providers?.["llama-cpp"]?.models[0]).toEqual(
-      provider.models[0],
-    );
-    expect(result.configPatch?.models?.providers?.["llama-cpp"]).toMatchObject({
+    expect(patch?.agents?.defaults?.model).toEqual(before.agents?.defaults?.model);
+    expect(patch?.models?.providers?.["llama-cpp"]?.models[0]).toEqual(provider.models[0]);
+    expect(patch?.models?.providers?.["llama-cpp"]).toMatchObject({
       headers: provider.headers,
       params: { custom: "retained", modelCacheDir: root },
       localService: { env: { CUSTOM_SETTING: "retained" }, cwd: root },
     });
-    expect(result.configPatch?.memory).toBeUndefined();
-    expect(result.configPatch?.agents?.defaults?.imageModel).toEqual({
+    expect(patch?.memory).toBeUndefined();
+    expect(patch?.agents?.defaults?.imageModel).toEqual({
       primary: "llama-cpp/smolvlm2-2.2b-instruct-q4_k_m",
       fallbacks: [],
     });
-    expect(result.configPatch?.tools?.media?.models).toEqual([
+    expect(patch?.tools?.media?.models).toEqual([
       { provider: "openai", model: "multimodal", capabilities: ["audio", "video"] },
       { provider: "llama-cpp", model: "smolvlm2-2.2b-instruct-q4_k_m", capabilities: ["image"] },
     ]);
@@ -411,9 +417,7 @@ describe("registered local media setup transaction", () => {
   });
 
   it("credits only verified model/projector cache on retry", async () => {
-    mocks.ensureModel.mockImplementation(async ({ source }) =>
-      path.join(root, source.includes("mmproj") ? "projector.gguf" : "model.gguf"),
-    );
+    mocks.ensureModel.mockImplementation(async ({ source }) => modelFile(source));
     const ctx = context();
     await setup(ctx);
     expect(mocks.ensureModel.mock.calls.filter(([arg]) => arg.download === false)).toHaveLength(
@@ -426,14 +430,7 @@ describe("registered local media setup transaction", () => {
 
   it("rebases managed model endpoints while preserving custom routes and chat defaults", async () => {
     const ctx = context();
-    const provider = buildLlamaCppProviderConfig({
-      managed: {
-        command: "/old/llama-server",
-        baseUrl: "http://127.0.0.1:19432/v1",
-        healthUrl: "http://127.0.0.1:19432/health",
-        args: ["--models-preset", "/old/models.ini"],
-      },
-    });
+    const provider = managedProvider();
     const model = provider.models[0];
     if (!model) {
       throw new Error("Expected existing model fixture");
@@ -468,8 +465,7 @@ describe("registered local media setup transaction", () => {
     await expect(setup({ ...context(), credentialOnly: true })).rejects.toThrow(
       "without --credential-only",
     );
-    expect(mocks.hardware).not.toHaveBeenCalled();
-    expect(mocks.install).not.toHaveBeenCalled();
+    expectNotCalled(mocks.hardware, mocks.install);
   });
 
   it.each(["external", "direct-model"])(
@@ -487,8 +483,7 @@ describe("registered local media setup transaction", () => {
       const before = structuredClone(ctx.config);
       await expect(setup(ctx)).rejects.toThrow("managed llama.cpp router");
       expect(ctx.config).toEqual(before);
-      expect(mocks.ensureModel).not.toHaveBeenCalled();
-      expect(mocks.install).not.toHaveBeenCalled();
+      expectNotCalled(mocks.ensureModel, mocks.install);
     },
   );
 
@@ -496,19 +491,11 @@ describe("registered local media setup transaction", () => {
     "rejects inherited router limits before downloading: %j",
     async (...args) => {
       const ctx = context();
-      const provider = buildLlamaCppProviderConfig({
-        managed: {
-          command: "/old/llama-server",
-          baseUrl: "http://127.0.0.1:19432/v1",
-          healthUrl: "http://127.0.0.1:19432/health",
-          args: ["--models-preset", "/old/models.ini", ...args],
-        },
-      });
+      const provider = managedProvider(args);
       ctx.config = { models: { providers: { "llama-cpp": provider } } };
       await expect(setup(ctx)).rejects.toThrow("exceeds the local media limit");
       expect(mocks.ensureModel.mock.calls.every(([arg]) => arg.download === false)).toBe(true);
-      expect(mocks.install).not.toHaveBeenCalled();
-      expect(mocks.prepare).not.toHaveBeenCalled();
+      expectNotCalled(mocks.install, mocks.prepare);
     },
   );
 

@@ -39,6 +39,13 @@ const disk = {
   files: 100,
   ffree: 50,
 };
+const detect = (options: Partial<Parameters<typeof detectLlamaCppHardware>[0]> = {}) =>
+  detectLlamaCppHardware({ cacheDir: "/models", ...options });
+async function useSeparateVolume() {
+  const stat = await readStat(os.tmpdir());
+  stat.dev += 1;
+  vi.mocked(fs.stat).mockResolvedValueOnce(stat);
+}
 
 beforeEach(async () => {
   probes.output = "";
@@ -62,21 +69,16 @@ describe("Gateway hardware detection", () => {
     vi.spyOn(process, "constrainedMemory").mockReturnValue(8 * GIB);
     vi.spyOn(process, "availableMemory").mockReturnValue(3 * GIB);
 
-    expect(await detectLlamaCppHardware({ cacheDir: "/models" })).toMatchObject({
+    expect(await detect()).toMatchObject({
       totalMemoryBytes: 8 * GIB,
       availableMemoryBytes: 3 * GIB,
     });
   });
 
   it("reports reclaimable Linux memory and separate NVIDIA device budgets", async () => {
-    probes.output = [
-      "NVIDIA Device A, 24576, 20000, 580.65.06, 8.9",
-      "NVIDIA Device B, 8192, 4096, 580.65.06, 7.5",
-    ].join("\n");
-
-    const hardware = await detectLlamaCppHardware({ cacheDir: "/models" });
-
-    expect(hardware).toMatchObject({
+    probes.output =
+      "NVIDIA Device A, 24576, 20000, 580.65.06, 8.9\nNVIDIA Device B, 8192, 4096, 580.65.06, 7.5";
+    expect(await detect()).toMatchObject({
       totalMemoryBytes: 32 * GIB,
       availableMemoryBytes: 16 * GIB,
       availableDiskBytes: 40 * 4096,
@@ -99,28 +101,20 @@ describe("Gateway hardware detection", () => {
   it("counts reclaimable Apple memory once and identifies unified Metal", async () => {
     vi.mocked(os.platform).mockReturnValue("darwin");
     vi.mocked(os.arch).mockReturnValue("arm64");
-    probes.output = [
-      "Mach Virtual Memory Statistics: (page size of 16384 bytes)",
-      "Pages free: 65536.",
-      "Pages inactive: 131072.",
-      "Pages purgeable: 32768.",
-    ].join("\n");
-
-    const hardware = await detectLlamaCppHardware({ cacheDir: "/models" });
-
+    probes.output =
+      "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 65536.\nPages inactive: 131072.\nPages purgeable: 32768.";
+    const hardware = await detect();
     expect(hardware.availableMemoryBytes).toBe(3 * GIB);
     expect(hardware.accelerator).toEqual({ kind: "metal" });
   });
 
   it("reports separate capacities when the model cache is on another volume", async () => {
-    const cacheStat = await readStat(os.tmpdir());
-    cacheStat.dev += 1;
-    vi.mocked(fs.stat).mockResolvedValueOnce(cacheStat);
+    await useSeparateVolume();
     vi.mocked(fs.statfs)
       .mockResolvedValueOnce(disk)
       .mockResolvedValueOnce({ ...disk, bavail: 5 });
 
-    expect(await detectLlamaCppHardware({ cacheDir: "/models" })).toMatchObject({
+    expect(await detect()).toMatchObject({
       availableDiskBytes: 40 * 4096,
       availableRuntimeDiskBytes: 5 * 4096,
       sharedDisk: false,
@@ -128,12 +122,10 @@ describe("Gateway hardware detection", () => {
   });
 
   it("reserves combined capacity for a pooled Linux filesystem", async () => {
-    const cacheStat = await readStat(os.tmpdir());
-    cacheStat.dev += 1;
-    vi.mocked(fs.stat).mockResolvedValueOnce(cacheStat);
+    await useSeparateVolume();
     vi.mocked(fs.statfs).mockResolvedValue({ ...disk, type: 0x9123683e });
 
-    expect((await detectLlamaCppHardware({ cacheDir: "/models" })).sharedDisk).toBe(true);
+    expect((await detect()).sharedDisk).toBe(true);
   });
 
   it.each([
@@ -144,9 +136,7 @@ describe("Gateway hardware detection", () => {
     "accounts for APFS shared capacity: $runtimeContainer",
     async ({ runtimeContainer, sharedDisk }) => {
       vi.mocked(os.platform).mockReturnValue("darwin");
-      const cacheStat = await readStat(os.tmpdir());
-      cacheStat.dev += 1;
-      vi.mocked(fs.stat).mockResolvedValueOnce(cacheStat);
+      await useSeparateVolume();
       probes.diskContainers = {
         disk4s1: "<key>APFSContainerReference</key><string>disk4</string>",
         ...(runtimeContainer
@@ -154,7 +144,7 @@ describe("Gateway hardware detection", () => {
           : {}),
       };
 
-      expect((await detectLlamaCppHardware({ cacheDir: "/models" })).sharedDisk).toBe(sharedDisk);
+      expect((await detect()).sharedDisk).toBe(sharedDisk);
     },
   );
 
@@ -169,8 +159,7 @@ describe("Gateway hardware detection", () => {
     probes.output = output;
     probes.error = error;
 
-    const hardware = await detectLlamaCppHardware({ cacheDir: "/models" });
-
+    const hardware = await detect();
     expect(hardware.accelerator).toMatchObject({ kind: "cpu", reason: expect.any(String) });
   });
 
@@ -178,9 +167,7 @@ describe("Gateway hardware detection", () => {
     vi.mocked(fs.statfs).mockRejectedValueOnce(
       Object.assign(new Error("missing"), { code: "ENOENT" }),
     );
-
-    const hardware = await detectLlamaCppHardware({ cacheDir: "/models/new" });
-
+    const hardware = await detect({ cacheDir: "/models/new" });
     expect(hardware.availableDiskBytes).toBe(40 * 4096);
     expect(fs.statfs).toHaveBeenLastCalledWith("/models");
   });
@@ -188,15 +175,11 @@ describe("Gateway hardware detection", () => {
   it("keeps unreadable disk capacity unknown", async () => {
     vi.mocked(fs.statfs).mockRejectedValue(Object.assign(new Error("denied"), { code: "EACCES" }));
 
-    expect(
-      (await detectLlamaCppHardware({ cacheDir: "/models" })).availableDiskBytes,
-    ).toBeUndefined();
+    expect((await detect()).availableDiskBytes).toBeUndefined();
   });
 
   it("honors setup cancellation before probing", async () => {
-    await expect(
-      detectLlamaCppHardware({ cacheDir: "/models", signal: AbortSignal.abort() }),
-    ).rejects.toThrow();
+    await expect(detect({ signal: AbortSignal.abort() })).rejects.toThrow();
     expect(fs.statfs).not.toHaveBeenCalled();
   });
 });

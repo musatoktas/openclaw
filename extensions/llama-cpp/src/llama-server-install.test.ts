@@ -48,8 +48,57 @@ import {
 } from "./llama-server-install.js";
 
 type FileHandle = Awaited<ReturnType<typeof fs.open>>;
-
 const tempRoots: string[] = [];
+const pinnedVersion = `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})`;
+const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+function mockCommand(
+  run: (command: string, args: string[], options: { timeout?: number }) => string | Promise<string>,
+) {
+  mocks.execFile.mockImplementation(
+    (
+      command: string,
+      args: string[],
+      options: { timeout?: number },
+      callback: (error: unknown, stdout: string, stderr: string) => void,
+    ) => {
+      try {
+        const output = run(command, args, options);
+        if (typeof output === "string") {
+          callback(null, output, "");
+        } else {
+          void output.then(
+            (text) => callback(null, text, ""),
+            (error: unknown) => callback(error, "", ""),
+          );
+        }
+      } catch (error) {
+        callback(error, "", "");
+      }
+    },
+  );
+}
+
+async function createRoot(prefix: string, canonical = false) {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const root = canonical ? await fs.realpath(temporary) : temporary;
+  tempRoots.push(root);
+  mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+  return root;
+}
+
+function download(
+  destination: string,
+  payload: Buffer,
+  options: Partial<Parameters<typeof downloadVerifiedFile>[0]> = {},
+) {
+  return downloadVerifiedFile({
+    url: "https://downloads.example/model.gguf",
+    destination,
+    expectedSha256: digest(payload),
+    ...options,
+  });
+}
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -63,15 +112,12 @@ afterEach(async () => {
 });
 
 async function createDestination(): Promise<{ destination: string; root: string }> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "llama-server-download-"));
-  tempRoots.push(root);
+  const root = await createRoot("llama-server-download-");
   return { destination: path.join(root, "model.gguf"), root };
 }
 
 async function createInstalledServer(): Promise<string> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "llama-server-installed-"));
-  tempRoots.push(root);
-  mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+  await createRoot("llama-server-installed-");
   const asset = selectLlamaServerAsset();
   const { command } = resolveManagedLlamaServerPaths(asset);
   await fs.mkdir(path.dirname(command), { recursive: true });
@@ -80,9 +126,7 @@ async function createInstalledServer(): Promise<string> {
 }
 
 async function createCpuArchive() {
-  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "llama-cpu-install-")));
-  tempRoots.push(root);
-  mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+  const root = await createRoot("llama-cpu-install-", true);
   const source = selectLlamaServerAsset("win32", "arm64", { kind: "cpu" });
   const runtime = source.dependencies![0]!;
   if (runtime.archive !== "vc-redist") {
@@ -94,11 +138,11 @@ async function createCpuArchive() {
   const runtimeBytes = Buffer.from("verified Visual C++ runtime bundle");
   const asset: LlamaServerAsset = {
     ...source,
-    sha256: createHash("sha256").update(serverBytes).digest("hex"),
+    sha256: digest(serverBytes),
     dependencies: [
       {
         ...runtime,
-        sha256: createHash("sha256").update(runtimeBytes).digest("hex"),
+        sha256: digest(runtimeBytes),
         size: runtimeBytes.byteLength,
       },
     ],
@@ -119,16 +163,7 @@ async function createCpuArchive() {
 }
 
 function mockVersionOutput(output: string): void {
-  mocks.execFile.mockImplementation(
-    (
-      _command: string,
-      _args: string[],
-      _options: unknown,
-      callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-    ) => {
-      callback(null, output, "");
-    },
-  );
+  mockCommand(() => output);
 }
 
 function mockDownload(payload: Buffer): ReturnType<typeof vi.fn> {
@@ -172,12 +207,12 @@ describe("cached file integrity", () => {
   it("reuses unchanged verified bytes but detects replacement, edits, and deletion", async () => {
     const { destination } = await createDestination();
     const original = Buffer.from("GGUFverified");
-    const digest = createHash("sha256").update(original).digest("hex");
+    const expectedDigest = digest(original);
     await fs.writeFile(destination, original);
     const scans = vi.spyOn(fileDurability, "sha256File");
 
-    expect(await sha256File(destination)).toBe(digest);
-    expect(await sha256File(destination)).toBe(digest);
+    expect(await sha256File(destination)).toBe(expectedDigest);
+    expect(await sha256File(destination)).toBe(expectedDigest);
     expect(scans).toHaveBeenCalledTimes(1);
     // Preserve length and mtime: inode/ctime changes must still invalidate verification.
     const previous = await fs.stat(destination);
@@ -185,9 +220,9 @@ describe("cached file integrity", () => {
     await fs.writeFile(replacement, "GGUFcorrupt!");
     await fs.utimes(replacement, previous.atime, previous.mtime);
     await fs.rename(replacement, destination);
-    expect(await sha256File(destination)).not.toBe(digest);
+    expect(await sha256File(destination)).not.toBe(expectedDigest);
     await fs.writeFile(destination, original);
-    expect(await sha256File(destination)).toBe(digest);
+    expect(await sha256File(destination)).toBe(expectedDigest);
     await fs.rm(destination);
     await expect(sha256File(destination)).rejects.toMatchObject({ code: "ENOENT" });
     expect(scans).toHaveBeenCalledTimes(3);
@@ -215,9 +250,7 @@ describe("cached file integrity", () => {
         mode === "cancellation" ? /abort/iu : "File changed during integrity verification",
       );
       vi.restoreAllMocks();
-      const actual = createHash("sha256")
-        .update(await fs.readFile(destination))
-        .digest("hex");
+      const actual = digest(await fs.readFile(destination));
       expect(await sha256File(destination)).toBe(actual);
     },
   );
@@ -225,16 +258,11 @@ describe("cached file integrity", () => {
   it("reuses the download's verified publication without reading it again", async () => {
     const { destination } = await createDestination();
     const payload = Buffer.from("GGUFdownload");
-    const digest = createHash("sha256").update(payload).digest("hex");
     mockDownload(payload);
-    await downloadVerifiedFile({
-      url: "https://downloads.example/model.gguf",
-      destination,
-      expectedSha256: digest,
-    });
+    await download(destination, payload);
     const scan = vi.spyOn(fileDurability, "sha256File");
     const opened = vi.spyOn(fs, "open");
-    expect(await sha256File(destination)).toBe(digest);
+    expect(await sha256File(destination)).toBe(digest(payload));
     expect(scan).not.toHaveBeenCalled();
     expect(opened).not.toHaveBeenCalled();
   });
@@ -256,13 +284,10 @@ describe("downloadVerifiedFile", () => {
           release,
         });
       }
-      const digest = createHash("sha256").update(payload).digest("hex");
       await expect(
-        downloadVerifiedFile({
+        download(destination, payload, {
           url: "https://downloads.example/mmproj.gguf",
-          destination,
           expectedSize: payload.byteLength,
-          expectedSha256: digest,
           signal: controller.signal,
           onProgress: () => {
             if (outcome === "cancelled") {
@@ -285,11 +310,9 @@ describe("downloadVerifiedFile", () => {
       );
 
       mockDownload(payload);
-      await downloadVerifiedFile({
+      await download(destination, payload, {
         url: "https://downloads.example/mmproj.gguf",
-        destination,
         expectedSize: payload.byteLength,
-        expectedSha256: digest,
       });
       expect(await fs.readFile(destination)).toEqual(payload);
       expect(await fs.readdir(root)).toEqual(["model.gguf"]);
@@ -331,11 +354,8 @@ describe("downloadVerifiedFile", () => {
     });
     const onProgress = vi.fn();
 
-    await downloadVerifiedFile({
-      url: "https://downloads.example/model.gguf",
-      destination,
+    await download(destination, payload, {
       expectedSize: payload.byteLength,
-      expectedSha256: createHash("sha256").update(payload).digest("hex"),
       onProgress,
     });
 
@@ -377,10 +397,7 @@ describe("downloadVerifiedFile", () => {
       installWriteFileThroughWrite(handle);
     });
 
-    await downloadVerifiedFile({
-      url: "https://downloads.example/model.gguf",
-      destination,
-      expectedSha256: createHash("sha256").update(payload).digest("hex"),
+    await download(destination, payload, {
       expectedSize: payload.byteLength,
       onProgress,
     });
@@ -406,31 +423,21 @@ describe("ensureLlamaServerInstalled", () => {
     const command = await createInstalledServer();
     const started = createDeferred<void>();
     const versionReply = createDeferred<string>();
-    mocks.execFile.mockImplementation(
-      (
-        file: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-      ) => {
-        // macOS hosts probe the product version first; hold only the server probe.
-        if (file === "/usr/bin/sw_vers") {
-          callback(null, "26.0\n", "");
-          return;
-        }
-        started.resolve();
-        void versionReply.promise.then((output) => callback(null, output, ""));
-      },
-    );
+    mockCommand((file) => {
+      // macOS hosts probe the product version first; hold only the server probe.
+      if (file === "/usr/bin/sw_vers") {
+        return "26.0\n";
+      }
+      started.resolve();
+      return versionReply.promise;
+    });
     const first = ensureLlamaServerInstalled();
     await started.promise;
     const controller = new AbortController();
     const queued = ensureLlamaServerInstalled({ signal: controller.signal });
     controller.abort();
     await expect(queued).rejects.toMatchObject({ name: "AbortError" });
-    versionReply.resolve(
-      `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})\nbuilt with test compiler`,
-    );
+    versionReply.resolve(`${pinnedVersion}\nbuilt with test compiler`);
     await expect(first).resolves.toMatchObject({ command });
     await expect(ensureLlamaServerInstalled()).resolves.toMatchObject({ command });
     expect(mocks.execFile.mock.calls.filter(([file]) => file === command)).toHaveLength(2);
@@ -439,40 +446,21 @@ describe("ensureLlamaServerInstalled", () => {
   it("allows slow version initialization before publication, after publication, and on reuse", async () => {
     const { root, asset, runtime } = await createCpuArchive();
     const calls: Array<{ command: string; args: string[]; timeout?: number }> = [];
-    mocks.execFile.mockImplementation(
-      (
-        command: string,
-        args: string[],
-        options: { timeout?: number },
-        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-      ) => {
-        calls.push({ command, args, timeout: options.timeout });
-        // Measured Metal initialization took 23 seconds even for an installed runtime.
-        if (options.timeout !== undefined && options.timeout < 23_000) {
-          callback(
-            Object.assign(new Error("version initialization timed out"), {
-              cmd: [command, ...args].join(" "),
-              killed: true,
-              signal: "SIGTERM" as const,
-            }),
-            "",
-            "",
-          );
-          return;
-        }
-        void Promise.all(
-          runtime.files.map((file) => fs.stat(path.join(path.dirname(command), file.target))),
-        )
-          .then(() => {
-            callback(
-              null,
-              `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})`,
-              "",
-            );
-          })
-          .catch((error: unknown) => callback(error as ExecFileException, "", ""));
-      },
-    );
+    mockCommand(async (command, args, options) => {
+      calls.push({ command, args, timeout: options.timeout });
+      // Measured Metal initialization took 23 seconds even for an installed runtime.
+      if (options.timeout !== undefined && options.timeout < 23_000) {
+        throw Object.assign(new Error("version initialization timed out"), {
+          cmd: [command, ...args].join(" "),
+          killed: true,
+          signal: "SIGTERM" as const,
+        });
+      }
+      await Promise.all(
+        runtime.files.map((file) => fs.stat(path.join(path.dirname(command), file.target))),
+      );
+      return pinnedVersion;
+    });
 
     const { command } = resolveManagedLlamaServerPaths(asset);
     await expect(ensureLlamaServerInstalled({ asset })).resolves.toMatchObject({ command });
@@ -504,9 +492,7 @@ describe("ensureLlamaServerInstalled", () => {
 
   it("does not fetch the VC runtime when the fresh CPU ZIP already starts", async () => {
     const { root, asset, runtime } = await createCpuArchive();
-    mockVersionOutput(
-      `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})`,
-    );
+    mockVersionOutput(pinnedVersion);
 
     const { command } = resolveManagedLlamaServerPaths(asset);
     await expect(ensureLlamaServerInstalled({ asset })).resolves.toMatchObject({ command });
@@ -542,19 +528,10 @@ describe("ensureLlamaServerInstalled", () => {
   it("preserves both launch errors when the VC runtime fallback cannot start the server", async () => {
     const { root, asset } = await createCpuArchive();
     let attempt = 0;
-    mocks.execFile.mockImplementation(
-      (
-        command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-      ) => {
-        const detail = attempt++ === 0 ? "initial launch failed" : "fallback launch failed";
-        const error = new Error(detail) as ExecFileException;
-        error.cmd = `${command} --version`;
-        callback(error, "", "");
-      },
-    );
+    mockCommand((command) => {
+      const detail = attempt++ === 0 ? "initial launch failed" : "fallback launch failed";
+      throw Object.assign(new Error(detail), { cmd: `${command} --version` });
+    });
 
     await expect(ensureLlamaServerInstalled({ asset })).rejects.toThrow(
       /Initial startup detail: .*initial launch failed.*Fallback detail: .*fallback launch failed/u,
@@ -567,20 +544,11 @@ describe("ensureLlamaServerInstalled", () => {
     const { root, asset } = await createCpuArchive();
     const controller = new AbortController();
     const timeouts: Array<number | undefined> = [];
-    mocks.execFile.mockImplementation(
-      (
-        command: string,
-        _args: string[],
-        options: { timeout?: number },
-        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-      ) => {
-        timeouts.push(options.timeout);
-        controller.abort();
-        const error = new Error("The operation was aborted") as ExecFileException;
-        error.cmd = `${command} --version`;
-        callback(error, "", "");
-      },
-    );
+    mockCommand((command, _args, options) => {
+      timeouts.push(options.timeout);
+      controller.abort();
+      throw Object.assign(new Error("The operation was aborted"), { cmd: `${command} --version` });
+    });
 
     const { command } = resolveManagedLlamaServerPaths(asset);
     await expect(
@@ -594,11 +562,7 @@ describe("ensureLlamaServerInstalled", () => {
   it.each(["ready", "corrupt-runtime", "missing-runtime", "no-device"] as const)(
     "publishes the complete CUDA installation only after verification: %s",
     async (outcome) => {
-      const root = await fs.realpath(
-        await fs.mkdtemp(path.join(os.tmpdir(), "llama-cuda-install-")),
-      );
-      tempRoots.push(root);
-      mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+      const root = await createRoot("llama-cuda-install-", true);
       const source = selectLlamaServerAsset("win32", "x64", {
         kind: "cuda",
         devices: [{ driverVersion: "551.78", computeCapability: 8.6 }],
@@ -624,14 +588,11 @@ describe("ensureLlamaServerInstalled", () => {
       const runtimeBytes = await runtimeZip.generateAsync({ type: "nodebuffer" });
       const asset: LlamaServerAsset = {
         ...source,
-        sha256: createHash("sha256").update(serverBytes).digest("hex"),
+        sha256: digest(serverBytes),
         dependencies: [
           {
             ...runtime,
-            sha256:
-              outcome === "corrupt-runtime"
-                ? "0".repeat(64)
-                : createHash("sha256").update(runtimeBytes).digest("hex"),
+            sha256: outcome === "corrupt-runtime" ? "0".repeat(64) : digest(runtimeBytes),
           },
           ...(outcome === "no-device" ? [vcRuntime] : []),
         ],
@@ -644,26 +605,15 @@ describe("ensureLlamaServerInstalled", () => {
       });
       const validatedFiles: string[][] = [];
       const commandCalls: Array<{ args: string[]; timeout?: number }> = [];
-      mocks.execFile.mockImplementation(
-        (
-          command: string,
-          args: string[],
-          options: { timeout?: number },
-          callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-        ) => {
-          commandCalls.push({ args, timeout: options.timeout });
-          void fs.readdir(path.dirname(command)).then((files) => {
-            validatedFiles.push(files);
-            const stdout =
-              args[0] === "--version"
-                ? `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})`
-                : outcome === "no-device"
-                  ? "Available devices:\n  (none)"
-                  : "Available devices:\n  CUDA0: Test GPU (12288 MiB, 11264 MiB free)";
-            callback(null, stdout, "");
-          });
-        },
-      );
+      mockCommand(async (command, args, options) => {
+        commandCalls.push({ args, timeout: options.timeout });
+        validatedFiles.push(await fs.readdir(path.dirname(command)));
+        return args[0] === "--version"
+          ? pinnedVersion
+          : outcome === "no-device"
+            ? "Available devices:\n  (none)"
+            : "Available devices:\n  CUDA0: Test GPU (12288 MiB, 11264 MiB free)";
+      });
       const result = ensureLlamaServerInstalled({
         asset,
         signal: controller.signal,
@@ -714,7 +664,6 @@ describe("ensureLlamaServerInstalled", () => {
 });
 
 describe("macOS runtime floor", () => {
-  const pinnedVersion = `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})`;
   const dyldFailure = Object.assign(
     new Error("dyld: Symbol not found: _cblas_sgemm$NEWLAPACK$ILP64"),
     {
@@ -726,31 +675,25 @@ describe("macOS runtime floor", () => {
     productVersion: string | ExecFileException,
     installed: "none" | "valid" | "crashes",
   ) {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "llama-server-macos-"));
-    tempRoots.push(root);
-    mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+    await createRoot("llama-server-macos-");
     const asset = selectLlamaServerAsset("darwin", "x64", { kind: "cpu" });
     const { command } = resolveManagedLlamaServerPaths(asset);
     if (installed !== "none") {
       await fs.mkdir(path.dirname(command), { recursive: true });
       await fs.writeFile(command, "");
     }
-    mocks.execFile.mockImplementation(
-      (
-        file: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
-      ) => {
-        if (file !== "/usr/bin/sw_vers") {
-          callback(installed === "crashes" ? dyldFailure : null, pinnedVersion, "");
-        } else if (typeof productVersion !== "string") {
-          callback(productVersion, "", "");
-        } else {
-          callback(null, `${productVersion}\n`, "");
+    mockCommand((file) => {
+      if (file !== "/usr/bin/sw_vers") {
+        if (installed === "crashes") {
+          throw dyldFailure;
         }
-      },
-    );
+        return pinnedVersion;
+      } else if (typeof productVersion !== "string") {
+        throw productVersion;
+      } else {
+        return `${productVersion}\n`;
+      }
+    });
     return { asset, command };
   }
 
