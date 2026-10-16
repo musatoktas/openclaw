@@ -43,28 +43,21 @@ async function createInstalledTriage(params: { hang?: boolean; promptPath?: stri
     ${params.hang ? "setInterval(() => {}, 1000);" : `process.stdout.write(JSON.stringify({ promptPath: ${JSON.stringify(promptPath)}, bundlePath: null, bundleError: "Snapshot unavailable" }));`}
   `,
   );
-  return {
-    receiptPath,
-    promptPath,
-    target: {
-      root,
-      nodeRunner: process.execPath,
-      env: { HOME: root, USERPROFILE: root, OPENCLAW_STATE_DIR: path.join(root, "state") },
-    },
+  const target = {
+    root,
+    nodeRunner: process.execPath,
+    env: { HOME: root, USERPROFILE: root, OPENCLAW_STATE_DIR: path.join(root, "state") },
   };
-}
-
-function runDiagnostics(
-  target: Parameters<typeof runUpdateFailureTriage>[0]["target"],
-  overrides: Partial<Omit<Parameters<typeof runUpdateFailureTriage>[0], "target">> = {},
-) {
-  return runUpdateFailureTriage({
-    failure: { error: "Update failed" },
-    mode: "json",
-    runtime: { log: vi.fn(), error: vi.fn() },
-    ...overrides,
-    target,
-  });
+  const runtime = { log: vi.fn(), error: vi.fn() };
+  const run = (overrides: Partial<Parameters<typeof runUpdateFailureTriage>[0]> = {}) =>
+    runUpdateFailureTriage({
+      failure: { error: "Update failed" },
+      mode: "json",
+      runtime,
+      target,
+      ...overrides,
+    });
+  return { receiptPath, promptPath, target, runtime, run };
 }
 
 describe("update triage child lifecycle", () => {
@@ -81,14 +74,11 @@ describe("update triage child lifecycle", () => {
           invocationCwd: state.workspaceDir,
         });
         const cwdStat = await fs.stat(state.workspaceDir);
-        let release!: () => void;
         const { promise: validating, resolve: started } = createDeferred();
-        const blocked = new Promise<void>((resolve) => {
-          release = resolve;
-        });
+        const blocked = createDeferred();
         vi.spyOn(fs, "stat").mockImplementationOnce(async () => {
           started();
-          await blocked;
+          await blocked.promise;
           return cwdStat;
         });
         const controller = new AbortController();
@@ -105,7 +95,7 @@ describe("update triage child lifecycle", () => {
         } else {
           current = false;
         }
-        release();
+        blocked.resolve();
         expect(await pending).toEqual({ status: "cancelled" });
         expect(handoff).not.toHaveBeenCalled();
         expect(runtime.error).not.toHaveBeenCalled();
@@ -114,13 +104,12 @@ describe("update triage child lifecycle", () => {
   );
 
   it("keeps artifact paths in local output and returns the partial-export outcome", async () => {
-    const { target, promptPath, receiptPath } = await createInstalledTriage();
+    const { target, promptPath, receiptPath, runtime, run } = await createInstalledTriage();
     const runCommand = vi.spyOn(exec, "runCommandWithTimeout");
-    const runtime = { log: vi.fn(), error: vi.fn() };
-    const result = await runDiagnostics(
-      { ...target, env: { ...target.env, [UPDATE_RUN_ID_ENV]: "completed-update-run" } },
-      { failure: { error: "Update could not install the package" }, runtime },
-    );
+    const result = await run({
+      target: { ...target, env: { ...target.env, [UPDATE_RUN_ID_ENV]: "completed-update-run" } },
+      failure: { error: "Update could not install the package" },
+    });
     expect(result).toMatchObject({
       status: "completed",
       hint: expect.stringContaining("Diagnostics export unavailable: Snapshot unavailable"),
@@ -139,24 +128,21 @@ describe("update triage child lifecycle", () => {
   });
 
   it("does not launch diagnostics after its owner closes during root discovery", async () => {
-    const { target, receiptPath } = await createInstalledTriage();
-    let releaseRoot!: (root: string) => void;
+    const { target, receiptPath, run } = await createInstalledTriage();
+    const root = createDeferred<string>();
     const { promise: discovering, resolve: started } = createDeferred();
     let current = true;
-    const pending = runDiagnostics(
-      { ...target, root: undefined },
-      {
-        resolveRoot: () =>
-          new Promise((resolve) => {
-            releaseRoot = resolve;
-            started();
-          }),
-        isCurrent: () => current,
+    const pending = run({
+      target: { ...target, root: undefined },
+      resolveRoot: () => {
+        started();
+        return root.promise;
       },
-    );
+      isCurrent: () => current,
+    });
     await discovering;
     current = false;
-    releaseRoot(target.root);
+    root.resolve(target.root);
     expect(await pending).toEqual({ status: "cancelled" });
     await expect(fs.stat(receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -164,10 +150,9 @@ describe("update triage child lifecycle", () => {
   it("terminates diagnostics and suppresses publication when its scheduler stops", async ({
     signal,
   }) => {
-    const { target, receiptPath } = await createInstalledTriage({ hang: true });
+    const { receiptPath, runtime, run } = await createInstalledTriage({ hang: true });
     const controller = new AbortController();
-    const runtime = { log: vi.fn(), error: vi.fn() };
-    const pending = runDiagnostics(target, { runtime, signal: controller.signal });
+    const pending = run({ signal: controller.signal });
     try {
       // The child writes its record before replying; receipt delivery and command exit are unordered.
       const settled = pending.then(async () => {
@@ -199,34 +184,27 @@ describe("update triage child lifecycle", () => {
     }
   });
 
-  it("does not complete when a timed-out child exits gracefully with code zero", async () => {
-    const { target, promptPath } = await createInstalledTriage();
-    vi.spyOn(exec, "runCommandWithTimeout").mockResolvedValueOnce({
-      stdout: JSON.stringify({ promptPath }),
-      stderr: "",
-      code: 0,
-      signal: null,
-      killed: true,
-      termination: "timeout",
-    });
-    const result = await runDiagnostics(target);
-    expect(result).toMatchObject({
+  it.each(["timeout with zero exit", "empty report path"])("rejects %s", async (failure) => {
+    const timeout = failure === "timeout with zero exit";
+    const { promptPath, run } = await createInstalledTriage(timeout ? {} : { promptPath: "" });
+    if (timeout) {
+      vi.spyOn(exec, "runCommandWithTimeout").mockResolvedValueOnce({
+        stdout: JSON.stringify({ promptPath }),
+        stderr: "",
+        code: 0,
+        signal: null,
+        killed: true,
+        termination: "timeout",
+      });
+    }
+    expect(await run()).toMatchObject({
       status: "failed",
-      hint: expect.stringContaining("Triage stopped (timeout)"),
-    });
-  });
-
-  it("rejects empty report paths", async () => {
-    const { target } = await createInstalledTriage({ promptPath: "" });
-    const result = await runDiagnostics(target);
-    expect(result).toMatchObject({
-      status: "failed",
-      hint: expect.stringContaining("openclaw triage"),
+      hint: expect.stringContaining(timeout ? "Triage stopped (timeout)" : "openclaw triage"),
     });
   });
 
   it("redacts and bounds diagnostic failures while preserving an executable Windows host command", async () => {
-    const { target } = await createInstalledTriage();
+    const { target, runtime, run } = await createInstalledTriage();
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     target.env.OPENCLAW_STATE_DIR = path.join(target.root, "state directory's");
     const configPath = path.join(target.root, "custom config.json");
@@ -242,8 +220,7 @@ describe("update triage child lifecycle", () => {
       .mockRejectedValueOnce(
         new Error(`ENOSPC Authorization: Bearer ${credential}\n${"detail ".repeat(1000)}`),
       );
-    const runtime = { log: vi.fn(), error: vi.fn() };
-    const result = await runDiagnostics({ ...target, env: targetEnv }, { runtime });
+    const result = await run({ target: { ...target, env: targetEnv } });
     expect(result).toMatchObject({ status: "failed", hint: expect.stringContaining("ENOSPC") });
     expect(JSON.stringify(result)).not.toContain(credential);
     if (result.status === "failed") {
