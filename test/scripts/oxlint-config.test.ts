@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import JSON5 from "json5";
@@ -8,6 +8,27 @@ import { resolveRepoToolBinPath } from "../../scripts/lib/local-check-runtime.mt
 import { copyOxlintConfigFixture, createScriptTestHarness } from "./test-helpers.js";
 
 const { createTempDir } = createScriptTestHarness();
+
+function runTool(
+  root: string,
+  args: string[],
+  options: SpawnSyncOptionsWithStringEncoding = { encoding: "utf8" },
+) {
+  return spawnSync(process.execPath, args, { cwd: root, encoding: "utf8", ...options });
+}
+
+function writeFixture(root: string, file: string, content: string) {
+  const target = path.join(root, file);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content);
+}
+
+function linkDependencies(root: string) {
+  fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+}
+
+const oxlintBin = path.resolve("node_modules/oxlint/bin/oxlint");
+const oxlintRunner = path.resolve("scripts/run-oxlint.mts");
 
 const sourceProjectOwners = [
   "agents",
@@ -32,15 +53,11 @@ function writeSourceProjectFixture(root: string) {
     "config/tsconfig/oxlint.source.json",
     ...sourceProjectOwners.map((owner) => `src/${owner}/tsconfig.json`),
   ]) {
-    const target = path.join(root, file);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.copyFileSync(file, target);
+    writeFixture(root, file, fs.readFileSync(file, "utf8"));
   }
   writeSessionCompatibilityFixture(root);
   for (const file of sourceAugmentations) {
-    const target = path.join(root, file);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, "export {};\n");
+    writeFixture(root, file, "export {};\n");
   }
 }
 
@@ -150,15 +167,13 @@ describe("oxlint config", () => {
     ];
     copyOxlintConfigFixture(tempRoot);
     for (const fixture of fixtures) {
-      const target = path.join(tempRoot, fixture.file);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, fixture.source);
+      writeFixture(tempRoot, fixture.file, fixture.source);
     }
     // These syntax-rule fixtures need no type program; one batch uses the real config and paths.
-    const result = spawnSync(
-      process.execPath,
+    const result = runTool(
+      tempRoot,
       [
-        path.resolve("node_modules/oxlint/bin/oxlint"),
+        oxlintBin,
         "--config",
         ".oxlintrc.json",
         "--format",
@@ -168,7 +183,7 @@ describe("oxlint config", () => {
         "error",
         ...fixtures.map((fixture) => fixture.file),
       ],
-      { cwd: tempRoot, encoding: "utf8", timeout: 10_000 },
+      { encoding: "utf8", timeout: 10_000 },
     );
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(1);
@@ -212,13 +227,11 @@ describe("oxlint config", () => {
     copyOxlintConfigFixture(tempRoot);
     for (const file of ["tsconfig.json", "src/tsconfig.json"]) {
       if (fs.existsSync(file)) {
-        const target = path.join(tempRoot, file);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.copyFileSync(file, target);
+        writeFixture(tempRoot, file, fs.readFileSync(file, "utf8"));
       }
     }
     writeSourceProjectFixture(tempRoot);
-    fs.symlinkSync(path.resolve("node_modules"), path.join(tempRoot, "node_modules"), "junction");
+    linkDependencies(tempRoot);
     const supportFiles = [
       "src/cli/diagnostics.test-support.ts",
       "src/cli/diagnostics.test-support.cjs",
@@ -226,34 +239,20 @@ describe("oxlint config", () => {
     const files = [...supportFiles, "src/cli/unrelated.cjs", "ui/unrelated.test-support.cjs"];
     const source = 'const emit = process.emit;\nemit("lint-fixture");\n';
     for (const file of files) {
-      const target = path.join(tempRoot, file);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, source);
+      writeFixture(tempRoot, file, source);
     }
     const lint = () =>
-      spawnSync(
-        process.execPath,
-        [
-          path.resolve("node_modules/oxlint/bin/oxlint"),
-          "--type-aware",
-          "--format",
-          "json",
-          "--threads=1",
-          ...files,
-        ],
-        {
-          cwd: tempRoot,
-          encoding: "utf8",
-          timeout: 10_000,
-          env: {
-            ...process.env,
-            OXLINT_TSGOLINT_PATH: path.resolve(
-              "node_modules/.bin",
-              process.platform === "win32" ? "tsgolint.CMD" : "tsgolint",
-            ),
-          },
+      runTool(tempRoot, [oxlintBin, "--type-aware", "--format", "json", "--threads=1", ...files], {
+        encoding: "utf8",
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          OXLINT_TSGOLINT_PATH: path.resolve(
+            "node_modules/.bin",
+            process.platform === "win32" ? "tsgolint.CMD" : "tsgolint",
+          ),
         },
-      );
+      });
     const broken = lint();
     expect(broken.error).toBeUndefined();
     expect(broken.status, broken.stdout + broken.stderr).toBe(1);
@@ -285,11 +284,7 @@ describe("oxlint config", () => {
 
   it("bounds package fallback roots while preserving existing projects and ambient types", () => {
     const root = fs.realpathSync(createTempDir("openclaw-oxlint-package-project-"));
-    const write = (file: string, content: string) => {
-      const target = path.join(root, file);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, content);
-    };
+    const write = (file: string, content: string) => writeFixture(root, file, content);
     const copy = (file: string) => write(file, fs.readFileSync(file, "utf8"));
     copyOxlintConfigFixture(root);
     const packageOwners = [
@@ -308,7 +303,7 @@ describe("oxlint config", () => {
     }
     write("package.json", '{"type":"module"}');
     writeSourceProjectFixture(root);
-    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    linkDependencies(root);
     // The original repository graph acquires ESNext through unrelated roots.
     write("src/library-owner.ts", '/// <reference lib="esnext" />\nexport {};');
     write("ui/unrelated.ts", "export {};");
@@ -380,29 +375,18 @@ describe("oxlint config", () => {
     );
     const selected = [...fallback, ...configured, ...inferred];
     const lint = () =>
-      spawnSync(
-        process.execPath,
-        [
-          path.resolve("node_modules/oxlint/bin/oxlint"),
-          "--type-aware",
-          "--threads=1",
-          "--format=json",
-          ...selected,
-        ],
-        {
-          cwd: root,
-          encoding: "utf8",
-          timeout: 30_000,
-          env: {
-            ...process.env,
-            OXC_LOG: "debug",
-            GOMAXPROCS: "2",
-            OXLINT_TSGOLINT_PATH: resolveRepoToolBinPath(
-              process.platform === "win32" ? "tsgolint.CMD" : "tsgolint",
-            ),
-          },
+      runTool(root, [oxlintBin, "--type-aware", "--threads=1", "--format=json", ...selected], {
+        encoding: "utf8",
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          OXC_LOG: "debug",
+          GOMAXPROCS: "2",
+          OXLINT_TSGOLINT_PATH: resolveRepoToolBinPath(
+            process.platform === "win32" ? "tsgolint.CMD" : "tsgolint",
+          ),
         },
-      );
+      });
     const baseline = lint();
     copy("packages/tsconfig.json");
     const narrowed = lint();
@@ -516,7 +500,7 @@ describe("oxlint config", () => {
         ],
       }),
     );
-    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    linkDependencies(root);
     const sources = {
       "src/oversized.ts": 702,
       "src/within-cap.test.ts": 902,
@@ -526,11 +510,7 @@ describe("oxlint config", () => {
       "src/disabled/ignored.ts": 1402,
     };
     for (const [file, lines] of Object.entries(sources)) {
-      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-      fs.writeFileSync(
-        path.join(root, file),
-        `export const values = [\n${"  0,\n".repeat(lines - 2)}];\n`,
-      );
+      writeFixture(root, file, `export const values = [\n${"  0,\n".repeat(lines - 2)}];\n`);
     }
     fs.writeFileSync(path.join(root, "src/correctness.ts"), "export var legacy = 1;\n");
     fs.writeFileSync(path.join(root, "src/globals.js"), "window.console.log(configuredGlobal);\n");
@@ -589,10 +569,10 @@ describe("oxlint config", () => {
         JSON.stringify(inherited ? { ...ownConfig, extends: ["./base.json"] } : ownConfig),
       );
       const summary = path.join(root, `summary-${index}.md`);
-      const result = spawnSync(
-        process.execPath,
+      const result = runTool(
+        root,
         [
-          path.resolve("scripts/run-oxlint.mts"),
+          oxlintRunner,
           "--openclaw-focused-config",
           "--threads=1",
           "--format",
@@ -602,7 +582,6 @@ describe("oxlint config", () => {
           ...(correctness ? ["src/correctness.ts"] : []),
         ],
         {
-          cwd: root,
           encoding: "utf8",
           env: {
             ...process.env,
@@ -666,7 +645,7 @@ describe("oxlint config", () => {
     fs.mkdirSync(path.join(root, ".git"));
     const config = { categories: { correctness: "off" }, rules: { "max-lines": ["error", 2] } };
     fs.writeFileSync(path.join(root, ".oxlintrc.json"), JSON.stringify(config));
-    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    linkDependencies(root);
     const sources = [
       "!root.ts",
       "src/!root.ts",
@@ -676,8 +655,7 @@ describe("oxlint config", () => {
       "src/wild-question.ts",
     ];
     for (const file of sources) {
-      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-      fs.writeFileSync(path.join(root, file), "export const values = [\n  0,\n  1,\n];\n");
+      writeFixture(root, file, "export const values = [\n  0,\n  1,\n];\n");
     }
     const changedPaths = [
       "!root.ts",
@@ -693,18 +671,10 @@ describe("oxlint config", () => {
           JSON.stringify({ extends: ["./base.json"] }),
         );
       }
-      const result = spawnSync(
-        process.execPath,
-        [
-          path.resolve("scripts/run-oxlint.mts"),
-          "--openclaw-focused-config",
-          "--threads=1",
-          "--format",
-          "json",
-          ...sources,
-        ],
+      const result = runTool(
+        root,
+        [oxlintRunner, "--openclaw-focused-config", "--threads=1", "--format", "json", ...sources],
         {
-          cwd: root,
           encoding: "utf8",
           env: {
             ...process.env,
@@ -736,7 +706,7 @@ describe("oxlint config", () => {
   it("preserves native config validation locally and in Actions", () => {
     const root = fs.realpathSync(createTempDir("openclaw-oxlint-invalid-limit-"));
     fs.mkdirSync(path.join(root, ".git"));
-    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    linkDependencies(root);
     fs.writeFileSync(path.join(root, "fixture.ts"), "console.log(1);\n");
     const invalidConfigs = [
       ...["not-a-severity", 3, null].map((severity) =>
@@ -754,21 +724,16 @@ describe("oxlint config", () => {
         { github: true, changedPaths: undefined },
         { github: false, changedPaths: ["src/changed.ts"] },
       ]) {
-        const result = spawnSync(
-          process.execPath,
-          [path.resolve("scripts/run-oxlint.mts"), "--openclaw-focused-config", "fixture.ts"],
-          {
-            cwd: root,
-            encoding: "utf8",
-            env: {
-              ...process.env,
-              GITHUB_ACTIONS: github ? "true" : "false",
-              OPENCLAW_OXLINT_CHANGED_PATHS: changedPaths && JSON.stringify(changedPaths),
-              OPENCLAW_CI_STATIC_EVIDENCE: "1",
-              OPENCLAW_CI_STATIC_EVIDENCE_ID: "invalid:0",
-            },
+        const result = runTool(root, [oxlintRunner, "--openclaw-focused-config", "fixture.ts"], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GITHUB_ACTIONS: github ? "true" : "false",
+            OPENCLAW_OXLINT_CHANGED_PATHS: changedPaths && JSON.stringify(changedPaths),
+            OPENCLAW_CI_STATIC_EVIDENCE: "1",
+            OPENCLAW_CI_STATIC_EVIDENCE_ID: "invalid:0",
           },
-        );
+        });
         expect(result.error).toBeUndefined();
         expect(
           result.status,

@@ -24,6 +24,19 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const scriptPath = "scripts/package-mac-app.sh";
 const swiftScriptPath = "scripts/lib/mac-swift-build.sh";
 
+function writeExecutable(file: string, source: string) {
+  writeFileSync(file, source);
+  chmodSync(file, 0o755);
+}
+
+function writeFiles(root: string, files: Record<string, string>) {
+  for (const [file, contents] of Object.entries(files)) {
+    const target = path.join(root, file);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, contents);
+  }
+}
+
 describe.skipIf(process.platform === "win32")("cloud-worker app packaging identity", () => {
   const script = readFileSync(scriptPath, "utf8");
   const initialization = script.slice(
@@ -129,14 +142,13 @@ describe.skipIf(process.platform === "win32" || availableParallelism() < 2)(
         const mountParent = path.join(root, "Darwin private temp");
         mkdirSync(mountParent);
         const getconf = path.join(root, "getconf");
-        writeFileSync(
+        writeExecutable(
           getconf,
           `#!/bin/bash
 [[ "$*" == DARWIN_USER_TEMP_DIR ]] || exit 2
 printf '%s\\n' '${mountParent.replaceAll("'", "'\\''")}'
 `,
         );
-        chmodSync(getconf, 0o755);
         const commit = "b".repeat(40);
         writeFileSync(
           path.join(scripts, "mac-swift-build.sh"),
@@ -430,17 +442,15 @@ function makePlist(): string {
   const plist = path.join(dir, "Info.plist");
   writeFileSync(
     plist,
-    [
-      '<?xml version="1.0" encoding="UTF-8"?>',
-      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-      '<plist version="1.0">',
-      "<dict>",
-      "<key>CFBundleIdentifier</key>",
-      "<string>old.bundle</string>",
-      "</dict>",
-      "</plist>",
-      "",
-    ].join("\n"),
+    `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>CFBundleIdentifier</key>
+<string>old.bundle</string>
+</dict>
+</plist>
+`,
     "utf8",
   );
   return plist;
@@ -463,17 +473,6 @@ function scriptBlock(startMarker: string, endMarker: string, file = scriptPath):
   return script.slice(start, end);
 }
 
-function getPackageManagerHelperBlock(): string {
-  return scriptBlock("PNPM_CMD=()", "merge_framework_machos()");
-}
-
-function getMergeFrameworkMachOsBlock(): string {
-  return scriptBlock(
-    "merge_framework_machos()",
-    'PEEKABOO_SOURCE_COMMIT="$(resolve_peekaboo_source_commit)"',
-  );
-}
-
 function runSwiftToolchainHarness(options: {
   swiftVersion: string;
   selectedDeveloperDir: "command-line-tools" | "xcode";
@@ -490,7 +489,7 @@ function runSwiftToolchainHarness(options: {
   mkdirSync(commandLineToolsDir, { recursive: true });
   const xcodebuild = path.join(xcodeDeveloperDir, "usr", "bin", "xcodebuild");
   mkdirSync(path.dirname(xcodebuild), { recursive: true });
-  writeFileSync(
+  writeExecutable(
     xcodebuild,
     `#!/bin/bash
 [[ "$*" == "-version" ]] || exit 2
@@ -501,35 +500,23 @@ ${
 }
 `,
   );
-  chmodSync(xcodebuild, 0o755);
-  writeFileSync(
+  writeExecutable(
     path.join(toolsDir, "xcrun"),
-    [
-      "#!/bin/bash",
-      '[[ "${1:-}" == "xcodebuild" && "${2:-}" == "-version" ]] || exit 2',
-      'developer_dir="${DEVELOPER_DIR:-$MOCK_SELECTED_DEVELOPER_DIR}"',
-      'xcodebuild="$developer_dir/usr/bin/xcodebuild"',
-      'if [[ ! -x "$xcodebuild" ]]; then',
-      '  echo "xcrun: error: unable to find utility xcodebuild" >&2',
-      "  exit 1",
-      "fi",
-      'exec "$xcodebuild" "${@:2}"',
-      "",
-    ].join("\n"),
-    "utf8",
+    `#!/bin/bash
+[[ "\${1:-}" == "xcodebuild" && "\${2:-}" == "-version" ]] || exit 2
+developer_dir="\${DEVELOPER_DIR:-$MOCK_SELECTED_DEVELOPER_DIR}"
+xcodebuild="$developer_dir/usr/bin/xcodebuild"
+if [[ ! -x "$xcodebuild" ]]; then
+  echo "xcrun: error: unable to find utility xcodebuild" >&2
+  exit 1
+fi
+exec "$xcodebuild" "\${@:2}"
+`,
   );
-  writeFileSync(
+  writeExecutable(
     path.join(toolsDir, "swift"),
-    [
-      "#!/bin/bash",
-      `echo 'swift-driver version: 1.120.0 Apple Swift version ${options.swiftVersion} (swiftlang-${options.swiftVersion} clang-1700.0.13.5)'`,
-      "",
-    ].join("\n"),
-    "utf8",
+    `#!/bin/bash\necho 'swift-driver version: 1.120.0 Apple Swift version ${options.swiftVersion} (swiftlang-${options.swiftVersion} clang-1700.0.13.5)'\n`,
   );
-  for (const tool of ["xcrun", "swift"]) {
-    chmodSync(path.join(toolsDir, tool), 0o755);
-  }
 
   return runHelper(`
     set -euo pipefail
@@ -541,40 +528,17 @@ ${
   `);
 }
 
-function getSparkleBuildHelperBlock(): string {
-  return scriptBlock(
-    "sparkle_canonical_build_from_version()",
-    'source "$ROOT_DIR/scripts/lib/mac-swift-build.sh"',
-  );
-}
-
-function getPeekabooSourceCommitHelperBlock(): string {
-  return scriptBlock(
-    "resolve_peekaboo_source_commit() {",
-    "sparkle_canonical_build_from_version()",
-  );
-}
-
 function runPeekabooSourceCommitHarness(packageResolved: string, expectedRevision?: string) {
   const root = tempDirs.make("openclaw-package-peekaboo-source-");
-  const resolvedFile = path.join(root, "apps", "macos", "Package.resolved");
-  mkdirSync(path.dirname(resolvedFile), { recursive: true });
-  writeFileSync(resolvedFile, packageResolved, "utf8");
+  writeFiles(root, { "apps/macos/Package.resolved": packageResolved });
 
   return runHelper(`
     set -euo pipefail
     ROOT_DIR=${JSON.stringify(root)}
     ${expectedRevision ? `export OPENCLAW_EXPECTED_PEEKABOO_SOURCE_COMMIT=${JSON.stringify(expectedRevision)}` : "unset OPENCLAW_EXPECTED_PEEKABOO_SOURCE_COMMIT"}
-    ${getPeekabooSourceCommitHelperBlock()}
+    ${scriptBlock("resolve_peekaboo_source_commit() {", "sparkle_canonical_build_from_version()")}
     resolve_peekaboo_source_commit
   `);
-}
-
-function getSourceProvenanceStampBlock(): string {
-  return scriptBlock(
-    'plist_set_string_required "$APP_ROOT/Contents/Info.plist" OpenClawBuildTimestamp',
-    'plist_set_or_add_string "$APP_ROOT/Contents/Info.plist" SUFeedURL',
-  );
 }
 
 function runSourceProvenanceStampHarness(corruptKey?: string) {
@@ -611,19 +575,11 @@ function runSourceProvenanceStampHarness(corruptKey?: string) {
     BUILD_GIT_COMMIT=${JSON.stringify(openClawCommit)}
     PEEKABOO_SOURCE_COMMIT=${JSON.stringify(peekabooCommit)}
     BUILD_CONFIG=release
-    ${getSourceProvenanceStampBlock()}
+    ${scriptBlock('plist_set_string_required "$APP_ROOT/Contents/Info.plist" OpenClawBuildTimestamp', 'plist_set_or_add_string "$APP_ROOT/Contents/Info.plist" SUFeedURL')}
     printf '%s\n%s\n' "$stamped_openclaw" "$stamped_peekaboo"
   `);
 
   return { result, openClawCommit, peekabooCommit };
-}
-
-function getMLXTTSHelperBuildBlock(): string {
-  return scriptBlock(
-    "helper_build_path_for_arch() {",
-    "sparkle_framework_for_arch()",
-    swiftScriptPath,
-  );
 }
 
 function getSwiftPackageResolutionBlock(): string {
@@ -660,10 +616,6 @@ function snapshotImageInfoPlist(imagePath?: string): string {
 </dict>
 </plist>
 `;
-}
-
-function getCompiledPeekabooHelperBlock(): string {
-  return scriptBlock("compiled_peekaboo_commit() {", "swiftpm_resource_sources()", swiftScriptPath);
 }
 
 function fixtureGit(cwd: string, ...args: string[]) {
@@ -767,32 +719,9 @@ function runRealCompiledPeekabooHarness(
 
   return runHelper(`
     set -euo pipefail
-    ${getCompiledPeekabooHelperBlock()}
+    ${scriptBlock("compiled_peekaboo_commit() {", "swiftpm_resource_sources()", swiftScriptPath)}
     compiled_peekaboo_commit ${JSON.stringify(buildPath)} ${JSON.stringify(expectedOverride ?? head)}
   `);
-}
-
-function getStopPackagedAppBlock(): string {
-  return scriptBlock("running_packaged_app_pids()", 'if [[ -n "${SIGN_IDENTITY:-}" ]]');
-}
-
-function getSwiftCompatibilityBlock(): string {
-  return scriptBlock(
-    'echo "📦 Copying Swift 6.2 compatibility libraries"',
-    'echo "🖼  Compiling app icon"',
-  );
-}
-
-function getSwiftPMResourceBundleBlock(): string {
-  return scriptBlock('echo "📦 Copying SwiftPM resource bundles"', "running_packaged_app_pids()");
-}
-
-function getSwiftPMResourcePatchBlock(): string {
-  return scriptBlock(
-    "swiftpm_resource_sources()",
-    "cleanup_swift_architecture() {",
-    swiftScriptPath,
-  );
 }
 
 const swiftPMResourceBundles = [
@@ -855,7 +784,7 @@ function runSwiftPMResourceBundleHarness(options: { missingBundle?: string } = {
       [[ "$#" -eq 1 && "$1" == "$PRIMARY_ARCH" ]] || return 1
       printf '%s\\n' ${JSON.stringify(helperBuildProducts)}
     }
-    ${getSwiftPMResourceBundleBlock()}
+    ${scriptBlock('echo "📦 Copying SwiftPM resource bundles"', "running_packaged_app_pids()")}
   `);
 
   return { appRoot, result };
@@ -882,32 +811,28 @@ function runSwiftPMResourcePatchHarness(failRestore = false) {
   const fixtures = new Map([
     [
       keyboardShortcuts,
-      [
-        "import Foundation",
-        "extension String {",
-        "  var localized: String {",
-        "    NSLocalizedString(self, bundle: .module, comment: self)",
-        "  }",
-        "}",
-        "",
-        "extension Data {",
-        "}",
-        "",
-      ].join("\n"),
+      `import Foundation
+extension String {
+  var localized: String {
+    NSLocalizedString(self, bundle: .module, comment: self)
+  }
+}
+
+extension Data {
+}
+`,
     ],
     [
       swiftMathFont,
-      [
-        "import Foundation",
-        "#if os(macOS)",
-        "import AppKit",
-        "#endif",
-        "",
-        "/// Now available for everyone to use",
-        'let first = Bundle.module.url(forResource: "mathFonts", withExtension: "bundle")',
-        'let second = Bundle.module.url(forResource: "mathFonts", withExtension: "bundle")',
-        "",
-      ].join("\n"),
+      `import Foundation
+#if os(macOS)
+import AppKit
+#endif
+
+/// Now available for everyone to use
+let first = Bundle.module.url(forResource: "mathFonts", withExtension: "bundle")
+let second = Bundle.module.url(forResource: "mathFonts", withExtension: "bundle")
+`,
     ],
     [
       swiftMathLegacyFont,
@@ -924,7 +849,7 @@ function runSwiftPMResourcePatchHarness(failRestore = false) {
     set -euo pipefail
     SWIFT_WORK_ROOT=${JSON.stringify(workRoot)}
     BUILD_PATH=${JSON.stringify(buildPath)}
-    ${getSwiftPMResourcePatchBlock()}
+    ${scriptBlock("swiftpm_resource_sources()", "cleanup_swift_architecture() {", swiftScriptPath)}
     patch_swiftpm_resource_lookups ${JSON.stringify(buildPath)}
     grep -q keyboardShortcutsPackagedResources ${JSON.stringify(keyboardShortcuts)}
     test "$(grep -c swiftMathPackagedResources ${JSON.stringify(swiftMathFont)})" -eq 3
@@ -948,16 +873,9 @@ function runStopPackagedAppHarness() {
   const pgrepPath = path.join(toolsDir, "pgrep");
   const sleepPath = path.join(toolsDir, "sleep");
 
-  writeFileSync(
-    lsofPath,
-    ["#!/bin/bash", `printf 'n%s\\n' ${JSON.stringify(appBinary)}`].join("\n"),
-    "utf8",
-  );
-  writeFileSync(pgrepPath, "#!/bin/bash\nprintf '123\\n'\n", "utf8");
-  writeFileSync(sleepPath, "#!/bin/bash\nexit 0\n", "utf8");
-  chmodSync(lsofPath, 0o755);
-  chmodSync(pgrepPath, 0o755);
-  chmodSync(sleepPath, 0o755);
+  writeExecutable(lsofPath, `#!/bin/bash\nprintf 'n%s\\n' ${JSON.stringify(appBinary)}`);
+  writeExecutable(pgrepPath, "#!/bin/bash\nprintf '123\\n'\n");
+  writeExecutable(sleepPath, "#!/bin/bash\nexit 0\n");
 
   return runHelper(`
     set -euo pipefail
@@ -967,7 +885,7 @@ function runStopPackagedAppHarness() {
     kill() {
       return 0
     }
-    ${getStopPackagedAppBlock()}
+    ${scriptBlock("running_packaged_app_pids()", 'if [[ -n "${SIGN_IDENTITY:-}" ]]')}
     stop_packaged_app_if_running
   `);
 }
@@ -979,12 +897,7 @@ function runSwiftCompatibilityHarness() {
   const appRoot = path.join(root, "OpenClaw.app");
   const xcodeSelectPath = path.join(toolsDir, "xcode-select");
 
-  writeFileSync(
-    xcodeSelectPath,
-    ["#!/bin/bash", `printf '%s\\n' ${JSON.stringify(developerDir)}`].join("\n"),
-    "utf8",
-  );
-  chmodSync(xcodeSelectPath, 0o755);
+  writeExecutable(xcodeSelectPath, `#!/bin/bash\nprintf '%s\\n' ${JSON.stringify(developerDir)}`);
 
   return runHelper(`
     set -euo pipefail
@@ -992,24 +905,20 @@ function runSwiftCompatibilityHarness() {
     BUILD_CONFIG=release
     PATH=${JSON.stringify(`${toolsDir}:/usr/bin:/bin`)}
     mkdir -p "$APP_ROOT/Contents/Frameworks"
-    ${getSwiftCompatibilityBlock()}
+    ${scriptBlock('echo "📦 Copying Swift 6.2 compatibility libraries"', 'echo "🖼  Compiling app icon"')}
   `);
 }
 
 function runSwiftPackageResolutionHarness() {
   const root = tempDirs.make("openclaw-swift-resolve-root-");
   const toolsDir = tempDirs.make("openclaw-swift-resolve-tools-");
+
   const resolvedFile = path.join(root, "apps", "macos", "Package.resolved");
   const swiftPath = path.join(toolsDir, "swift");
 
   mkdirSync(path.dirname(resolvedFile), { recursive: true });
   writeFileSync(resolvedFile, "locked\n", { encoding: "utf8", flag: "wx" });
-  writeFileSync(
-    swiftPath,
-    ["#!/bin/bash", `printf 'changed\\n' > ${JSON.stringify(resolvedFile)}`].join("\n"),
-    "utf8",
-  );
-  chmodSync(swiftPath, 0o755);
+  writeExecutable(swiftPath, `#!/bin/bash\nprintf 'changed\\n' > ${JSON.stringify(resolvedFile)}`);
 
   const result = runHelper(`
     set -euo pipefail
@@ -1150,7 +1059,10 @@ describe("package-mac-app plist stamping", () => {
         description,
         "Mach-O universal binary with 2 architectures\n" + "architecture detail\n".repeat(65536),
       );
-      const helper = getMergeFrameworkMachOsBlock()
+      const helper = scriptBlock(
+        "merge_framework_machos()",
+        'PEEKABOO_SOURCE_COMMIT="$(resolve_peekaboo_source_commit)"',
+      )
         .replaceAll("/usr/bin/file", "fixture_file")
         .replaceAll("/usr/bin/lipo", "fixture_lipo");
       const result = runHelper(`
@@ -1227,7 +1139,7 @@ describe("package-mac-app plist stamping", () => {
 
       const result = runHelper(`
         set -euo pipefail
-        ${getMergeFrameworkMachOsBlock()}
+        ${scriptBlock("merge_framework_machos()", 'PEEKABOO_SOURCE_COMMIT="$(resolve_peekaboo_source_commit)"')}
         merge_framework_machos ${JSON.stringify(primary)} ${JSON.stringify(destination)} ${JSON.stringify(secondary)}
         /usr/bin/lipo -archs ${JSON.stringify(destinationBinary)}
       `);
@@ -1261,8 +1173,7 @@ describe("package-mac-app plist stamping", () => {
     const helperBuildProducts = path.join(helperBuildRoot, arch, "out", "Products", "Release");
     mkdirSync(helperBuildProducts, { recursive: true });
     writeFileSync(path.join(helperBuildProducts, "openclaw-mlx-tts"), arch);
-    writeFileSync(metalPath, "#!/bin/sh\nexit 1\n");
-    chmodSync(metalPath, 0o755);
+    writeExecutable(metalPath, "#!/bin/sh\nexit 1\n");
 
     const result = runHelper(`
       set -euo pipefail
@@ -1290,7 +1201,7 @@ describe("package-mac-app plist stamping", () => {
       SWIFT_BUILD_JOBS=2
       SWIFT_BUILD_RESULTS=${JSON.stringify(tempRoot)}
       mkdir -p "$SWIFT_BUILD_RESULTS/${arch}"
-      ${getMLXTTSHelperBuildBlock()}
+      ${scriptBlock("helper_build_path_for_arch() {", "sparkle_framework_for_arch()", swiftScriptPath)}
       build_mlx_tts_helper ${arch}
       build_mlx_tts_helper ${arch} --show-bin-path > "$SWIFT_BUILD_RESULTS/${arch}/helper-products"
       swift() { echo unexpected-build >&2; return 99; }
@@ -1350,7 +1261,7 @@ describe("package-mac-app plist stamping", () => {
   });
 
   it("prefers repo Corepack pnpm over a global pnpm shim", () => {
-    const helperBlock = getPackageManagerHelperBlock();
+    const helperBlock = scriptBlock("PNPM_CMD=()", "merge_framework_machos()");
     const tempRoot = tempDirs.make("openclaw-package-pnpm-root-");
     const outerRoot = tempDirs.make("openclaw-package-pnpm-outer-");
     const toolsDir = tempDirs.make("openclaw-package-pnpm-tools-");
@@ -1358,40 +1269,30 @@ describe("package-mac-app plist stamping", () => {
     symlinkSync("/bin/bash", path.join(toolsDir, "bash"));
     symlinkSync("/usr/bin/grep", path.join(toolsDir, "grep"));
 
-    writeFileSync(
-      path.join(tempRoot, "package.json"),
-      '{\n  "packageManager": "pnpm@11.2.2+sha512.test"\n}\n',
-    );
-    writeFileSync(
-      path.join(outerRoot, "package.json"),
-      '{\n  "packageManager": "pnpm@11.8.0+sha512.test"\n}\n',
-    );
-    writeFileSync(
+    writeFiles(tempRoot, {
+      "package.json": '{\n  "packageManager": "pnpm@11.2.2+sha512.test"\n}\n',
+    });
+    writeFiles(outerRoot, {
+      "package.json": '{\n  "packageManager": "pnpm@11.8.0+sha512.test"\n}\n',
+    });
+    writeExecutable(
       path.join(toolsDir, "pnpm"),
-      [
-        "#!/bin/bash",
-        "set -euo pipefail",
-        'printf "global|%s|%s\\n" "$PWD" "$*" >> "$OPENCLAW_TEST_LOG"',
-        'if [[ "${1:-}" == "--version" ]]; then echo "11.8.0"; fi',
-        "",
-      ].join("\n"),
-      "utf8",
+      `#!/bin/bash
+set -euo pipefail
+printf "global|%s|%s\\n" "$PWD" "$*" >> "$OPENCLAW_TEST_LOG"
+if [[ "\${1:-}" == "--version" ]]; then echo "11.8.0"; fi
+`,
     );
-    writeFileSync(
+    writeExecutable(
       path.join(toolsDir, "corepack"),
-      [
-        "#!/bin/bash",
-        "set -euo pipefail",
-        'printf "corepack|%s|%s\\n" "$PWD" "$*" >> "$OPENCLAW_TEST_LOG"',
-        'if [[ "${1:-}" == "pnpm" && "${2:-}" == "--version" ]]; then',
-        '  if grep -q "pnpm@11.2.2" package.json 2>/dev/null; then echo "11.2.2"; else echo "11.8.0"; fi',
-        "fi",
-        "",
-      ].join("\n"),
-      "utf8",
+      `#!/bin/bash
+set -euo pipefail
+printf "corepack|%s|%s\\n" "$PWD" "$*" >> "$OPENCLAW_TEST_LOG"
+if [[ "\${1:-}" == "pnpm" && "\${2:-}" == "--version" ]]; then
+  if grep -q "pnpm@11.2.2" package.json 2>/dev/null; then echo "11.2.2"; else echo "11.8.0"; fi
+fi
+`,
     );
-    chmodSync(path.join(toolsDir, "pnpm"), 0o755);
-    chmodSync(path.join(toolsDir, "corepack"), 0o755);
 
     const result = runHelper(`
       set -euo pipefail
@@ -1452,26 +1353,25 @@ describe("package-mac-app plist stamping", () => {
   });
 
   it("runs Sparkle build metadata derivation from the repository root", () => {
-    const helperBlock = getSparkleBuildHelperBlock();
+    const helperBlock = scriptBlock(
+      "sparkle_canonical_build_from_version()",
+      'source "$ROOT_DIR/scripts/lib/mac-swift-build.sh"',
+    );
     const tempRoot = tempDirs.make("openclaw-package-sparkle-root-");
     const toolsDir = tempDirs.make("openclaw-package-sparkle-tools-");
 
     const nodePath = path.join(toolsDir, "node");
-    writeFileSync(
+    writeExecutable(
       nodePath,
-      [
-        "#!/bin/bash",
-        "set -euo pipefail",
-        'if [[ "$PWD" != "$OPENCLAW_ROOT" ]]; then',
-        '  echo "node ran outside repo root: $PWD" >&2',
-        "  exit 1",
-        "fi",
-        "echo 2026060290",
-        "",
-      ].join("\n"),
-      "utf8",
+      `#!/bin/bash
+set -euo pipefail
+if [[ "$PWD" != "$OPENCLAW_ROOT" ]]; then
+  echo "node ran outside repo root: $PWD" >&2
+  exit 1
+fi
+echo 2026060290
+`,
     );
-    chmodSync(nodePath, 0o755);
 
     const result = runHelper(`
       set -euo pipefail
@@ -1526,19 +1426,17 @@ describe("package-mac-app plist stamping", () => {
         mkdirSync(directory, { recursive: true });
       }
       writeFileSync(path.join(appRoot, "candidate"), "verified replacement");
-      writeFileSync(
+      writeExecutable(
         signerPath,
         '#!/bin/bash\nset -euo pipefail\n[[ -d "$1" ]]\nprintf "identity=%s\\n" "${SIGN_IDENTITY-<unset>}"\nprintf "sign\\n" >> "${0%/*}/../events"\n',
       );
-      chmodSync(signerPath, 0o755);
       {
         const node = path.join(appRoot, "Contents/Resources/runtime/bin/bun");
         mkdirSync(path.dirname(node), { recursive: true });
-        writeFileSync(
+        writeExecutable(
           node,
           `#!/bin/bash\nexec '${process.execPath.replaceAll("'", "'\\''")}' "$@"\n`,
         );
-        chmodSync(node, 0o755);
       }
       writeFileSync(
         path.join(scriptsDir, "verify-mac-runtime.mjs"),
@@ -1819,7 +1717,7 @@ try {
       writeFileSync(unrelated, "unrelated snapshot preserved\n");
       writeFileSync(path.join(root, "empty.plist"), snapshotImageInfoPlist());
       const hdiutil = path.join(root, "hdiutil");
-      writeFileSync(
+      writeExecutable(
         hdiutil,
         `#!/bin/bash
         set -euo pipefail
@@ -1850,16 +1748,14 @@ try {
         exit 0
         `,
       );
-      chmodSync(hdiutil, 0o755);
       const mountCommand = path.join(root, "mount");
-      writeFileSync(
+      writeExecutable(
         mountCommand,
         `#!/bin/bash
 printf 'mount\\n' >> "$operations"
 ${mounts === "failed" ? "exit 1" : mounts === "mounted" ? `printf '/dev/disk9 on %s (apfs, read-only)\\n' "$fixture_mount"` : "exit 0"}
 `,
       );
-      chmodSync(mountCommand, 0o755);
 
       const result = runHelper(
         `
@@ -1952,7 +1848,7 @@ ${mounts === "failed" ? "exit 1" : mounts === "mounted" ? `printf '/dev/disk9 on
     writeFileSync(path.join(root, "attached.plist"), snapshotImageInfoPlist(image));
     writeFileSync(path.join(root, "empty.plist"), snapshotImageInfoPlist());
     const hdiutil = path.join(root, "hdiutil");
-    writeFileSync(
+    writeExecutable(
       hdiutil,
       `#!/bin/bash
 set -euo pipefail
@@ -1988,10 +1884,8 @@ case "$1" in
 esac
 `,
     );
-    chmodSync(hdiutil, 0o755);
     const sleep = path.join(root, "sleep");
-    writeFileSync(sleep, '#!/bin/bash\nprintf "sleep %s\\n" "$*" >> "$operations"\n');
-    chmodSync(sleep, 0o755);
+    writeExecutable(sleep, '#!/bin/bash\nprintf "sleep %s\\n" "$*" >> "$operations"\n');
 
     const result = runHelper(
       `
@@ -2055,7 +1949,7 @@ esac
       );
       writeFileSync(path.join(root, "empty.plist"), snapshotImageInfoPlist());
       const hdiutil = path.join(root, "hdiutil");
-      writeFileSync(
+      writeExecutable(
         hdiutil,
         `#!/bin/bash
 set -euo pipefail
@@ -2075,16 +1969,14 @@ else
 fi
 `,
       );
-      chmodSync(hdiutil, 0o755);
       const mountCommand = path.join(root, "mount");
-      writeFileSync(
+      writeExecutable(
         mountCommand,
         `#!/bin/bash
 printf 'mount\\n' >> "$operations"
 printf '/dev/disk99 on /unrelated (apfs, read-only)\\n'
 `,
       );
-      chmodSync(mountCommand, 0o755);
 
       const result = spawnSync(
         "/bin/bash",
@@ -2135,7 +2027,11 @@ printf '/dev/disk99 on /unrelated (apfs, read-only)\\n'
   );
 
   it("stamps only the clean Peekaboo source that SwiftPM actually compiled", () => {
-    const verifier = getCompiledPeekabooHelperBlock();
+    const verifier = scriptBlock(
+      "compiled_peekaboo_commit() {",
+      "swiftpm_resource_sources()",
+      swiftScriptPath,
+    );
     expect(verifier).toContain('"core.commitGraph=false"');
     expect(verifier).toContain('"--no-replace-objects"');
     expect(verifier).toContain('"fsck", "--full", "--strict"');

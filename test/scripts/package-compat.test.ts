@@ -93,6 +93,22 @@ function runShell(root: string, entry: string, script: string) {
   return { ...result, calls };
 }
 
+function runCandidate(script: string, options: Parameters<typeof writeCandidate>[1] = {}) {
+  const root = tempDirs.make("openclaw-consent-");
+  return runShell(root, writeCandidate(root, options), script);
+}
+
+function clawhubScenario(environment: string, node = "") {
+  return `
+export OPENCLAW_PLUGINS_SWEEP_SOURCE_ONLY=1
+export OPENCLAW_PLUGINS_E2E_CLAWHUB=1
+${environment}
+source scripts/e2e/lib/plugins/sweep.sh
+${node}
+run_plugins_clawhub_scenario
+`;
+}
+
 const fixtureCommand = `
 source scripts/lib/openclaw-e2e-instance.sh
 openclaw_e2e_fixture_plugin_command openclaw_e2e_maybe_timeout 5s node "$OPENCLAW_ENTRY" --
@@ -144,12 +160,10 @@ describe("package fixture consent compatibility", () => {
   it.each([true, false])(
     "runs the plugin sweep with selective consent (supported=%s)",
     (supported) => {
-      const root = tempDirs.make("openclaw-consent-sweep-");
-      const entry = writeCandidate(root, {
+      const result = runCandidate(sweepFixtureLoader, {
         commands: supported ? undefined : [],
         preserveUninstallIntent: true,
       });
-      const result = runShell(root, entry, sweepFixtureLoader);
       expect(result.status, result.stderr).toBe(0);
       const mutations = result.calls.filter(
         (args) => args[0] === "plugins" && !args.includes("--help"),
@@ -176,12 +190,7 @@ describe("package fixture consent compatibility", () => {
   it.each([true, false])(
     "runs kitchen-sink success and registry failure (supported=%s)",
     (supported) => {
-      const root = tempDirs.make("openclaw-consent-kitchen-");
-      const result = runShell(
-        root,
-        writeCandidate(root, { commands: supported ? undefined : [] }),
-        kitchenFixtureLoader,
-      );
+      const result = runCandidate(kitchenFixtureLoader, { commands: supported ? undefined : [] });
       expect(result.status, result.stderr).toBe(0);
       const installs = result.calls.filter(
         (args) => args[1] === "install" && !args.includes("--help"),
@@ -197,14 +206,11 @@ describe("package fixture consent compatibility", () => {
   );
 
   it("probes each command and preserves literal argv", () => {
-    const root = tempDirs.make("openclaw-consent-argv-");
-    const entry = writeCandidate(root, { commands: ["install", "update"] });
-    const result = runShell(
-      root,
-      entry,
+    const result = runCandidate(
       `${fixtureCommand} plugins install 'file:a b/$(literal)' --force ''
 ${fixtureCommand} plugins enable fixture
 ${fixtureCommand} plugins update fixture`,
+      { commands: ["install", "update"] },
     );
     expect(result.status, result.stderr).toBe(0);
     expect(result.calls).toEqual([
@@ -220,25 +226,21 @@ ${fixtureCommand} plugins update fixture`,
   it.each([true, false])(
     "consents to ClawHub install but not unchanged update (supported=%s)",
     (supported) => {
-      const root = tempDirs.make("openclaw-consent-clawhub-");
-      const result = runShell(
-        root,
-        writeCandidate(root, { commands: supported ? undefined : [] }),
-        `
-export OPENCLAW_PLUGINS_SWEEP_SOURCE_ONLY=1
-export OPENCLAW_PLUGINS_E2E_CLAWHUB=1
+      const result = runCandidate(
+        clawhubScenario(
+          `
 export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=1
 export OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC=clawhub:@example/consent-fixture
 export OPENCLAW_PLUGINS_E2E_CLAWHUB_ID=consent-fixture
-source scripts/e2e/lib/plugins/sweep.sh
-node() {
+`,
+          `node() {
   case "$1" in
     scripts/e2e/lib/plugins/assertions.mjs) return 0 ;;
     *) command node "$@" ;;
   esac
-}
-run_plugins_clawhub_scenario
-`,
+}`,
+        ),
+        { commands: supported ? undefined : [] },
       );
       expect(result.status, result.stderr).toBe(0);
       expect(
@@ -251,18 +253,11 @@ run_plugins_clawhub_scenario
   );
 
   it("requires an explicit package identity for live ClawHub E2E", () => {
-    const root = tempDirs.make("openclaw-clawhub-live-requirements-");
-    const result = runShell(
-      root,
-      writeCandidate(root),
-      `
-export OPENCLAW_PLUGINS_SWEEP_SOURCE_ONLY=1
-export OPENCLAW_PLUGINS_E2E_CLAWHUB=1
+    const result = runCandidate(
+      clawhubScenario(`
 export OPENCLAW_PLUGINS_E2E_LIVE_CLAWHUB=1
 unset OPENCLAW_PLUGINS_E2E_CLAWHUB_SPEC OPENCLAW_PLUGINS_E2E_CLAWHUB_ID
-source scripts/e2e/lib/plugins/sweep.sh
-run_plugins_clawhub_scenario
-`,
+`),
     );
 
     expect(result.status).toBe(2);
@@ -290,16 +285,10 @@ export OPENCLAW_PLUGINS_E2E_CLAWHUB_ID=custom-plugin
       name: "explicit override",
     },
   ])("selects the ClawHub identity for $name", ({ environment, expectedId, expectedSpec }) => {
-    const root = tempDirs.make("openclaw-clawhub-identity-");
-    const result = runShell(
-      root,
-      writeCandidate(root),
-      `
-export OPENCLAW_PLUGINS_SWEEP_SOURCE_ONLY=1
-export OPENCLAW_PLUGINS_E2E_CLAWHUB=1
-${environment}
-source scripts/e2e/lib/plugins/sweep.sh
-node() {
+    const result = runCandidate(
+      clawhubScenario(
+        environment,
+        `node() {
   case "$1" in
     scripts/e2e/lib/clawhub-fixture-server.cjs)
       printf '12345\\n' > "$3"
@@ -308,9 +297,8 @@ node() {
     scripts/e2e/lib/plugins/assertions.mjs) return 0 ;;
     *) command node "$@" ;;
   esac
-}
-run_plugins_clawhub_scenario
-`,
+}`,
+      ),
     );
 
     expect(result.status, result.stderr).toBe(0);
@@ -338,24 +326,17 @@ run_plugins_clawhub_scenario
     ["kitchen-sink", "error"],
     ["kitchen-sink", "timeout"],
   ])("%s logger fails before mutation on help %s", (suite, failure) => {
-    const root = tempDirs.make("openclaw-consent-failure-");
-    const entry = writeCandidate(root, failure === "error" ? { helpStatus: 47 } : { hang: true });
-    const result = runShell(
-      root,
-      entry,
-      suite === "plugins"
-        ? `
-export OPENCLAW_PLUGINS_SWEEP_SOURCE_ONLY=1
-export OPENCLAW_PLUGINS_CLI_TIMEOUT=1s
-source scripts/e2e/lib/plugins/sweep.sh
-run_plugins_fixture_logged failure plugins install fixture --force
-`
-        : `
-export KITCHEN_SINK_SWEEP_SOURCE_ONLY=1
-export KITCHEN_SINK_CLI_TIMEOUT=1s
-source scripts/e2e/lib/kitchen-sink-plugin/sweep.sh
-run_kitchen_sink_fixture_logged failure plugins install fixture --force
+    const prefix = suite === "plugins" ? "OPENCLAW_PLUGINS" : "KITCHEN_SINK";
+    const directory = suite === "plugins" ? "plugins" : "kitchen-sink-plugin";
+    const runner = suite === "plugins" ? "plugins" : "kitchen_sink";
+    const result = runCandidate(
+      `
+export ${prefix}_SWEEP_SOURCE_ONLY=1
+export ${prefix}_CLI_TIMEOUT=1s
+source scripts/e2e/lib/${directory}/sweep.sh
+run_${runner}_fixture_logged failure plugins install fixture --force
 `,
+      failure === "error" ? { helpStatus: 47 } : { hang: true },
     );
     expect(result.status, result.stderr).toBe(failure === "error" ? 47 : 124);
     expect(result.stdout + result.stderr).toContain("help probe failed");
@@ -363,12 +344,7 @@ run_kitchen_sink_fixture_logged failure plugins install fixture --force
   });
 
   it("returns the mutation exit status", () => {
-    const root = tempDirs.make("openclaw-consent-exit-");
-    const result = runShell(
-      root,
-      writeCandidate(root, { exitCode: 49 }),
-      `${fixtureCommand} plugins install fixture`,
-    );
+    const result = runCandidate(`${fixtureCommand} plugins install fixture`, { exitCode: 49 });
     expect(result.status).toBe(49);
     expect(result.calls.at(-1)).toEqual(["plugins", "install", "fixture", consent]);
   });
