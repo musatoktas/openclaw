@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { attributeWriterOccupancy } from "../../scripts/diagnostic-writer-occupancy.mts";
 
+const patchOperation = "session-entry.patch";
+const timing = (reservationMs: number, queueWaitMs: number) => ({
+  operation: patchOperation,
+  reservationMs,
+  queueWaitMs,
+});
+const reservation = (estimatedEnd: string, reservationMs: number, queueWaitMs: number) => ({
+  estimatedEnd,
+  ...timing(reservationMs, queueWaitMs),
+});
+
 function warning(
   fields: Record<string, unknown> = {},
   time = "2026-10-13T14:01:01.500Z",
@@ -9,7 +20,7 @@ function warning(
   return JSON.stringify({
     "0": '{"subsystem":"session-sqlite"}',
     "1": {
-      operation: "session-entry.patch",
+      operation: patchOperation,
       pid: 123,
       threadId: 0,
       reentrant: false,
@@ -36,36 +47,21 @@ describe("writer occupancy log report", () => {
     expect(report.observedReservations).toBe(1);
     expect(report.ignoredLines).toBe(3);
     expect(report.operations).toEqual([
-      {
-        operation: "session-entry.patch",
-        count: 1,
-        reservationMs: 2_000,
-        queueWaitMs: 1_000,
-        maxReservationMs: 2_000,
-      },
+      { ...timing(2_000, 1_000), count: 1, maxReservationMs: 2_000 },
     ]);
     expect(report.minutes).toEqual([
       {
         minute: "2026-10-13T14:00:00.000Z",
         maxObservedWaitOverlap: 1,
-        operations: [
-          { operation: "session-entry.patch", reservationMs: 1_000, queueWaitMs: 1_000 },
-        ],
+        operations: [timing(1_000, 1_000)],
       },
       {
         minute: "2026-10-13T14:01:00.000Z",
         maxObservedWaitOverlap: 0,
-        operations: [{ operation: "session-entry.patch", reservationMs: 1_000, queueWaitMs: 0 }],
+        operations: [timing(1_000, 0)],
       },
     ]);
-    expect(report.topReservations).toEqual([
-      {
-        estimatedEnd: "2026-10-13T14:01:01.000Z",
-        operation: "session-entry.patch",
-        reservationMs: 2_000,
-        queueWaitMs: 1_000,
-      },
-    ]);
+    expect(report.topReservations).toEqual([reservation("2026-10-13T14:01:01.000Z", 2_000, 1_000)]);
   });
 
   it("counts simultaneous observed waits only within the same process/thread", async () => {
@@ -94,14 +90,7 @@ describe("writer occupancy log report", () => {
       maxReservationMs: 1_000,
     });
     expect(report.minutes.map((row) => row.operations[0]?.reservationMs)).toEqual([500, 500]);
-    expect(report.topReservations).toEqual([
-      {
-        estimatedEnd: "2026-10-13T14:01:00.500Z",
-        operation: "session-entry.patch",
-        reservationMs: 1_000,
-        queueWaitMs: 0,
-      },
-    ]);
+    expect(report.topReservations).toEqual([reservation("2026-10-13T14:01:00.500Z", 1_000, 0)]);
     const waitOnly = await attributeWriterOccupancy([warning()], {
       from: "2026-10-13T14:00:58.250Z",
       until: "2026-10-13T14:00:58.750Z",
@@ -111,12 +100,7 @@ describe("writer occupancy log report", () => {
       queueWaitMs: 500,
       maxReservationMs: 0,
     });
-    expect(waitOnly.topReservations[0]).toEqual({
-      estimatedEnd: "2026-10-13T14:00:58.750Z",
-      operation: "session-entry.patch",
-      reservationMs: 0,
-      queueWaitMs: 500,
-    });
+    expect(waitOnly.topReservations[0]).toEqual(reservation("2026-10-13T14:00:58.750Z", 0, 500));
     await expect(attributeWriterOccupancy([], { from: "2026-10-13T14:00:00" })).rejects.toThrow(
       "explicit UTC offsets",
     );

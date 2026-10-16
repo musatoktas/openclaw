@@ -37,6 +37,14 @@ const sourceRoot = process.cwd();
 const declarationPath = "dist/plugin-sdk/src/plugin-sdk/qa-channel-protocol.d.ts";
 const tsgoArgs = ["-p", "tsconfig.plugin-sdk.dts.json", "--declaration", "true"];
 const buildArgs = ["--config", "fixture.tsdown.config.ts", "--out-dir", "dist"];
+const sourceScript = (name: string) => path.join(sourceRoot, "scripts", name);
+const exists = (root: string, name: string) => fs.existsSync(path.join(root, name));
+const read = (root: string, name: string) => fs.readFileSync(path.join(root, name), "utf8");
+function expectOwnership(root: string, owner: boolean, unjoined: boolean) {
+  const lock = resolveDistArtifactLockPath(root);
+  expect(exists(lock, "owner.json")).toBe(owner);
+  expect(exists(lock, "unjoined")).toBe(unjoined);
+}
 
 function waitForForeignProcessExit(pid: number, signal: AbortSignal): Promise<void> {
   // Crash cases deliberately remove the compiler's owner. Its checkpoint socket
@@ -292,7 +300,7 @@ async function runWithProcesses(
       },
     });
   } catch (error) {
-    console.error(diagnostics.map((read) => read()).join("\n"));
+    console.error(diagnostics.map((diagnostic) => diagnostic()).join("\n"));
     throw error;
   } finally {
     signal.removeEventListener("abort", abort);
@@ -386,7 +394,7 @@ describe("native check launchers in paths with spaces", () => {
             : ["--mode=package-boundary"],
         );
         const lock = resolveDistArtifactLockPath(root);
-        expect(fs.existsSync(path.join(lock, "owner.json"))).toBe(true);
+        expect(exists(lock, "owner.json")).toBe(true);
         if (!compiler) {
           expect(fs.readdirSync(lock)).toContain(`child-${child.pid}`);
         }
@@ -420,17 +428,14 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         const smokeScript = write(
           root,
           "scripts/test-built-plugin-singleton.mts",
-          fs.readFileSync(path.join(sourceRoot, "scripts/test-built-plugin-singleton.mts"), "utf8"),
+          fs.readFileSync(sourceScript("test-built-plugin-singleton.mts"), "utf8"),
         );
         for (const entry of [
           "lib",
           "process-warning-filter.mts",
           "stage-bundled-plugin-runtime.mts",
         ]) {
-          fs.symlinkSync(
-            path.join(sourceRoot, "scripts", entry),
-            path.join(root, "scripts", entry),
-          );
+          fs.symlinkSync(sourceScript(entry), path.join(root, "scripts", entry));
         }
         const importJoined = path.join(root, "import-joined");
         const smokePid = path.join(root, "smoke.pid");
@@ -465,7 +470,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
           `
         import fs from 'node:fs';
         import { createRequire } from 'node:module';
-        import { withDistArtifactOwnership } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};
+        import { withDistArtifactOwnership } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};
         const require = createRequire(import.meta.url);
         await withDistArtifactOwnership(process.cwd(), () => new Promise(resolve => {
           fs.writeFileSync(${JSON.stringify(writerStarted)}, 'started');
@@ -495,7 +500,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         expect(fs.readFileSync(importJoined, "utf8")).toBe("joined");
         const cancelled = await smoke.done;
         expect(cancelled.code, cancelled.output).toBe(exitCode);
-        expect(fs.existsSync(path.join(root, "dist/extensions/build-smoke-plugin"))).toBe(false);
+        expect(exists(root, "dist/extensions/build-smoke-plugin")).toBe(false);
         contenderGate.write("continue");
         expect(await writer.done).toMatchObject({ code: 0 });
         let reacquired = false;
@@ -532,7 +537,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         "writer.mjs",
         `
         import { createRequire } from 'node:module';
-        import { withDistArtifactOwnership } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};
+        import { withDistArtifactOwnership } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};
         const require = createRequire(import.meta.url);
         await withDistArtifactOwnership(process.cwd(), () => new Promise(resolve => {
           ${checkpoint("artifact-writer-ready")}
@@ -546,12 +551,12 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         root,
         "source-runner.mjs",
         `
-        import ${JSON.stringify(path.join(sourceRoot, "scripts/tsx.mjs"))};
+        import ${JSON.stringify(sourceScript("tsx.mjs"))};
         import childProcess from 'node:child_process';
         import { registerHooks, syncBuiltinESMExports } from 'node:module';
         const { registerSourceRunnerServiceFixture } = await import(${JSON.stringify(path.join(sourceRoot, "test/scripts/fixtures/source-runner-service.mjs"))});
         registerSourceRunnerServiceFixture(${JSON.stringify(sourceRoot)});
-        const postbuildUrl = ${JSON.stringify(pathToFileURL(path.join(sourceRoot, "scripts/runtime-postbuild.mts")).href)};
+        const postbuildUrl = ${JSON.stringify(pathToFileURL(sourceScript("runtime-postbuild.mts")).href)};
         registerHooks({
           load(url, context, nextLoad) {
             return url === postbuildUrl
@@ -569,7 +574,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
           }};
         };
         syncBuiltinESMExports();
-        const { runNodeMain } = await import(${JSON.stringify(path.join(sourceRoot, "scripts/run-node.mts"))});
+        const { runNodeMain } = await import(${JSON.stringify(sourceScript("run-node.mts"))});
         process.exitCode = await runNodeMain({
           cwd: process.cwd(), args: ['artifact-fixture'],
           env: { ...process.env, OPENCLAW_FORCE_BUILD: '0', OPENCLAW_BUILD_PRIVATE_QA: '0' },
@@ -597,8 +602,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
     ).catch((cause: unknown) => cause);
     expect(error).toHaveProperty("code", "ENOENT");
     expect((error as { error?: unknown }).error ?? error).toBe(error);
-    expect(fs.existsSync(path.join(resolveDistArtifactLockPath(root), "owner.json"))).toBe(false);
-    expect(fs.existsSync(path.join(resolveDistArtifactLockPath(root), "unjoined"))).toBe(false);
+    expectOwnership(root, false, false);
   });
 
   it.for([false, true])(
@@ -606,9 +610,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
     async (nested, { signal }) => {
       await withProcesses(async ({ start }) => {
         const root = createCheckout();
-        const moduleUrl = pathToFileURL(
-          path.join(sourceRoot, "scripts/lib/dist-artifact-lock.mts"),
-        ).href;
+        const moduleUrl = pathToFileURL(sourceScript("lib/dist-artifact-lock.mts")).href;
         const body = `
         import assert from 'node:assert/strict';
         import fs from 'node:fs';
@@ -647,12 +649,11 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         const result = await start(root, probe).done;
         expect(result.code, result.output).toBe(0);
         const directory = resolveDistArtifactLockPath(root);
-        expect(fs.existsSync(path.join(directory, "owner.json"))).toBe(true);
-        expect(fs.existsSync(path.join(directory, "unjoined"))).toBe(false);
+        expectOwnership(root, true, false);
         expect(fs.readdirSync(directory).filter((name) => name.startsWith("child-"))).toHaveLength(
           nested ? 1 : 0,
         );
-        const owner = fs.readFileSync(path.join(directory, "owner.json"), "utf8");
+        const owner = read(directory, "owner.json");
         const artifact = write(root, "dist/retained-artifact.txt", "previous generation");
         const nextWriter = write(
           root,
@@ -669,14 +670,14 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         expect(denied.code, denied.output).toBe(1);
         expect(denied.output).toContain("Could not acquire");
         expect(fs.readFileSync(artifact, "utf8")).toBe("previous generation");
-        expect(fs.readFileSync(path.join(directory, "owner.json"), "utf8")).toBe(owner);
+        expect(read(directory, "owner.json")).toBe(owner);
 
         // Every fixture process has exited; the synthetic failure started no detached compiler.
         fs.rmSync(directory, { recursive: true });
         const recovered = await start(root, nextWriter).done;
         expect(recovered.code, recovered.output).toBe(0);
         expect(fs.readFileSync(artifact, "utf8")).toBe("next generation");
-        expect(fs.existsSync(path.join(directory, "owner.json"))).toBe(false);
+        expect(exists(directory, "owner.json")).toBe(false);
       }, signal);
     },
   );
@@ -693,7 +694,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
           "retained-error.mts",
           `
           import assert from 'node:assert/strict';
-          import { withDistArtifactOwnership } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};
+          import { withDistArtifactOwnership } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};
           const kind = ${JSON.stringify(kind)};
           const uncertainty = { processTreeState: 'indeterminate' };
           const aggregate = new AggregateError([], 'sibling cleanup');
@@ -708,9 +709,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         `,
         );
         const result = await start(root, probe).done;
-        const directory = resolveDistArtifactLockPath(root);
-        expect(fs.existsSync(path.join(directory, "owner.json"))).toBe(true);
-        expect(fs.existsSync(path.join(directory, "unjoined"))).toBe(true);
+        expectOwnership(root, true, true);
         expect(result.code, result.output).toBe(0);
       }, signal);
     },
@@ -808,12 +807,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         expect(result.output).toContain("cleanup unverified");
         expect(fs.existsSync(cleanupAttempt), result.output).toBe(false);
         expect(treeHashes(path.join(root, "dist"))).toEqual(previousOutputs);
-        expect(fs.existsSync(path.join(root, ".artifacts/dist-artifacts.lock/owner.json"))).toBe(
-          true,
-        );
-        expect(fs.existsSync(path.join(root, ".artifacts/dist-artifacts.lock/unjoined"))).toBe(
-          true,
-        );
+        expectOwnership(root, true, true);
         expect(
           fs
             .readdirSync(path.join(root, ".artifacts"))
@@ -837,7 +831,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         if (unjoined) {
           write(root, ".artifacts/dist-artifacts.lock/unjoined", "unverified cleanup");
         }
-        const command = start(root, path.join(sourceRoot, "scripts/run-tsgo.mjs"), ["--version"]);
+        const command = start(root, sourceScript("run-tsgo.mjs"), ["--version"]);
         const result = await command.done;
         expect(result.code).toBe(1);
         expect(result.output).toContain("Could not acquire");
@@ -861,7 +855,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         `
         import assert from 'node:assert/strict';
         import fs from 'node:fs';
-        import { withDistArtifactOwnership } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};
+        import { withDistArtifactOwnership } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};
         const kill = process.kill;
         // Release after fs-safe observes contention, just before the PID probe.
         process.kill = (pid, signal) => {
@@ -908,14 +902,14 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
           "--declaration",
           "true",
         ];
-        const compilerScript = path.join(sourceRoot, "scripts/run-tsgo.mts");
+        const compilerScript = sourceScript("run-tsgo.mts");
         const writerScript = nested
           ? write(
               root,
               "nested-writer.mts",
               `
-          import { withDistArtifactOwnership, distArtifactEntryArgs } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};
-          import { runManagedCommand } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/managed-child-process.mts"))};
+          import { withDistArtifactOwnership, distArtifactEntryArgs } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};
+          import { runManagedCommand } from ${JSON.stringify(sourceScript("lib/managed-child-process.mts"))};
           await withDistArtifactOwnership(${JSON.stringify(cwd)}, () => runManagedCommand({
             bin: process.execPath, args: distArtifactEntryArgs(${JSON.stringify(compilerScript)}, ${JSON.stringify(writerArgs)}), requireProcessTreeExit: true,
           }));
@@ -933,8 +927,8 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
           root,
           "contender.mts",
           `
-        import { withDistArtifactOwnership } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};
-        import { runTsdownBuild } from ${JSON.stringify(path.join(sourceRoot, "scripts/tsdown-build.mts"))};
+        import { withDistArtifactOwnership } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};
+        import { runTsdownBuild } from ${JSON.stringify(sourceScript("tsdown-build.mts"))};
         const now = Date.now;
         let reads = 0;
         Date.now = () => now() + reads++ * 16 * 60 * 1000;
@@ -957,7 +951,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         expect(fs.existsSync(declaration)).toBe(false);
 
         installCompiler(root, checkpoint("next-declarations-ready"));
-        const nextWriter = start(root, path.join(sourceRoot, "scripts/run-tsgo.mts"), tsgoArgs);
+        const nextWriter = start(root, sourceScript("run-tsgo.mts"), tsgoArgs);
         await Promise.race([
           nextWriter.waiting,
           waitEvent("next-declarations-ready"),
@@ -969,11 +963,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
 
         const otherRoot = createCheckout();
         installCompiler(otherRoot, checkpoint("other-checkout-ready"));
-        const independent = start(
-          otherRoot,
-          path.join(sourceRoot, "scripts/run-tsgo.mts"),
-          tsgoArgs,
-        );
+        const independent = start(otherRoot, sourceScript("run-tsgo.mts"), tsgoArgs);
         (await independent.event("other-checkout-ready")).write("continue");
         expect(await independent.done).toMatchObject({ code: 0 });
         expect(fs.existsSync(declaration)).toBe(false);
@@ -1005,16 +995,16 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
           `import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);`,
           checkpoint("exit-owner"),
           `socket.on('data', () => process.exit(2));`,
-          `process.argv = [process.execPath, ${JSON.stringify(path.join(sourceRoot, "scripts/run-tsgo.mts"))}, ...${JSON.stringify(tsgoArgs)}];`,
-          `await import(${JSON.stringify(path.join(sourceRoot, "scripts/run-tsgo.mts"))});`,
+          `process.argv = [process.execPath, ${JSON.stringify(sourceScript("run-tsgo.mts"))}, ...${JSON.stringify(tsgoArgs)}];`,
+          `await import(${JSON.stringify(sourceScript("run-tsgo.mts"))});`,
         ].join("\n"),
       );
       const supervisor = start(root, owner, [], resourceOwner);
       const compilerGate = await supervisor.event("orphan-ready");
-      const compilerPid = Number(fs.readFileSync(path.join(root, "compiler.pid"), "utf8"));
+      const compilerPid = Number(read(root, "compiler.pid"));
       (await waitEvent("exit-owner")).write("exit");
       expect(await supervisor.done).toMatchObject({ code: 2 });
-      const build = start(root, path.join(sourceRoot, "scripts/tsdown-build.mts"), buildArgs);
+      const build = start(root, sourceScript("tsdown-build.mts"), buildArgs);
       await Promise.race([build.waiting, waitEvent("orphan-build-started"), build.done]);
       expect(
         fs.existsSync(path.join(root, declarationPath)),
@@ -1024,9 +1014,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         code: 1,
         output: expect.stringContaining("PID death alone is not sufficient."),
       });
-      expect(fs.existsSync(path.join(root, ".artifacts/dist-artifacts.lock/owner.json"))).toBe(
-        true,
-      );
+      expect(exists(root, ".artifacts/dist-artifacts.lock/owner.json")).toBe(true);
       expect(() => resourceOwner.assertReleased()).toThrow("Unreleased Vitest resource claim");
       compilerGate.write("continue");
       await waitForForeignProcessExit(compilerPid, signal);
@@ -1052,19 +1040,19 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         root,
         "owner.mts",
         [
-          `import { withDistArtifactOwnership, distArtifactEntryArgs } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/dist-artifact-ownership.mts"))};`,
-          `import { runManagedCommand } from ${JSON.stringify(path.join(sourceRoot, "scripts/lib/managed-child-process.mts"))};`,
+          `import { withDistArtifactOwnership, distArtifactEntryArgs } from ${JSON.stringify(sourceScript("lib/dist-artifact-ownership.mts"))};`,
+          `import { runManagedCommand } from ${JSON.stringify(sourceScript("lib/managed-child-process.mts"))};`,
           `await withDistArtifactOwnership(process.cwd(), () => runManagedCommand({`,
-          `bin: process.execPath, args: distArtifactEntryArgs(${JSON.stringify(path.join(sourceRoot, "scripts/run-tsgo.mts"))}, ${JSON.stringify(tsgoArgs)}), requireProcessTreeExit: true }));`,
+          `bin: process.execPath, args: distArtifactEntryArgs(${JSON.stringify(sourceScript("run-tsgo.mts"))}, ${JSON.stringify(tsgoArgs)}), requireProcessTreeExit: true }));`,
         ].join("\n"),
       );
       const supervisor = start(root, owner, [], resourceOwner);
       const compilerGate = await supervisor.event("nested-compiler-ready");
-      const compiler = JSON.parse(fs.readFileSync(path.join(root, "compiler.json"), "utf8"));
+      const compiler = JSON.parse(read(root, "compiler.json"));
       try {
         process.kill(compiler.wrapper, "SIGKILL");
         await supervisor.done;
-        const build = start(root, path.join(sourceRoot, "scripts/tsdown-build.mts"), buildArgs);
+        const build = start(root, sourceScript("tsdown-build.mts"), buildArgs);
         await Promise.race([build.waiting, waitEvent("nested-build-started"), build.done]);
         expect(
           fs.existsSync(path.join(root, declarationPath)),
@@ -1107,9 +1095,9 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
         shards.event("shard-pages"),
         shards.event("shard-e2e"),
       ]);
-      const build = start(root, path.join(sourceRoot, "scripts/tsdown-build.mts"), buildArgs);
+      const build = start(root, sourceScript("tsdown-build.mts"), buildArgs);
       await Promise.race([build.waiting, waitEvent("shard-build-started"), build.done]);
-      expect(fs.existsSync(path.join(root, "dist/still-consumed.txt"))).toBe(true);
+      expect(exists(root, "dist/still-consumed.txt")).toBe(true);
       pages.write("continue");
       e2e.write("continue");
       expect(await shards.done).toMatchObject({ code: 0 });
@@ -1176,30 +1164,22 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
       ]);
       const ready = await consumer.event("lint-consuming");
       expect(
-        fs.readFileSync(
-          path.join(root, "packages/plugin-sdk/dist/src/plugin-sdk/qa-channel-protocol.d.ts"),
-          "utf8",
-        ),
+        read(root, "packages/plugin-sdk/dist/src/plugin-sdk/qa-channel-protocol.d.ts"),
       ).toContain("interface Channel");
-      expect(fs.existsSync(path.join(root, ".artifacts/extension-package-boundary/plugins"))).toBe(
-        false,
-      );
-      const build = start(root, path.join(sourceRoot, "scripts/tsdown-build.mts"), buildArgs);
+      expect(exists(root, ".artifacts/extension-package-boundary/plugins")).toBe(false);
+      const build = start(root, sourceScript("tsdown-build.mts"), buildArgs);
       await Promise.race([build.waiting, waitEvent("lint-build-started"), build.done]);
       expect(
-        fs.existsSync(path.join(root, "dist/still-consumed.txt")),
+        exists(root, "dist/still-consumed.txt"),
         "cleanup must wait through dependent lint",
       ).toBe(true);
       ready.write("continue");
       expect(await consumer.done).toMatchObject({ code: 0 });
       (await build.event("lint-build-started")).write("continue");
       expect(await build.done).toMatchObject({ code: 0 });
-      expect(fs.existsSync(path.join(root, "dist/still-consumed.txt"))).toBe(false);
+      expect(exists(root, "dist/still-consumed.txt")).toBe(false);
       expect(
-        fs.readFileSync(
-          path.join(root, "packages/plugin-sdk/dist/src/plugin-sdk/qa-channel-protocol.d.ts"),
-          "utf8",
-        ),
+        read(root, "packages/plugin-sdk/dist/src/plugin-sdk/qa-channel-protocol.d.ts"),
       ).toContain("interface Channel");
     }, signal);
   }, 30_000);

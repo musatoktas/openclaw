@@ -34,6 +34,17 @@ afterEach(() => {
 });
 
 type Request = { method: string; path: string; authorization: string | null; body?: unknown };
+const request = (
+  method: string,
+  requestPath: string,
+  authorization: string | null,
+  body?: unknown,
+): Request => ({
+  method,
+  path: requestPath,
+  authorization,
+  ...(body === undefined ? {} : { body }),
+});
 
 async function runDriver(driver: "token" | "webhook", failure?: "identity" | "send") {
   vi.resetModules();
@@ -47,36 +58,36 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
     vi.fn<typeof fetch>(async (input, init) => {
       const incoming = new globalThis.Request(input, init);
       const url = new URL(incoming.url);
-      const request = {
+      const call = {
         method: incoming.method,
         path: `${url.pathname}${url.search}`.replace(/^\/api\/v10/u, ""),
         authorization: incoming.headers.get("Authorization"),
         ...(incoming.body === null ? {} : { body: await incoming.json() }),
       };
-      requests.push(request);
+      requests.push(call);
       if (
-        (failure === "identity" && request.path === "/users/@me") ||
+        (failure === "identity" && call.path === "/users/@me") ||
         (failure === "send" &&
-          (request.path === "/channels/parent/messages" || request.path.endsWith("?wait=true")))
+          (call.path === "/channels/parent/messages" || call.path.endsWith("?wait=true")))
       ) {
         return Response.json(
           { message: "synthetic refusal" },
           { status: 403, statusText: "Forbidden" },
         );
       }
-      if (request.path === "/users/@me") {
+      if (call.path === "/users/@me") {
         return Response.json({ id: "driver-user" });
       }
-      if (request.path === "/channels/parent/webhooks") {
+      if (call.path === "/channels/parent/webhooks") {
         return Response.json({ id: "webhook", token: "synthetic-webhook" });
       }
-      if (request.method === "POST") {
+      if (call.method === "POST") {
         return Response.json({ id: "sent", author: { id: sender } });
       }
-      if (request.method === "DELETE") {
+      if (call.method === "DELETE") {
         return new Response(null, { status: 204 });
       }
-      expect(request.path).toBe("/channels/thread/messages?limit=50");
+      expect(call.path).toBe("/channels/thread/messages?limit=50");
       return Response.json([
         { id: "sender-copy", author: { id: sender }, content: ackToken },
         { id: "ack", author: { id: "agent-user", username: "Agent" }, content: ackToken },
@@ -92,24 +103,17 @@ async function runDriver(driver: "token" | "webhook", failure?: "identity" | "se
   process.argv = [
     process.execPath,
     path.resolve("scripts/dev/discord-acp-plain-language-smoke.ts"),
-    "--channel",
-    "parent",
-    "--driver",
-    driver,
-    "--token",
-    "synthetic-driver",
-    "--bot-token",
-    "synthetic-bot",
-    "--token-prefix",
-    "Bot",
-    "--bot-token-prefix",
-    "Bot",
-    "--agent",
-    "codex",
-    "--mention",
-    "mentioned-user",
-    "--instruction",
-    "Synthetic ACP instruction",
+    ...Object.entries({
+      channel: "parent",
+      driver,
+      token: "synthetic-driver",
+      "bot-token": "synthetic-bot",
+      "token-prefix": "Bot",
+      "bot-token-prefix": "Bot",
+      agent: "codex",
+      mention: "mentioned-user",
+      instruction: "Synthetic ACP instruction",
+    }).flatMap(([flag, value]) => [`--${flag}`, value]),
     "--json",
   ];
   await expect(import("../../scripts/dev/discord-acp-plain-language-smoke.ts")).rejects.toBe(
@@ -156,35 +160,25 @@ it.each(["token", "webhook"] as const)(
       allowed_mentions: { parse: [], users: ["mentioned-user"] },
     };
     expect(result.requests).toEqual([
-      { method: "GET", path: "/users/@me", authorization: auth },
+      request("GET", "/users/@me", auth),
       ...(driver === "webhook"
         ? [
-            {
-              method: "POST",
-              path: "/channels/parent/webhooks",
-              authorization: auth,
-              body: { name: "openclaw-acp-smoke-00000000" },
-            },
+            request("POST", "/channels/parent/webhooks", auth, {
+              name: "openclaw-acp-smoke-00000000",
+            }),
           ]
         : []),
-      {
-        method: "POST",
-        path:
-          driver === "token"
-            ? "/channels/parent/messages"
-            : "/webhooks/webhook/synthetic-webhook?wait=true",
-        authorization: driver === "token" ? auth : null,
-        body: message,
-      },
-      { method: "GET", path: "/channels/thread/messages?limit=50", authorization: auth },
+      request(
+        "POST",
+        driver === "token"
+          ? "/channels/parent/messages"
+          : "/webhooks/webhook/synthetic-webhook?wait=true",
+        driver === "token" ? auth : null,
+        message,
+      ),
+      request("GET", "/channels/thread/messages?limit=50", auth),
       ...(driver === "webhook"
-        ? [
-            {
-              method: "DELETE",
-              path: "/webhooks/webhook/synthetic-webhook",
-              authorization: null,
-            },
-          ]
+        ? [request("DELETE", "/webhooks/webhook/synthetic-webhook", null)]
         : []),
     ]);
   },

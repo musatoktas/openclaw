@@ -8,11 +8,11 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { setTimeout as waitForProcessTick } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { testing as promptProbeTesting } from "../../scripts/anthropic-prompt-probe.ts";
-import { testing as claudeUsageTesting } from "../../scripts/debug-claude-usage.ts";
-import { testing as discordSmokeTesting } from "../../scripts/dev/discord-acp-plain-language-smoke.ts";
-import { testing as realtimeSmokeTesting } from "../../scripts/dev/realtime-talk-live-smoke.ts";
-import { testing as tuiPtyWatchTesting } from "../../scripts/dev/tui-pty-test-watch.ts";
+import { testing as prompt } from "../../scripts/anthropic-prompt-probe.ts";
+import { testing as claude } from "../../scripts/debug-claude-usage.ts";
+import { testing as discord } from "../../scripts/dev/discord-acp-plain-language-smoke.ts";
+import { testing as realtime } from "../../scripts/dev/realtime-talk-live-smoke.ts";
+import { testing as tui } from "../../scripts/dev/tui-pty-test-watch.ts";
 import {
   maskIdentifier,
   parseBooleanEnv,
@@ -40,6 +40,46 @@ import { runQaGatewayFixture } from "../helpers/qa-gateway-cleanup.js";
 const tempDirs: string[] = [];
 const testNodeExecPath = resolveTestNodeExecPath();
 const promptProbeUrl = resolveRuntimeWorkerUrl(scriptProcessEntrypoints.anthropicPromptProbe);
+
+async function tempDir(prefix: string) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tempDirs.push(root);
+  return root;
+}
+
+function discordRequest(overrides: Partial<Parameters<typeof discord.requestDiscordJson>[0]>) {
+  return discord.requestDiscordJson({
+    method: "GET",
+    path: "/channels/123/messages",
+    headers: {},
+    retries: 0,
+    timeoutMs: 5,
+    errorPrefix: "Discord API",
+    ...overrides,
+  });
+}
+
+function gatewayLeaderScript(descendantPidPath: string) {
+  const descendantScript = [
+    "process.on('SIGINT', () => {});",
+    "process.on('SIGTERM', () => {});",
+    "setInterval(() => {}, 1000);",
+    "process.send('ready');",
+    "process.disconnect();",
+  ].join("");
+  return [
+    "import childProcess from 'node:child_process';",
+    "import fs from 'node:fs';",
+    "const descendant = childProcess.spawn(process.execPath, [",
+    "  '--input-type=module',",
+    `  '--eval', ${JSON.stringify(descendantScript)},`,
+    "], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+    `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid));`,
+    "process.on('SIGINT', () => process.exit(0));",
+    "descendant.once('message', () => process.send(descendant.pid));",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+}
 
 let receipts: FixtureReceiptChannel;
 beforeAll(async () => {
@@ -243,17 +283,13 @@ describe("dev tooling safety helpers", () => {
 
 describe("script-specific dev tooling hardening", () => {
   it("rejects unknown Discord smoke drivers instead of silently using token mode", () => {
-    expect(discordSmokeTesting.parseDriverMode("webhook")).toBe("webhook");
-    expect(() => discordSmokeTesting.parseDriverMode("curl")).toThrow(/Invalid --driver/u);
+    expect(discord.parseDriverMode("webhook")).toBe("webhook");
+    expect(() => discord.parseDriverMode("curl")).toThrow(/Invalid --driver/u);
   });
 
   it.each([
-    [
-      "Discord smoke",
-      "scripts/dev/discord-acp-plain-language-smoke.ts",
-      discordSmokeTesting.parseArgs,
-    ],
-    ["TUI PTY watch", "scripts/dev/tui-pty-test-watch.ts", tuiPtyWatchTesting.parseOptions],
+    ["Discord smoke", "scripts/dev/discord-acp-plain-language-smoke.ts", discord.parseArgs],
+    ["TUI PTY watch", "scripts/dev/tui-pty-test-watch.ts", tui.parseOptions],
   ] as const)("rejects unknown %s args before launching work", async (_label, script, parse) => {
     expect(() => parse(["--wat"])).toThrow("Unknown argument: --wat");
     const result = await runCli(script, ["--wat"]);
@@ -264,17 +300,11 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("rejects missing Discord smoke option values before env fallbacks", () => {
-    expect(() => discordSmokeTesting.parseArgs(["--channel"])).toThrow(
-      "--channel requires a value",
-    );
-    expect(() => discordSmokeTesting.parseArgs(["--channel="])).toThrow(
-      "--channel requires a value",
-    );
-    expect(() => discordSmokeTesting.parseArgs(["--channel", "--json"])).toThrow(
-      "--channel requires a value",
-    );
+    expect(() => discord.parseArgs(["--channel"])).toThrow("--channel requires a value");
+    expect(() => discord.parseArgs(["--channel="])).toThrow("--channel requires a value");
+    expect(() => discord.parseArgs(["--channel", "--json"])).toThrow("--channel requires a value");
     for (const flag of ["--channel", "--token", "--timeout-ms", "--state-dir"]) {
-      expect(() => discordSmokeTesting.parseArgs([flag, "-h"])).toThrow(`${flag} requires a value`);
+      expect(() => discord.parseArgs([flag, "-h"])).toThrow(`${flag} requires a value`);
     }
   });
 
@@ -282,33 +312,24 @@ describe("script-specific dev tooling hardening", () => {
     const token = "webhook-secret-token-abcdef123456"; // pragma: allowlist secret
     const apiPath = `/webhooks/123/${token}?wait=true`;
 
-    expect(discordSmokeTesting.redactDiscordApiPath(apiPath)).not.toContain(token);
-    expect(discordSmokeTesting.redactDiscordApiPath(apiPath)).toContain("/webhooks/123/");
+    expect(discord.redactDiscordApiPath(apiPath)).not.toContain(token);
+    expect(discord.redactDiscordApiPath(apiPath)).toContain("/webhooks/123/");
   });
 
   it("computes the remaining Discord smoke timeout budget", () => {
-    expect(discordSmokeTesting.remainingTimeoutMs(1_500, undefined, 1_000)).toBe(500);
-    expect(() => discordSmokeTesting.remainingTimeoutMs(1_000, undefined, 1_000)).toThrow(
+    expect(discord.remainingTimeoutMs(1_500, undefined, 1_000)).toBe(500);
+    expect(() => discord.remainingTimeoutMs(1_000, undefined, 1_000)).toThrow(
       /exceeded total timeout/u,
     );
     expect(() =>
-      discordSmokeTesting.remainingTimeoutMs(
-        1_000,
-        () => new Error("request-specific timeout"),
-        1_000,
-      ),
+      discord.remainingTimeoutMs(1_000, () => new Error("request-specific timeout"), 1_000),
     ).toThrow("request-specific timeout");
   });
 
   it("aborts stalled Discord smoke fetches at the request timeout", async () => {
     let signal: AbortSignal | undefined;
-    const request = discordSmokeTesting.requestDiscordJson({
-      method: "GET",
+    const request = discordRequest({
       path: "/users/@me",
-      headers: {},
-      retries: 0,
-      timeoutMs: 5,
-      errorPrefix: "Discord API",
       fetchImpl: ((_url, init) => {
         signal = init?.signal ?? undefined;
         return new Promise(() => {});
@@ -327,13 +348,7 @@ describe("script-specific dev tooling hardening", () => {
       }),
       { status: 200, statusText: "OK" },
     );
-    const request = discordSmokeTesting.requestDiscordJson({
-      method: "GET",
-      path: "/channels/123/messages",
-      headers: {},
-      retries: 0,
-      timeoutMs: 5,
-      errorPrefix: "Discord API",
+    const request = discordRequest({
       fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
     });
 
@@ -348,14 +363,9 @@ describe("script-specific dev tooling hardening", () => {
     const response = new Response("{}", {
       headers: { "content-length": "6" },
     });
-    const request = discordSmokeTesting.requestDiscordJson({
-      method: "GET",
-      path: "/channels/123/messages",
-      headers: {},
-      retries: 0,
+    const request = discordRequest({
       timeoutMs: 50,
       responseBodyMaxBytes: 5,
-      errorPrefix: "Discord API",
       fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
     });
 
@@ -375,13 +385,8 @@ describe("script-specific dev tooling hardening", () => {
     } as Response;
 
     await expect(
-      discordSmokeTesting.requestDiscordJson({
-        method: "GET",
-        path: "/channels/123/messages",
-        headers: {},
+      discordRequest({
         retries: 1,
-        timeoutMs: 5,
-        errorPrefix: "Discord API",
         fetchImpl: (() => {
           calls += 1;
           return Promise.resolve(response);
@@ -393,14 +398,12 @@ describe("script-specific dev tooling hardening", () => {
 
   it("rejects short flags as TUI PTY watch option values", () => {
     for (const flag of ["--mode", "--mirror-path"]) {
-      expect(() => tuiPtyWatchTesting.parseOptions([flag, "-h"])).toThrow(
-        `${flag} requires a value`,
-      );
+      expect(() => tui.parseOptions([flag, "-h"])).toThrow(`${flag} requires a value`);
     }
   });
 
   it("keeps TUI PTY watch vitest args behind the separator", () => {
-    expect(tuiPtyWatchTesting.parseOptions(["--mode", "all", "--", "--help"])).toMatchObject({
+    expect(tui.parseOptions(["--mode", "all", "--", "--help"])).toMatchObject({
       mode: "all",
       vitestArgs: ["--help"],
     });
@@ -409,7 +412,7 @@ describe("script-specific dev tooling hardening", () => {
   it("escalates stalled TUI PTY watch children after interrupt cleanup", async () => {
     vi.useFakeTimers();
     const signals: NodeJS.Signals[] = [];
-    const stopper = tuiPtyWatchTesting.createChildStopper(
+    const stopper = tui.createChildStopper(
       { kill: () => true },
       (_child, signal: NodeJS.Signals): void => {
         signals.push(signal);
@@ -427,25 +430,23 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("restarts TUI PTY mirror reads when the mirror file is truncated", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tui-watch-test-"));
-    tempDirs.push(tempRoot);
+    const tempRoot = await tempDir("openclaw-tui-watch-test-");
     const mirrorPath = path.join(tempRoot, "mirror.ansi");
     await fs.writeFile(mirrorPath, "fresh", "utf8");
 
-    const result = await tuiPtyWatchTesting.readNewMirrorData(mirrorPath, 10, 1024);
+    const result = await tui.readNewMirrorData(mirrorPath, 10, 1024);
 
     expect(result.chunk.toString("utf8")).toBe("fresh");
     expect(result.offset).toBe(5);
   });
 
   it("drains all pending TUI PTY mirror chunks after the child exits", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tui-watch-test-"));
-    tempDirs.push(tempRoot);
+    const tempRoot = await tempDir("openclaw-tui-watch-test-");
     const mirrorPath = path.join(tempRoot, "mirror.ansi");
     await fs.writeFile(mirrorPath, "first-second-third", "utf8");
     const chunks: string[] = [];
 
-    const offset = await tuiPtyWatchTesting.drainNewMirrorData(
+    const offset = await tui.drainNewMirrorData(
       mirrorPath,
       0,
       (chunk: Buffer) => chunks.push(chunk.toString("utf8")),
@@ -457,7 +458,7 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("keeps only diagnostic tails from noisy TUI PTY child output", () => {
-    const retained = tuiPtyWatchTesting.appendBufferTail(
+    const retained = tui.appendBufferTail(
       Buffer.from("0123456789", "utf8"),
       Buffer.from("abcdef", "utf8"),
       8,
@@ -469,14 +470,14 @@ describe("script-specific dev tooling hardening", () => {
   it.each([
     {
       name: "OpenAI realtime smoke",
-      request: realtimeSmokeTesting.createOpenAIClientSecret,
+      request: realtime.createOpenAIClientSecret,
       credential: "test-key",
       headers: undefined,
       error: /OpenAI Realtime client secret request exceeded timeout/u,
     },
     {
       name: "Claude usage",
-      request: claudeUsageTesting.fetchAnthropicOAuthUsage,
+      request: claude.fetchAnthropicOAuthUsage,
       credential: "test-token",
       headers: { "content-type": "application/json" },
       error: /Anthropic OAuth usage request exceeded timeout/u,
@@ -502,7 +503,7 @@ describe("script-specific dev tooling hardening", () => {
   it.each([
     [
       "OpenAI realtime",
-      realtimeSmokeTesting.resolveOpenAIHttpTimeoutMs,
+      realtime.resolveOpenAIHttpTimeoutMs,
       "42",
       42,
       "2s",
@@ -510,7 +511,7 @@ describe("script-specific dev tooling hardening", () => {
     ],
     [
       "Claude usage",
-      claudeUsageTesting.resolveFetchTimeoutMs,
+      claude.resolveFetchTimeoutMs,
       "123",
       123,
       "1.5",
@@ -522,46 +523,44 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("formats OpenAI realtime smoke help without launching live checks", () => {
-    expect(realtimeSmokeTesting.parseRealtimeSmokeArgs(["--help"])).toEqual({
+    expect(realtime.parseRealtimeSmokeArgs(["--help"])).toEqual({
       help: true,
       openAIAudioCycles: 1,
       openAIOnly: false,
     });
-    expect(realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-only"])).toEqual({
+    expect(realtime.parseRealtimeSmokeArgs(["--openai-only"])).toEqual({
       help: false,
       openAIAudioCycles: 1,
       openAIOnly: true,
     });
-    expect(realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles", "3"])).toEqual({
+    expect(realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles", "3"])).toEqual({
       help: false,
       openAIAudioCycles: 3,
       openAIOnly: false,
     });
-    expect(realtimeSmokeTesting.usage()).toContain(
+    expect(realtime.usage()).toContain(
       "Usage: node --import tsx scripts/dev/realtime-talk-live-smoke.ts",
     );
-    expect(realtimeSmokeTesting.usage()).toContain("--openai-only");
-    expect(realtimeSmokeTesting.usage()).toContain("--openai-audio-cycles");
+    expect(realtime.usage()).toContain("--openai-only");
+    expect(realtime.usage()).toContain("--openai-audio-cycles");
   });
 
   it("rejects unknown OpenAI realtime smoke args before runtime setup", () => {
-    expect(() => realtimeSmokeTesting.parseRealtimeSmokeArgs(["--wat"])).toThrow(
-      "Unknown argument: --wat",
-    );
-    expect(() => realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles"])).toThrow(
+    expect(() => realtime.parseRealtimeSmokeArgs(["--wat"])).toThrow("Unknown argument: --wat");
+    expect(() => realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles"])).toThrow(
       "--openai-audio-cycles requires a value",
     );
-    expect(() =>
-      realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles", "0"]),
-    ).toThrow("--openai-audio-cycles must be an integer >= 1");
-    expect(() =>
-      realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles", "11"]),
-    ).toThrow("--openai-audio-cycles must be <= 10");
+    expect(() => realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles", "0"])).toThrow(
+      "--openai-audio-cycles must be an integer >= 1",
+    );
+    expect(() => realtime.parseRealtimeSmokeArgs(["--openai-audio-cycles", "11"])).toThrow(
+      "--openai-audio-cycles must be <= 10",
+    );
   });
 
   it("chunks PCM input without copying or dropping bytes", async () => {
     const sent: Buffer[] = [];
-    const chunkCount = await realtimeSmokeTesting.sendPcmAudioInChunks(
+    const chunkCount = await realtime.sendPcmAudioInChunks(
       {
         sendAudio: (audio: Buffer) => sent.push(audio),
       } as never,
@@ -573,7 +572,7 @@ describe("script-specific dev tooling hardening", () => {
     expect(Buffer.concat(sent)).toEqual(Buffer.from([1, 2, 3, 4, 5]));
     expect(sent.map((chunk) => chunk.byteLength)).toEqual([2, 2, 1]);
     await expect(
-      realtimeSmokeTesting.sendPcmAudioInChunks({ sendAudio: vi.fn() } as never, Buffer.alloc(1), {
+      realtime.sendPcmAudioInChunks({ sendAudio: vi.fn() } as never, Buffer.alloc(1), {
         chunkBytes: 0,
         delayMs: 0,
       }),
@@ -581,25 +580,25 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("matches normalized live audio transcript markers", () => {
-    expect(realtimeSmokeTesting.transcriptIncludesMarker(["Glacier."], "glacier")).toBe(true);
+    expect(realtime.transcriptIncludesMarker(["Glacier."], "glacier")).toBe(true);
     expect(
-      realtimeSmokeTesting.transcriptIncludesMarker(
+      realtime.transcriptIncludesMarker(
         ["Please reply with the single-word GLACIER!"],
         "single word glacier",
       ),
     ).toBe(true);
-    expect(realtimeSmokeTesting.transcriptIncludesMarker(["ocean"], "glacier")).toBe(false);
+    expect(realtime.transcriptIncludesMarker(["ocean"], "glacier")).toBe(false);
   });
 
   it("resolves the realtime relay smoke to an existing Control UI module", () => {
-    const modulePath = realtimeSmokeTesting.resolveGatewayRelayModulePath(process.cwd());
+    const modulePath = realtime.resolveGatewayRelayModulePath(process.cwd());
 
     expect(modulePath.endsWith("/ui/src/pages/chat/talk/gateway-relay.ts")).toBe(true);
     expect(existsSync(modulePath.slice("/@fs/".length))).toBe(true);
   });
 
   it("rejects unsafe OpenAI realtime SDP answer content-length values before reading", async () => {
-    const maxBytes = realtimeSmokeTesting.OPENAI_HTTP_RESPONSE_MAX_BYTES;
+    const maxBytes = realtime.OPENAI_HTTP_RESPONSE_MAX_BYTES;
     const body = {
       cancel: vi.fn(() => Promise.resolve()),
       getReader: vi.fn(() => {
@@ -612,7 +611,7 @@ describe("script-specific dev tooling hardening", () => {
     } as unknown as Response;
 
     await expect(
-      realtimeSmokeTesting.readOpenAIRealtimeBrowserResponseText(
+      realtime.readOpenAIRealtimeBrowserResponseText(
         response,
         "OpenAI Realtime SDP answer",
         maxBytes,
@@ -623,7 +622,7 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("bounds OpenAI realtime smoke response body reads by streamed bytes", async () => {
-    const maxBytes = realtimeSmokeTesting.OPENAI_HTTP_RESPONSE_MAX_BYTES;
+    const maxBytes = realtime.OPENAI_HTTP_RESPONSE_MAX_BYTES;
     const response = new Response(
       new ReadableStream({
         start(controller) {
@@ -634,19 +633,19 @@ describe("script-specific dev tooling hardening", () => {
     );
 
     await expect(
-      realtimeSmokeTesting.readBoundedText(response, "OpenAI Realtime test", maxBytes),
+      realtime.readBoundedText(response, "OpenAI Realtime test", maxBytes),
     ).rejects.toThrow(`OpenAI Realtime test response body exceeded ${maxBytes} bytes`);
   });
 
   it("rejects absolute-form URLs in the Anthropic capture proxy", () => {
     expect(
-      promptProbeTesting.resolveAnthropicUpstreamUrl(
+      prompt.resolveAnthropicUpstreamUrl(
         "/v1/messages?anthropic-version=2023-06-01",
         "https://api.anthropic.com",
       ),
     ).toBe("https://api.anthropic.com/v1/messages?anthropic-version=2023-06-01");
     expect(() =>
-      promptProbeTesting.resolveAnthropicUpstreamUrl(
+      prompt.resolveAnthropicUpstreamUrl(
         "http://169.254.169.254/latest/meta-data",
         "https://api.anthropic.com",
       ),
@@ -657,15 +656,14 @@ describe("script-specific dev tooling hardening", () => {
     const request = Readable.from([Buffer.alloc(8), Buffer.alloc(8)]) as never;
     const destroy = vi.spyOn(request, "destroy");
 
-    await expect(promptProbeTesting.readRequestBody(request, 12)).rejects.toThrow(
+    await expect(prompt.readRequestBody(request, 12)).rejects.toThrow(
       "Anthropic capture proxy request body exceeded 12 bytes",
     );
     expect(destroy).toHaveBeenCalled();
   });
 
   it("reads only the bounded Anthropic prompt probe gateway log tail", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-probe-log-"));
-    tempDirs.push(tempRoot);
+    const tempRoot = await tempDir("openclaw-prompt-probe-log-");
     const logPath = path.join(tempRoot, "gateway.log");
     const token = "sk-test1234567890abcdefghijklmnop"; // pragma: allowlist secret
     await fs.writeFile(
@@ -678,7 +676,7 @@ describe("script-specific dev tooling hardening", () => {
       "utf8",
     );
 
-    const tail = await promptProbeTesting.readLogTail(logPath, 128);
+    const tail = await prompt.readLogTail(logPath, 128);
 
     expect(tail).toContain("recent gateway tail");
     expect(tail).not.toContain("DO_NOT_PRINT_OLD_GATEWAY_LOG");
@@ -686,13 +684,12 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("drops partial Anthropic prompt probe log lines before redaction", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-probe-log-"));
-    tempDirs.push(tempRoot);
+    const tempRoot = await tempDir("openclaw-prompt-probe-log-");
     const logPath = path.join(tempRoot, "gateway.log");
     const token = `sk-test${"a".repeat(80)}`; // pragma: allowlist secret
     await fs.writeFile(logPath, `Authorization: Bearer ${token}\nrecent gateway tail`, "utf8");
 
-    const tail = await promptProbeTesting.readLogTail(logPath, "recent gateway tail".length + 24);
+    const tail = await prompt.readLogTail(logPath, "recent gateway tail".length + 24);
 
     expect(tail).toBe("recent gateway tail");
     expect(tail).not.toContain(token.slice(-16));
@@ -702,11 +699,11 @@ describe("script-specific dev tooling hardening", () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-probe-test-"));
     const keepRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-probe-test-"));
 
-    expect(promptProbeTesting.promptProbeTmpResult(tempRoot, false)).toEqual({});
-    expect(promptProbeTesting.promptProbeTmpResult(keepRoot, true)).toEqual({ tmpDir: keepRoot });
+    expect(prompt.promptProbeTmpResult(tempRoot, false)).toEqual({});
+    expect(prompt.promptProbeTmpResult(keepRoot, true)).toEqual({ tmpDir: keepRoot });
 
-    await promptProbeTesting.cleanupPromptProbeTmpDir(tempRoot, false);
-    await promptProbeTesting.cleanupPromptProbeTmpDir(keepRoot, true);
+    await prompt.cleanupPromptProbeTmpDir(tempRoot, false);
+    await prompt.cleanupPromptProbeTmpDir(keepRoot, true);
 
     await expect(fs.stat(tempRoot)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.stat(keepRoot)).resolves.toBeTruthy();
@@ -716,12 +713,11 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "rejects Anthropic direct prompt success while its descendant remains active",
     async ({ signal }) => {
-      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-normal-exit-"));
-      tempDirs.push(tempRoot);
+      const tempRoot = await tempDir("openclaw-direct-normal-exit-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
       const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath, "leader-exit");
       let descendantPid = 0;
-      const result = promptProbeTesting.runDirectPrompt("normal exit cleanup proof", {
+      const result = prompt.runDirectPrompt("normal exit cleanup proof", {
         claudeBin: fakeClaudeBin,
         timeoutMs: 5_000,
       });
@@ -869,12 +865,11 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "returns a terminal result after an Anthropic direct prompt timeout",
     async () => {
-      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-prompt-tree-"));
-      tempDirs.push(tempRoot);
+      const tempRoot = await tempDir("openclaw-direct-prompt-tree-");
       const fakeClaudeBin = await writeBlockingPromptCli(tempRoot);
 
       await expect(
-        promptProbeTesting.runDirectPrompt("timeout cleanup proof", {
+        prompt.runDirectPrompt("timeout cleanup proof", {
           claudeBin: fakeClaudeBin,
           timeoutMs: 500,
         }),
@@ -889,8 +884,7 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "cleans Anthropic direct prompt descendants on parent signal",
     async ({ signal }) => {
-      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-parent-signal-"));
-      tempDirs.push(tempRoot);
+      const tempRoot = await tempDir("openclaw-direct-parent-signal-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
       let descendantPid = 0;
       const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath);
@@ -960,7 +954,7 @@ describe("script-specific dev tooling hardening", () => {
       },
     };
 
-    const stopped = await promptProbeTesting.stopGatewayPromptChild(
+    const stopped = await prompt.stopGatewayPromptChild(
       child,
       {
         close: async () => {
@@ -979,29 +973,10 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "cleans Anthropic prompt gateway descendants after leader exit",
     async ({ signal }) => {
-      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-gateway-tree-"));
-      tempDirs.push(tempRoot);
+      const tempRoot = await tempDir("openclaw-prompt-gateway-tree-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
       let descendantPid = 0;
-      const descendantScript = [
-        "process.on('SIGINT', () => {});",
-        "process.on('SIGTERM', () => {});",
-        "setInterval(() => {}, 1000);",
-        "process.send('ready');",
-        "process.disconnect();",
-      ].join("");
-      const leaderScript = [
-        "import childProcess from 'node:child_process';",
-        "import fs from 'node:fs';",
-        "const descendant = childProcess.spawn(process.execPath, [",
-        "  '--input-type=module',",
-        `  '--eval', ${JSON.stringify(descendantScript)},`,
-        "], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
-        `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid));`,
-        "process.on('SIGINT', () => process.exit(0));",
-        "descendant.once('message', () => process.send(descendant.pid));",
-        "setInterval(() => {}, 1000);",
-      ].join("\n");
+      const leaderScript = gatewayLeaderScript(descendantPidPath);
       const child = spawn(process.execPath, ["--input-type=module", "--eval", leaderScript], {
         detached: true,
         stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -1022,8 +997,8 @@ describe("script-specific dev tooling hardening", () => {
         expect(Number.isInteger(descendantPid)).toBe(true);
         expect(isProcessAlive(descendantPid)).toBe(true);
 
-        const stopped = await promptProbeTesting.stopGatewayPromptChild(
-          child as Parameters<typeof promptProbeTesting.stopGatewayPromptChild>[0],
+        const stopped = await prompt.stopGatewayPromptChild(
+          child as Parameters<typeof prompt.stopGatewayPromptChild>[0],
           {
             close: async () => {
               closeCalls += 1;
@@ -1054,30 +1029,11 @@ describe("script-specific dev tooling hardening", () => {
   it.runIf(process.platform !== "win32")(
     "cleans Anthropic prompt gateway descendants when the child attaches after parent signal",
     async ({ signal }) => {
-      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-parent-signal-"));
-      tempDirs.push(tempRoot);
+      const tempRoot = await tempDir("openclaw-prompt-parent-signal-");
       const descendantPidPath = path.join(tempRoot, "descendant.pid");
       const runnerPath = path.join(tempRoot, "parent-signal-runner.mjs");
       let descendantPid = 0;
-      const descendantScript = [
-        "process.on('SIGINT', () => {});",
-        "process.on('SIGTERM', () => {});",
-        "setInterval(() => {}, 1000);",
-        "process.send('ready');",
-        "process.disconnect();",
-      ].join("");
-      const leaderScript = [
-        "import childProcess from 'node:child_process';",
-        "import fs from 'node:fs';",
-        "const descendant = childProcess.spawn(process.execPath, [",
-        "  '--input-type=module',",
-        `  '--eval', ${JSON.stringify(descendantScript)},`,
-        "], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
-        `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid));`,
-        "process.on('SIGINT', () => process.exit(0));",
-        "descendant.once('message', () => process.send(descendant.pid));",
-        "setInterval(() => {}, 1000);",
-      ].join("\n");
+      const leaderScript = gatewayLeaderScript(descendantPidPath);
       await fs.writeFile(
         runnerPath,
         [
@@ -1151,7 +1107,7 @@ describe("script-specific dev tooling hardening", () => {
         resolve();
       };
     });
-    const stop = promptProbeTesting.stopGatewayPromptChild(
+    const stop = prompt.stopGatewayPromptChild(
       {
         exitCode: 0,
         signalCode: null,
@@ -1179,33 +1135,31 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("uses exact Claude cookie host matchers instead of broad substring matches", () => {
-    expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).toContain("host_key = 'claude.ai'");
-    expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).toContain("LIKE '%.claude.ai'");
-    expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).not.toContain("%claude.ai%");
+    expect(claude.CLAUDE_COOKIE_HOST_SQL).toContain("host_key = 'claude.ai'");
+    expect(claude.CLAUDE_COOKIE_HOST_SQL).toContain("LIKE '%.claude.ai'");
+    expect(claude.CLAUDE_COOKIE_HOST_SQL).not.toContain("%claude.ai%");
   });
 
   it("rejects malformed Claude usage args before reading auth or browser state", () => {
-    expect(claudeUsageTesting.parseArgs(["--agent", "work", "--session-key=abc"])).toEqual({
+    expect(claude.parseArgs(["--agent", "work", "--session-key=abc"])).toEqual({
       agentId: "work",
       help: false,
       reveal: false,
       sessionKey: "abc",
     });
-    expect(claudeUsageTesting.parseArgs(["--help"])).toEqual({
+    expect(claude.parseArgs(["--help"])).toEqual({
       agentId: "main",
       help: true,
       reveal: false,
       sessionKey: undefined,
     });
-    expect(() => claudeUsageTesting.parseArgs(["--wat"])).toThrow("Unknown argument: --wat");
-    expect(() => claudeUsageTesting.parseArgs(["--agent"])).toThrow("--agent requires a value");
-    expect(() => claudeUsageTesting.parseArgs(["--agent="])).toThrow("--agent requires a value");
-    expect(() => claudeUsageTesting.parseArgs(["--session-key", "--reveal"])).toThrow(
+    expect(() => claude.parseArgs(["--wat"])).toThrow("Unknown argument: --wat");
+    expect(() => claude.parseArgs(["--agent"])).toThrow("--agent requires a value");
+    expect(() => claude.parseArgs(["--agent="])).toThrow("--agent requires a value");
+    expect(() => claude.parseArgs(["--session-key", "--reveal"])).toThrow(
       "--session-key requires a value",
     );
-    expect(() => claudeUsageTesting.parseArgs(["--session-key= "])).toThrow(
-      "--session-key requires a value",
-    );
+    expect(() => claude.parseArgs(["--session-key= "])).toThrow("--session-key requires a value");
   });
 
   it.each([
@@ -1236,10 +1190,10 @@ describe("script-specific dev tooling hardening", () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockImplementation((_input, init) => nativeFetch(upstreamUrl, init));
-    let proxy: Awaited<ReturnType<typeof promptProbeTesting.startAnthropicProxy>> | undefined;
+    let proxy: Awaited<ReturnType<typeof prompt.startAnthropicProxy>> | undefined;
 
     try {
-      proxy = await promptProbeTesting.startAnthropicProxy({
+      proxy = await prompt.startAnthropicProxy({
         port: 0,
         upstreamBaseUrl: "https://api.anthropic.com",
         timeoutMs: 100,
