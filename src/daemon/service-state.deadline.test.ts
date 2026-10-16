@@ -17,6 +17,19 @@ const command: GatewayServiceCommandConfig = {
   environment: { OPENCLAW_GATEWAY_PORT: "18789" },
 };
 let now = 0;
+const inspectionOptions = { env: {}, timeoutMs: 100 };
+function refusal(kind: "cleanup" | "ownership") {
+  return kind === "cleanup"
+    ? new CommandProcessCleanupError()
+    : new ServiceOwnershipRefusalError("systemd-manager-changed");
+}
+function expectUnknown(state: Awaited<ReturnType<typeof readGatewayServiceState>>) {
+  expect(state).toMatchObject({
+    loadState: { status: "unknown" },
+    runtime: { status: "unknown" },
+    running: false,
+  });
+}
 
 beforeEach(() => {
   now = 0;
@@ -57,8 +70,7 @@ describe("ordinary service inspection deadline", () => {
               },
             };
       const pending = readGatewayServiceState(service, {
-        env: {},
-        timeoutMs: 100,
+        ...inspectionOptions,
         requireEffective: scenario === "strict",
       });
       const rejected =
@@ -78,13 +90,8 @@ describe("ordinary service inspection deadline", () => {
         return;
       }
       const state = await pending;
-      expect(state).toMatchObject({
-        installed: true,
-        running: false,
-        command,
-        loadState: { status: "unknown" },
-        runtime: { status: "unknown" },
-      });
+      expectUnknown(state);
+      expect(state).toMatchObject({ installed: true, command });
       if (scenario === "diagnostic") {
         expect(state.loadState).toEqual({
           status: "unknown",
@@ -103,33 +110,23 @@ describe("ordinary service inspection deadline", () => {
   it.each(["initial", "command", "absence"] as const)(
     "does not admit native status reads after expiry at %s",
     async (boundary) => {
-      const service = createMockGatewayService({
-        ...(boundary === "command"
-          ? {
-              readCommand: vi.fn(async () => {
-                now = 101;
-                return command;
-              }),
-            }
-          : {}),
-        ...(boundary === "absence"
-          ? {
-              isAbsent: vi.fn(async () => {
-                now = 101;
-                return true;
-              }),
-            }
-          : {}),
-      });
+      const service = createMockGatewayService();
+      if (boundary === "command") {
+        service.readCommand = vi.fn(async () => {
+          now = 101;
+          return command;
+        });
+      } else if (boundary === "absence") {
+        service.isAbsent = vi.fn(async () => {
+          now = 101;
+          return true;
+        });
+      }
       const state = await readGatewayServiceState(service, {
         env: { HOME: "/fixture" },
         timeoutMs: boundary === "initial" ? 0 : 100,
       });
-      expect(state).toMatchObject({
-        loadState: { status: "unknown" },
-        runtime: { status: "unknown" },
-        running: false,
-      });
+      expectUnknown(state);
       if (boundary === "command") {
         expect(state).toMatchObject({
           installed: true,
@@ -159,10 +156,7 @@ describe("ordinary service inspection deadline", () => {
   )(
     "does not consume $kind refusal in the $boundary fallback after expiry",
     async ({ boundary, kind }) => {
-      const error =
-        kind === "cleanup"
-          ? new CommandProcessCleanupError()
-          : new ServiceOwnershipRefusalError("systemd-manager-changed");
+      const error = refusal(kind);
       const refuse = vi.fn(async () => {
         now = 101;
         throw error;
@@ -181,8 +175,7 @@ describe("ordinary service inspection deadline", () => {
       }
       await expect(
         readGatewayServiceState(service, {
-          env: {},
-          timeoutMs: 100,
+          ...inspectionOptions,
           ...(boundary === "strict-absence" || boundary === "definition-capability"
             ? { requireEffective: true, requireLoadedCommand: true }
             : {}),
@@ -196,21 +189,14 @@ describe("ordinary service inspection deadline", () => {
     "joins admitted readers and preserves %s refusal after expiry",
     async (kind) => {
       const { load, runtime, entered, service } = deferredReaders();
-      const error =
-        kind === "cleanup"
-          ? new CommandProcessCleanupError()
-          : new ServiceOwnershipRefusalError("systemd-manager-changed");
-      const pending = readGatewayServiceState(service, { env: {}, timeoutMs: 100 });
+      const error = refusal(kind);
+      const pending = readGatewayServiceState(service, inspectionOptions);
       const rejected = expect(pending).rejects.toBe(error);
       let settled = false;
-      void pending.then(
-        () => {
-          settled = true;
-        },
-        () => {
-          settled = true;
-        },
-      );
+      const onSettled = () => {
+        settled = true;
+      };
+      void pending.then(onSettled, onSettled);
       await entered.promise;
       now = 101;
       runtime.reject(error);
@@ -250,7 +236,7 @@ it.each([1, 101])(
       () => {
         now += 2_000;
       },
-      () => readGatewayServiceState(service, { env: {}, timeoutMs: 100, requireEffective: true }),
+      () => readGatewayServiceState(service, { ...inspectionOptions, requireEffective: true }),
     );
     if (spent > 100) {
       await expect(work).rejects.toThrow("Service inspection deadline expired.");

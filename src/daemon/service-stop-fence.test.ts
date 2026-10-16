@@ -1,4 +1,4 @@
-import type { SpawnSyncOptions } from "node:child_process";
+import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
@@ -27,20 +27,14 @@ import * as systemdTransport from "./systemd-user-transport.js";
 const native = vi.hoisted(() => ({
   active: true,
   now: 0,
-  spawn: vi.fn<
-    (
-      command: string,
-      args?: readonly string[],
-      options?: SpawnSyncOptions,
-    ) => {
-      pid: number;
-      output: Array<string | null>;
-      stdout: string;
-      stderr: string;
-      status: number;
-      signal: null;
-    }
-  >(),
+  spawn:
+    vi.fn<
+      (
+        command: string,
+        args?: readonly string[],
+        options?: SpawnSyncOptions,
+      ) => SpawnSyncReturns<string> & { status: number; signal: null }
+    >(),
 }));
 vi.mock("node:child_process", async (actual) => ({
   ...(await actual<typeof import("node:child_process")>()),
@@ -64,6 +58,12 @@ const assertCurrent = () => {
     throw new Error("stop owner retired");
   }
 };
+const emptyResult = { code: 0, termination: "exit" as const, stdout: "", stderr: "" };
+const taskResult = {
+  code: 0,
+  stdout: "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
+  stderr: "",
+};
 
 it("rechecks the original owner after systemd routing reads and before dispatch", async () => {
   vi.spyOn(systemdScope, "findInstalledSystemdGatewayScope").mockImplementation(async () => {
@@ -71,9 +71,7 @@ it("rechecks the original owner after systemd routing reads and before dispatch"
     return { scope: "user", unitName: "openclaw-gateway.service", unitPath: "/unused/service" };
   });
   vi.spyOn(systemdTransport, "resolveSystemdUserTransport").mockResolvedValue(undefined);
-  const dispatch = vi
-    .spyOn(serviceExec, "execFileUtf8")
-    .mockResolvedValue({ code: 0, termination: "exit", stdout: "", stderr: "" });
+  const dispatch = vi.spyOn(serviceExec, "execFileUtf8").mockResolvedValue(emptyResult);
   await expect(
     stopSystemdService({ env: {}, stdout: new PassThrough(), assertCurrent }),
   ).rejects.toThrow("stop owner retired");
@@ -85,9 +83,7 @@ it("rechecks the original owner after launchd ancestry reads and before bootout"
     native.active = false;
     return false;
   });
-  const dispatch = vi
-    .spyOn(launchctl, "execLaunchctl")
-    .mockResolvedValue({ code: 0, termination: "exit", stdout: "", stderr: "" });
+  const dispatch = vi.spyOn(launchctl, "execLaunchctl").mockResolvedValue(emptyResult);
   await expect(
     stopLaunchAgent({ env: {}, stdout: new PassThrough(), assertCurrent }),
   ).rejects.toThrow("stop owner retired");
@@ -117,11 +113,7 @@ it("does not force a Windows process tree after losing the owner during graceful
 });
 
 it("rechecks ownership after the asynchronous Windows suppression guard", async () => {
-  const dispatch = vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue({
-    code: 0,
-    stdout: "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
-    stderr: "",
-  });
+  const dispatch = vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue(taskResult);
   await expect(
     suspendScheduledTaskAutoStartForUpdate(
       { HOME: "/unused", OPENCLAW_WINDOWS_TASK_NAME: "Native Fence Proof" },
@@ -169,11 +161,7 @@ it.each(["suppress", "restore"] as const)(
     if (acquired.kind !== "acquired") {
       throw new Error("Expected an independent fixture executor");
     }
-    const dispatch = vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue({
-      code: 0,
-      stdout: "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
-      stderr: "",
-    });
+    const dispatch = vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue(taskResult);
     const beforeMutation = async () => {
       await Promise.resolve();
       seedRetainedBorrower(

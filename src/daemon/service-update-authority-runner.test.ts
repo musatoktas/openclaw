@@ -13,6 +13,27 @@ import {
   type GatewayServiceNativeCommand,
 } from "./service-update-authority.js";
 
+function nativeRunner() {
+  const runner = getGatewayServiceUpdateNativeCommand();
+  if (!runner) {
+    throw new Error("missing native fixture");
+  }
+  return runner;
+}
+
+function blockedNative() {
+  const entered = createDeferred();
+  const release = createDeferred();
+  const commands: string[] = [];
+  const nativeCommand: GatewayServiceNativeCommand = async (argv) => {
+    commands.push(argv[0]!);
+    entered.resolve();
+    await release.promise;
+    return result;
+  };
+  return { entered, release, commands, nativeCommand };
+}
+
 it("revokes a captured native runner when its service authority scope closes", async () => {
   let captured: GatewayServiceNativeCommand | undefined;
   let effects = 0;
@@ -46,18 +67,13 @@ const result = {
 
 it("expires a queued deadline without invoking it or releasing its predecessor", async () => {
   vi.useFakeTimers();
-  const entered = createDeferred();
-  const release = createDeferred();
-  const commands: string[] = [];
+  const { entered, release, commands, nativeCommand } = blockedNative();
   let expired = false;
   try {
     const scope = withGatewayServiceUpdateAuthority(
       () => undefined,
       async () => {
-        const runner = getGatewayServiceUpdateNativeCommand();
-        if (!runner) {
-          throw new Error("missing native fixture");
-        }
+        const runner = nativeRunner();
         const first = runner(["first"], {});
         await entered.promise;
         const queued = runner(["expired"], { timeoutMs: 20 });
@@ -70,14 +86,7 @@ it("expires a queued deadline without invoking it or releasing its predecessor",
         await first;
         throw new Error("fixture complete after expiry");
       },
-      {
-        nativeCommand: async (argv) => {
-          commands.push(argv[0]!);
-          entered.resolve();
-          await release.promise;
-          return result;
-        },
-      },
+      { nativeCommand },
     );
     await expect(scope).rejects.toThrow();
     expect(expired).toBe(true);
@@ -89,30 +98,18 @@ it("expires a queued deadline without invoking it or releasing its predecessor",
 });
 
 it("closes unstarted submissions but joins the already running native call", async () => {
-  const entered = createDeferred();
-  const release = createDeferred();
-  const commands: string[] = [];
+  const { entered, release, commands, nativeCommand } = blockedNative();
   let done = false;
   const work = withGatewayServiceUpdateAuthority(
     () => undefined,
     async () => {
-      const runner = getGatewayServiceUpdateNativeCommand();
-      if (!runner) {
-        throw new Error("missing native fixture");
-      }
+      const runner = nativeRunner();
       void runner(["first"], {}).catch(() => undefined);
       await entered.promise;
       void runner(["never"], {}).catch(() => undefined);
       throw new Error("initiating failure");
     },
-    {
-      nativeCommand: async (argv) => {
-        commands.push(argv[0]!);
-        entered.resolve();
-        await release.promise;
-        return result;
-      },
-    },
+    { nativeCommand },
   ).finally(() => {
     done = true;
   });
