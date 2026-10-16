@@ -9,6 +9,7 @@ import {
   replaceSessionEntry,
   replaceSessionEntrySync,
 } from "../../config/sessions/session-accessor.js";
+import type { InternalSessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import {
@@ -34,6 +35,39 @@ const previewHandler = (fresh = false) =>
     (fresh ? createControlUiHandlers() : controlUiHandlers)["controlUi.sessionPreview"],
     "session preview handler",
   );
+
+function previewEntry(sessionId: string, label: string, extra: Partial<InternalSessionEntry> = {}) {
+  return { sessionId, label, updatedAt: 1, visibility: "shared" as const, ...extra };
+}
+
+function ownedPreview(sessionId: string, label: string) {
+  return {
+    scope: { agentId: "main", sessionKey: `agent:main:dashboard:${sessionId}` },
+    entry: previewEntry(sessionId, label, {
+      createdActor: { type: "human", source: "profile", id: "owner" },
+    }),
+  };
+}
+
+function expectPreview(respond: RespondFn, fields: Record<string, unknown>) {
+  expect(respond).toHaveBeenCalledWith(
+    true,
+    expect.objectContaining({ status: "ok", ...fields }),
+    undefined,
+  );
+}
+
+function writeTurn(
+  scope: Parameters<typeof persistSessionTranscriptTurn>[0],
+  content: string,
+  now: number,
+) {
+  return persistSessionTranscriptTurn(scope, {
+    cwd: "/tmp",
+    updateMode: "none",
+    messages: [{ message: { role: "user", content }, now }],
+  });
+}
 
 function waitForTranscript(key: string, titles: Map<string, string>) {
   const completions = new Map([...titles.keys()].map((agentId) => [agentId, createDeferred()]));
@@ -70,15 +104,11 @@ describe("controlUi.sessionPreview", () => {
         const cfg = { agents: { entries: { main: {} } } };
         setRuntimeConfigSnapshot(cfg);
         const scope = { agentId: "main", sessionKey: "agent:main:preview-owner" };
-        const entry = {
-          sessionId: "preview-owner",
-          updatedAt: 1,
-          label: "Original preview",
-          visibility: "shared" as const,
+        const entry = previewEntry("preview-owner", "Original preview", {
           agentHarnessId: "preview-owner",
           modelSelectionLocked: true,
           ...(state === "archived" ? { archivedAt: 1 } : {}),
-        };
+        });
         replaceSessionEntrySync(scope, entry);
         const previousRegistry = captureActivePluginRegistrySnapshot();
         const registry = createEmptyPluginRegistry();
@@ -132,16 +162,11 @@ describe("controlUi.sessionPreview", () => {
             ]);
             release.resolve();
             await pending;
-            expect(respond).toHaveBeenCalledWith(
-              true,
-              expect.objectContaining({
-                status: "ok",
-                title: "Renamed preview",
-                updatedAt: 2,
-                archived: state === "archived",
-              }),
-              undefined,
-            );
+            expectPreview(respond, {
+              title: "Renamed preview",
+              updatedAt: 2,
+              archived: state === "archived",
+            });
             return winner;
           });
           expect(first).toBe("response");
@@ -159,15 +184,7 @@ describe("controlUi.sessionPreview", () => {
   it("replies in the same authorization frame before queued visibility revocation", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       setRuntimeConfigSnapshot({});
-      const sessionKey = "agent:main:dashboard:preview-response-frame";
-      const scope = { agentId: "main", sessionKey };
-      const entry = {
-        sessionId: "preview-response-frame",
-        updatedAt: 1,
-        label: "Visible preview title",
-        visibility: "shared" as const,
-        createdActor: { type: "human" as const, source: "profile" as const, id: "owner" },
-      };
+      const { scope, entry } = ownedPreview("preview-response-frame", "Visible preview title");
       await replaceSessionEntry(scope, entry);
       const events: string[] = [];
       const revoked = createDeferred();
@@ -191,18 +208,14 @@ describe("controlUi.sessionPreview", () => {
         return {};
       });
       await previewHandler()(
-        requestOptions({ sessionKey }, respond, {
+        requestOptions({ sessionKey: scope.sessionKey }, respond, {
           client: { ...identifiedClient("reader"), connId: "preview-reader" },
           context,
         }),
       );
       expect(queued).toBe(true);
       await revoked.promise;
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({ status: "ok", title: entry.label }),
-        undefined,
-      );
+      expectPreview(respond, { title: entry.label });
       expect(events).toEqual(["response", "revoked"]);
     });
   });
@@ -210,15 +223,7 @@ describe("controlUi.sessionPreview", () => {
   it("rechecks exact-key visibility after compact registry preparation", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       setRuntimeConfigSnapshot({});
-      const sessionKey = "agent:main:dashboard:preparing-preview";
-      const scope = { agentId: "main", sessionKey };
-      const entry = {
-        sessionId: "preparing-preview",
-        updatedAt: 1,
-        label: "Private after preparation",
-        visibility: "shared" as const,
-        createdActor: { type: "human" as const, source: "profile" as const, id: "owner" },
-      };
+      const { scope, entry } = ownedPreview("preparing-preview", "Private after preparation");
       await replaceSessionEntry(scope, entry);
       const context = await createPreviewContext();
       const prepared = createDeferred();
@@ -230,7 +235,7 @@ describe("controlUi.sessionPreview", () => {
         .mockReturnValueOnce(prepared.promise);
       const respond = vi.fn<RespondFn>();
       const pending = previewHandler(true)(
-        requestOptions({ sessionKey }, respond, {
+        requestOptions({ sessionKey: scope.sessionKey }, respond, {
           client: { ...identifiedClient("reader"), connId: "preview-reader" },
           context,
         }),
@@ -265,11 +270,7 @@ describe("controlUi.sessionPreview", () => {
           updatedAt: 42,
           displayName: `Title from ${agentId}`,
         });
-        await persistSessionTranscriptTurn(scope, {
-          cwd: "/tmp",
-          updateMode: "none",
-          messages: [{ message: { role: "user", content: `Title from ${agentId}` }, now: 42 }],
-        });
+        await writeTurn(scope, `Title from ${agentId}`, 42);
       }
       const handler = previewHandler(true);
       const published = waitForTranscript(
@@ -287,17 +288,12 @@ describe("controlUi.sessionPreview", () => {
             context,
           }),
         );
-        expect(respond).toHaveBeenCalledWith(
-          true,
-          expect.objectContaining({
-            status: "ok",
-            sessionKey: "global",
-            agentId,
-            derivedTitle: `Title from ${agentId}`,
-            lastMessagePreview: `Title from ${agentId}`,
-          }),
-          undefined,
-        );
+        expectPreview(respond, {
+          sessionKey: "global",
+          agentId,
+          derivedTitle: `Title from ${agentId}`,
+          lastMessagePreview: `Title from ${agentId}`,
+        });
       }
       expect(statements.queries).toEqual([]);
       statements.restore();
@@ -324,19 +320,7 @@ describe("controlUi.sessionPreview", () => {
           origin: { provider: "webchat" },
         },
       });
-      await persistSessionTranscriptTurn(scope, {
-        cwd: "/tmp",
-        updateMode: "none",
-        messages: [
-          {
-            message: {
-              role: "user",
-              content: `  OPENAI_API_KEY=${secret} ${"x".repeat(240)}  `,
-            },
-            now: 1_786_000_000_000,
-          },
-        ],
-      });
+      await writeTurn(scope, `  OPENAI_API_KEY=${secret} ${"x".repeat(240)}  `, 1_786_000_000_000);
       const published = waitForTranscript(scope.sessionKey, new Map([["main", ""]]));
       const context = await createPreviewContext();
       await published;

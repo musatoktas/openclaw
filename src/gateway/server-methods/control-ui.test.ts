@@ -17,23 +17,42 @@ import { gitHubPublicApi } from "../github-public-api.js";
 import { createControlUiRequestOptions } from "./control-ui-request.test-support.js";
 import { createControlUiHandlers } from "./control-ui.js";
 import { identifiedClient } from "./sessions-sharing.test-support.js";
-import type { GatewayClient, RespondFn } from "./types.js";
+import type { GatewayClient, GatewayRequestHandlerOptions, RespondFn } from "./types.js";
 
 const requestOptions = createControlUiRequestOptions(() => ({
   agents: { entries: { main: {} } },
   gateway: { controlUi: { github: { token: "preview-service-token" } } },
 }));
 
-function previewHandler(load?: Parameters<typeof createControlUiHandlers>[0]) {
-  return expectDefined(createControlUiHandlers(load)["controlUi.githubPreview"], "preview handler");
+type RequestExtras = Parameters<typeof requestOptions>[2] &
+  Pick<Partial<GatewayRequestHandlerOptions>, "signal" | "hasCurrentClientAuthority">;
+function fixture(method: string, ...loaders: Parameters<typeof createControlUiHandlers>) {
+  const handler = expectDefined(createControlUiHandlers(...loaders)[`controlUi.${method}`], method);
+  const respond = vi.fn<RespondFn>();
+  return {
+    respond,
+    send: (params: Record<string, unknown>, extra?: RequestExtras) =>
+      handler({
+        ...requestOptions(params, respond, extra),
+        signal: extra?.signal,
+        hasCurrentClientAuthority: extra?.hasCurrentClientAuthority,
+      }),
+  };
 }
 
-function checksHandler(load: Parameters<typeof createControlUiHandlers>[1]) {
-  return expectDefined(
-    createControlUiHandlers(undefined, load)["controlUi.sessionPullRequests.checks"],
-    "CI checks handler",
-  );
+function runtime(getRuntimeConfig: () => OpenClawConfig) {
+  return { context: { getRuntimeConfig } };
 }
+
+function githubTarget(number: number, repo = "openclaw", owner = "openclaw") {
+  return { kind: "issue", number, owner, repo };
+}
+
+function configuredGitHub(token: string): OpenClawConfig {
+  return { agents: { entries: { main: {} } }, gateway: { controlUi: { github: { token } } } };
+}
+
+const json = (value: unknown) => new Response(JSON.stringify(value));
 
 function expectReply(respond: RespondFn, payload: unknown) {
   expect(respond).toHaveBeenCalledWith(true, payload, undefined);
@@ -59,15 +78,12 @@ function issueFields(title: string, extra: Record<string, unknown> = {}) {
 }
 
 function mockGitHubFetch(issue: Record<string, unknown>, repository: Record<string, unknown>) {
-  const fetchMock = vi.fn<typeof fetch>(
-    async (input) =>
-      new Response(
-        JSON.stringify(
-          (input instanceof Request ? input.url : input.toString()).includes("/issues/")
-            ? issue
-            : repository,
-        ),
-      ),
+  const fetchMock = vi.fn<typeof fetch>(async (input) =>
+    json(
+      (input instanceof Request ? input.url : input.toString()).includes("/issues/")
+        ? issue
+        : repository,
+    ),
   );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
@@ -83,7 +99,7 @@ describe("controlUi.githubPreview", () => {
   });
 
   it.each(["revoked", "copied", "aborted", "aborted-after-preparation"] as const)(
-    "rejects %s requests before reading GitHub",
+    "rejects %s requests before GitHub",
     async (state) => {
       const client = { ...identifiedClient("preview-reader"), connId: "preview-connection" };
       const controller = new AbortController();
@@ -91,17 +107,14 @@ describe("controlUi.githubPreview", () => {
         controller.abort();
       }
       const loadPreview = vi.fn();
-      const respond = vi.fn<RespondFn>();
-      const handler = previewHandler(loadPreview);
-      const pending = handler({
-        ...requestOptions({ kind: "issue", number: 1, owner: "octocat", repo: "repo" }, respond, {
-          client: state === "copied" ? { ...client } : client,
-          context: {
-            getRuntimeConfig: () => ({ agents: { entries: { main: {} } } }),
-            getClientConnIds: (filter: (current: GatewayClient) => boolean) =>
-              new Set(filter(client) ? [client.connId] : []),
-          },
-        }),
+      const { respond, send } = fixture("githubPreview", loadPreview);
+      const pending = send(githubTarget(1, "repo", "octocat"), {
+        client: state === "copied" ? { ...client } : client,
+        context: {
+          getRuntimeConfig: () => ({ agents: { entries: { main: {} } } }),
+          getClientConnIds: (filter: (current: GatewayClient) => boolean) =>
+            new Set(filter(client) ? [client.connId] : []),
+        },
         signal: controller.signal,
         ...(state === "revoked" ? { hasCurrentClientAuthority: () => false } : {}),
       });
@@ -123,7 +136,7 @@ describe("controlUi.githubPreview", () => {
     { mode: "managed", method: "controlUi.githubDetail" },
     { mode: "service", method: "controlUi.githubDetail" },
     { mode: "anonymous", method: "controlUi.githubPreview" },
-  ])("reads $method with its selected $mode credential", async ({ mode, method }) => {
+  ])("reads $method as $mode", async ({ mode, method }) => {
     vi.stubEnv("GH_TOKEN", mode === "service" ? "different-ambient-token" : "");
     vi.stubEnv("GITHUB_TOKEN", "");
     const assertSelected = vi.fn();
@@ -148,34 +161,26 @@ describe("controlUi.githubPreview", () => {
     } else {
       prepare.mockRejectedValue(new githubIdentity.GitHubIdentityError("rate_limited"));
     }
-    const cfg: OpenClawConfig = {
-      agents: {
+    const cfg: OpenClawConfig =
+      mode === "anonymous"
+        ? { agents: { entries: { main: {} } } }
+        : configuredGitHub(
+            mode === "managed" ? "old-preview-service-token" : "configured-reader-token",
+          );
+    if (mode === "managed") {
+      cfg.agents = {
         entries: {
           main: {},
-          ...(mode === "managed"
-            ? { alternate: { tools: { github: { profileId: identity.selection.profileId } } } }
-            : {}),
+          alternate: { tools: { github: { profileId: identity.selection.profileId } } },
         },
-      },
-      ...(mode !== "anonymous"
-        ? {
-            gateway: {
-              controlUi: {
-                github: {
-                  token:
-                    mode === "managed" ? "old-preview-service-token" : "configured-reader-token",
-                },
-              },
-            },
-          }
-        : {}),
-    };
+      };
+    }
     if (mode !== "anonymous") {
       setRuntimeConfigSnapshot(cfg);
     }
     const title =
       mode === "managed" ? "Use the selected GitHub identity" : "Public metadata without a login";
-    const anonymousResponse = new Response(JSON.stringify(issueFields(title)));
+    const anonymousResponse = json(issueFields(title));
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (mode === "anonymous") {
         return anonymousResponse;
@@ -189,39 +194,31 @@ describe("controlUi.githubPreview", () => {
       }
       const url = input instanceof Request ? input.url : input.toString();
       const issue = mode === "managed" ? url.endsWith("/issues/88120") : url.includes("/issues/");
-      return new Response(
-        JSON.stringify(
-          issue
-            ? issueFields(mode === "service" ? "Authenticated reader" : title, {
-                created_at: mode === "service" ? "2026-09-20T08:00:00Z" : "2026-09-01T08:00:00Z",
-                updated_at: mode === "service" ? "2026-09-20T09:00:00Z" : "2026-09-01T09:00:00Z",
-                ...(mode === "managed"
-                  ? { repository_url: "https://api.github.com/repos/openclaw/openclaw" }
-                  : {}),
-                body: mode === "managed" ? "Authenticated reader body" : "Reader body",
-                comments: 0,
-              })
-            : { id: mode === "managed" ? 123 : 124, private: false, visibility: "public" },
-        ),
+      return json(
+        issue
+          ? issueFields(mode === "service" ? "Authenticated reader" : title, {
+              created_at: mode === "service" ? "2026-09-20T08:00:00Z" : "2026-09-01T08:00:00Z",
+              updated_at: mode === "service" ? "2026-09-20T09:00:00Z" : "2026-09-01T09:00:00Z",
+              ...(mode === "managed"
+                ? { repository_url: "https://api.github.com/repos/openclaw/openclaw" }
+                : {}),
+              body: mode === "managed" ? "Authenticated reader body" : "Reader body",
+              comments: 0,
+            })
+          : { id: mode === "managed" ? 123 : 124, private: false, visibility: "public" },
       );
     });
     vi.stubGlobal("fetch", fetchMock);
-    const respond = vi.fn<RespondFn>();
-    await expectDefined(
-      createControlUiHandlers()[method],
-      "GitHub read handler",
-    )(
-      requestOptions(
-        {
-          kind: "issue",
-          number: mode === "managed" ? 88120 : mode === "service" ? 1 : 88121,
-          owner: mode === "service" ? "octocat" : "openclaw",
-          repo: mode === "service" ? "reader-auth" : "openclaw",
-          agentId: mode === "managed" ? "alternate" : "main",
-        },
-        respond,
-        { context: { getRuntimeConfig: () => cfg } },
-      ),
+    const { respond, send } = fixture(method.replace("controlUi.", ""));
+    await send(
+      {
+        kind: "issue",
+        number: mode === "managed" ? 88120 : mode === "service" ? 1 : 88121,
+        owner: mode === "service" ? "octocat" : "openclaw",
+        repo: mode === "service" ? "reader-auth" : "openclaw",
+        agentId: mode === "managed" ? "alternate" : "main",
+      },
+      runtime(() => cfg),
     );
     expectReply(
       respond,
@@ -250,7 +247,7 @@ describe("controlUi.githubPreview", () => {
   });
 
   it.each(["controlUi.githubPreview", "controlUi.githubDetail"])(
-    "keeps public GitHub targets on their public API with Enterprise selected (%s)",
+    "routes public %s with Enterprise selected",
     async (method) => {
       const cfg: OpenClawConfig = {
         agents: { entries: { main: {} } },
@@ -270,16 +267,10 @@ describe("controlUi.githubPreview", () => {
         }),
         { id: 125, private: false, visibility: "public" },
       );
-      const respond = vi.fn<RespondFn>();
-      await expectDefined(
-        createControlUiHandlers()[method],
-        "GitHub public read handler",
-      )(
-        requestOptions(
-          { kind: "issue", number: 88121, owner: "openclaw", repo: "public-routing" },
-          respond,
-          { context: { getRuntimeConfig: () => cfg } },
-        ),
+      const { respond, send } = fixture(method.replace("controlUi.", ""));
+      await send(
+        githubTarget(88121, "public-routing"),
+        runtime(() => cfg),
       );
       expectReply(respond, expect.objectContaining({ title: "Public issue" }));
       expect(fetchMock).toHaveBeenCalled();
@@ -290,11 +281,8 @@ describe("controlUi.githubPreview", () => {
     },
   );
 
-  it("revalidates configured credential availability before delivering a cached preview", async () => {
-    const cfg: OpenClawConfig = {
-      agents: { entries: { main: {} } },
-      gateway: { controlUi: { github: { token: "configured-preview-token" } } },
-    };
+  it("revalidates cached preview credentials", async () => {
+    const cfg = configuredGitHub("configured-preview-token");
     setRuntimeConfigSnapshot(cfg);
     const fetchMock = mockGitHubFetch(
       issueFields("Cached preview", {
@@ -302,14 +290,12 @@ describe("controlUi.githubPreview", () => {
       }),
       { private: false, visibility: "public" },
     );
-    const handler = previewHandler();
-    const respond = vi.fn<RespondFn>();
-    const options = requestOptions(
-      { kind: "issue", number: 70014, owner: "openclaw", repo: "configured-degraded" },
-      respond,
-      { context: { getRuntimeConfig: () => cfg } },
+    const { respond, send } = fixture("githubPreview");
+    const target = githubTarget(70014, "configured-degraded");
+    await send(
+      target,
+      runtime(() => cfg),
     );
-    await handler(options);
     expectReply(respond, expect.objectContaining({ title: "Cached preview" }));
     setActiveDegradedSecretOwners([
       {
@@ -323,7 +309,10 @@ describe("controlUi.githubPreview", () => {
       },
     ]);
     respond.mockClear();
-    await handler(options);
+    await send(
+      target,
+      runtime(() => cfg),
+    );
     expectError(respond, {
       code: "UNAVAILABLE",
       message:
@@ -334,20 +323,9 @@ describe("controlUi.githubPreview", () => {
   });
 
   it.each(["agent", "system"])(
-    "delivers public metadata only while its fallback identity remains selected: %s",
+    "rechecks %s fallback identity before delivery",
     async (selection) => {
-      const preview = {
-        comments: 4,
-        createdAt: "2026-07-05T08:00:00Z",
-        kind: "issue",
-        login: "octocat",
-        number: 99815,
-        owner: "openclaw",
-        repo: "openclaw",
-        state: "open",
-        title: "Keep hover previews compact",
-        updatedAt: "2026-07-05T09:55:00Z",
-      };
+      const preview = { title: "Keep hover previews compact" };
       let cfg: OpenClawConfig = { agents: { entries: { main: {} } } };
       const started = createDeferred();
       const pending = createDeferred<typeof preview>();
@@ -355,14 +333,10 @@ describe("controlUi.githubPreview", () => {
         started.resolve();
         return pending.promise;
       });
-      const respond = vi.fn<RespondFn>();
-
-      const request = previewHandler(loadPreview)(
-        requestOptions(
-          { kind: "issue", number: 99815, owner: "openclaw", repo: "openclaw" },
-          respond,
-          { context: { getRuntimeConfig: () => cfg } },
-        ),
+      const { respond, send } = fixture("githubPreview", loadPreview);
+      const request = send(
+        githubTarget(99815),
+        runtime(() => cfg),
       );
       await started.promise;
       const tools = { github: { profileId: `ghp_${"c".repeat(32)}` } };
@@ -386,8 +360,8 @@ describe("controlUi.githubPreview", () => {
     { name: "explicit refresh", owner: "openclaw", refresh: true, valid: true },
     { name: "malformed refresh", owner: "openclaw", refresh: "true", valid: false },
     { name: "malformed owner", owner: "openclaw/evil", refresh: undefined, valid: false },
-  ])("validates $name before loading GitHub", async ({ owner, refresh, valid }) => {
-    const target = { kind: "issue", owner, repo: "openclaw", number: 99817 };
+  ])("validates $name", async ({ owner, refresh, valid }) => {
+    const target = githubTarget(99817, "openclaw", owner);
     const preview = {
       ...target,
       login: "octocat",
@@ -400,10 +374,8 @@ describe("controlUi.githubPreview", () => {
     if (owner === "openclaw") {
       loadPreview.mockResolvedValue(preview);
     }
-    const respond = vi.fn<RespondFn>();
-    await previewHandler(loadPreview)(
-      requestOptions({ ...target, ...(refresh !== undefined ? { refresh } : {}) }, respond),
-    );
+    const { respond, send } = fixture("githubPreview", loadPreview);
+    await send({ ...target, ...(refresh !== undefined ? { refresh } : {}) });
     if (valid) {
       expect(loadPreview).toHaveBeenCalledExactlyOnceWith(
         target,
@@ -423,32 +395,31 @@ describe("controlUi.githubPreview", () => {
   });
 
   it.each([
-    {
-      failure: "managed identity unavailable",
-      managed: true,
-      error: new githubIdentity.GitHubIdentityError("unavailable"),
-      message:
-        "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings.",
-      retryable: false,
-    },
-    ...(["unverified", "rate_limited"] as const).map((reason) => ({
-      failure: "managed identity " + reason,
-      managed: true,
-      error: new githubIdentity.GitHubIdentityError(reason),
-      message: new githubIdentity.GitHubIdentityError(reason).message,
-      retryable: false,
-    })),
-    {
-      failure: "GitHub quota",
-      managed: false,
-      error: new gitHubPublicApi.ControlUiGitHubError(429, "rate limited"),
-      message: "GitHub API rate limit exceeded (HTTP 429). Wait and retry.",
-      retryable: true,
-    },
-    {
-      failure: "configured-unavailable preview credential",
-      managed: false,
-      error: new SecretSurfaceUnavailableError({
+    [
+      "managed identity unavailable",
+      true,
+      new githubIdentity.GitHubIdentityError("unavailable"),
+      "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings.",
+      false,
+    ],
+    ...(["unverified", "rate_limited"] as const).map((reason) => [
+      "managed identity " + reason,
+      true,
+      new githubIdentity.GitHubIdentityError(reason),
+      new githubIdentity.GitHubIdentityError(reason).message,
+      false,
+    ] as const),
+    [
+      "GitHub quota",
+      false,
+      new gitHubPublicApi.ControlUiGitHubError(429, "rate limited"),
+      "GitHub API rate limit exceeded (HTTP 429). Wait and retry.",
+      true,
+    ],
+    [
+      "configured-unavailable preview credential",
+      false,
+      new SecretSurfaceUnavailableError({
         ownerKind: "capability",
         ownerId: "control-ui-github",
         state: "unavailable",
@@ -456,43 +427,33 @@ describe("controlUi.githubPreview", () => {
         refKeys: [],
         reason: "secret reference was not found",
       }),
-      message:
-        "The configured Control UI GitHub credential is unavailable. Check gateway.controlUi.github.token and its host binding, then retry.",
-      retryable: false,
-    },
-  ])(
-    "preserves the $failure diagnostic in the RPC response",
-    async ({ error, message, retryable, managed }) => {
+      "The configured Control UI GitHub credential is unavailable. Check gateway.controlUi.github.token and its host binding, then retry.",
+      false,
+    ],
+  ] as const)(
+    "preserves the %s diagnostic",
+    async (_failure, managed, error, message, retryable) => {
       const loadPreview = vi.fn();
       if (managed) {
         vi.spyOn(githubIdentity, "prepareGitHubReadIdentity").mockRejectedValue(error);
       } else {
         loadPreview.mockRejectedValue(error);
       }
-      const respond = vi.fn<RespondFn>();
-
-      await previewHandler(loadPreview)(
-        requestOptions(
-          {
-            kind: managed ? "issue" : "pull",
-            number: managed ? 88125 : 99816,
-            owner: "openclaw",
-            repo: "openclaw",
-            ...(managed ? { agentId: "main" } : {}),
-          },
-          respond,
-          managed
-            ? {
-                context: {
-                  getRuntimeConfig: () => ({
-                    agents: { entries: { main: {} } },
-                    tools: { github: { profileId: `ghp_${"b".repeat(32)}` } },
-                    gateway: { controlUi: { github: { token: "existing-preview-service-token" } } },
-                  }),
-                },
-              }
-            : {},
-        ),
+      const { respond, send } = fixture("githubPreview", loadPreview);
+      await send(
+        {
+          kind: managed ? "issue" : "pull",
+          number: managed ? 88125 : 99816,
+          owner: "openclaw",
+          repo: "openclaw",
+          ...(managed ? { agentId: "main" } : {}),
+        },
+        managed
+          ? runtime(() => ({
+              ...configuredGitHub("existing-preview-service-token"),
+              tools: { github: { profileId: `ghp_${"b".repeat(32)}` } },
+            }))
+          : {},
       );
       if (managed) {
         expect(loadPreview).not.toHaveBeenCalled();
@@ -512,33 +473,44 @@ describe("controlUi.sessionPullRequests.subscribe", () => {
       sessionKeys: [" agent:main:main ", "agent:main:main", "agent:work:main"],
       expected: ["agent:main:main", "agent:work:main"],
       subscribed: true,
+      valid: true,
     },
-    { sessionKeys: [], expected: [], subscribed: false },
+    { sessionKeys: [], expected: [], subscribed: false, valid: true },
+    { sessionKeys: [" "], expected: [], subscribed: false, valid: false },
   ])(
-    "acknowledges the normalized replacement before hydration: $subscribed",
-    async ({ sessionKeys, expected, subscribed }) => {
+    "validates subscriptions: $sessionKeys",
+    async ({ sessionKeys, expected, subscribed, valid }) => {
       const { promise: hydration, resolve: finishHydration } = createDeferred();
-      const replace = vi.fn(
-        (
-          _connId: string,
-          _sessionKeys: readonly string[],
-          _refreshSessionKeys: ReadonlySet<string> | undefined,
-          onAdmitted: (() => void) | undefined,
-        ) => {
-          onAdmitted?.();
-          return hydration;
-        },
-      );
-      const respond = vi.fn<RespondFn>();
-      const request = expectDefined(
-        createControlUiHandlers(vi.fn())["controlUi.sessionPullRequests.subscribe"],
-        "subscription handler",
-      )(
-        requestOptions({ sessionKeys }, respond, {
+      const replace = valid
+        ? vi.fn(
+            (
+              _connId: string,
+              _sessionKeys: readonly string[],
+              _refreshSessionKeys: ReadonlySet<string> | undefined,
+              onAdmitted: (() => void) | undefined,
+            ) => {
+              onAdmitted?.();
+              return hydration;
+            },
+          )
+        : vi.fn();
+      const { respond, send } = fixture("sessionPullRequests.subscribe", vi.fn());
+      const request = send(
+        { sessionKeys },
+        {
           client: { connId: "conn-control-ui" },
           context: { controlUiSessionPullRequests: { replace } },
-        }),
+        },
       );
+      if (!valid) {
+        await request;
+        expect(replace).not.toHaveBeenCalled();
+        expectError(respond, {
+          code: "INVALID_REQUEST",
+          message: "invalid controlUi.sessionPullRequests.subscribe params",
+        });
+        return;
+      }
       await Promise.resolve();
       expect(replace).toHaveBeenCalledWith(
         "conn-control-ui",
@@ -551,28 +523,6 @@ describe("controlUi.sessionPullRequests.subscribe", () => {
       await request;
     },
   );
-
-  it("rejects malformed replace-sets", async () => {
-    const replace = vi.fn();
-    const handlers = createControlUiHandlers(vi.fn());
-    const respond = vi.fn<RespondFn>();
-
-    await expectDefined(
-      handlers["controlUi.sessionPullRequests.subscribe"],
-      'handlers["controlUi.sessionPullRequests.subscribe"] test invariant',
-    )(
-      requestOptions({ sessionKeys: [" "] }, respond, {
-        client: { connId: "conn-control-ui" },
-        context: { controlUiSessionPullRequests: { replace } },
-      }),
-    );
-
-    expect(replace).not.toHaveBeenCalled();
-    expectError(respond, {
-      code: "INVALID_REQUEST",
-      message: "invalid controlUi.sessionPullRequests.subscribe params",
-    });
-  });
 });
 
 describe("controlUi.sessionPullRequests.checks", () => {
@@ -599,45 +549,52 @@ describe("controlUi.sessionPullRequests.checks", () => {
     { ...params, number: -1 },
     { ...params, url: "https://github.com/other/repo" },
     { ...params, sessionKey: "" },
-  ])("rejects invalid or client-URL parameters before loading: %j", async (input) => {
+  ])("rejects malformed check params: %j", async (input) => {
     const load = vi.fn().mockResolvedValue(result);
-    const handler = checksHandler(load);
-    const respond = vi.fn<RespondFn>();
-    await handler(requestOptions(input, respond));
+    const { respond, send } = fixture("sessionPullRequests.checks", undefined, load);
+    await send(input);
     expect(load).not.toHaveBeenCalled();
     expectError(respond, expect.objectContaining({ code: "INVALID_REQUEST" }));
   });
 
-  it.each(["missing session", "unavailable projection"])(
-    "rejects a %s without invoking the GitHub loader",
-    async (missing) => {
+  it.each(["missing session", "unavailable projection", "incognito", "draft"] as const)(
+    "denies %s sessions before GitHub loading",
+    async (mode) => {
       await withOpenClawTestState({ label: "ci-details-unavailable" }, async () => {
         setRuntimeConfigSnapshot({});
-        if (missing === "unavailable projection") {
+        const unprojected = mode === "unavailable projection";
+        if (mode !== "missing session") {
           await replaceSessionEntry(
             { agentId: "main", sessionKey: params.sessionKey },
             {
-              sessionId: "unprojected-ci",
+              sessionId: unprojected ? "unprojected-ci" : "hidden-ci",
               updatedAt: 1,
-              visibility: "shared",
-              createdActor: { type: "human", source: "profile", id: "viewer" },
+              createdActor: {
+                type: "human",
+                source: "profile",
+                id: unprojected ? "viewer" : "owner",
+              },
+              ...(unprojected
+                ? { visibility: "shared" as const }
+                : mode === "incognito"
+                  ? { incognito: true }
+                  : { visibility: "draft" as const }),
             },
           );
         }
         const load = vi.fn().mockResolvedValue(result);
-        const handler = checksHandler(load);
-        const respond = vi.fn<RespondFn>();
-        await handler({
-          ...requestOptions(params, respond),
-          ...(missing === "unavailable projection" ? { client: identifiedClient("viewer") } : {}),
-        });
+        const { respond, send } = fixture("sessionPullRequests.checks", undefined, load);
+        await send(
+          params,
+          mode !== "missing session" ? { client: identifiedClient("viewer") } : {},
+        );
         expect(load).not.toHaveBeenCalled();
         expectUnavailable(respond);
       });
     },
   );
 
-  it("binds the visible session generation and rechecks it before returning details", async () => {
+  it("rechecks session generation before delivery", async () => {
     await withOpenClawTestState({ label: "ci-details-generation" }, async () => {
       setRuntimeConfigSnapshot({});
       const session = {
@@ -656,9 +613,8 @@ describe("controlUi.sessionPullRequests.checks", () => {
         started.resolve();
         return deferred.promise;
       });
-      const handler = checksHandler(load);
-      const respond = vi.fn<RespondFn>();
-      const request = handler(requestOptions(params, respond));
+      const { respond, send } = fixture("sessionPullRequests.checks", undefined, load);
+      const request = send(params);
       await started.promise;
       expect(load).toHaveBeenCalledWith(
         expect.objectContaining({ ...params, agentId: "main" }),
@@ -684,62 +640,36 @@ describe("controlUi.sessionPullRequests.checks", () => {
     });
   });
 
-  it.each(["before", "during"] as const)(
-    "denies missing-client reads when roles are enabled %s GitHub loading",
-    async (when) => {
-      await withOpenClawTestState({ label: "ci-details-missing-client-roles" }, async () => {
-        let cfg: OpenClawConfig = { agents: { entries: { main: {} } } };
-        const enableRoles = () => {
-          cfg = { ...cfg, gateway: { roles: { definitions: {} } } };
-          setRuntimeConfigSnapshot(cfg);
-        };
+  it.each(["before", "during"] as const)("enforces roles %s loading", async (when) => {
+    await withOpenClawTestState({ label: "ci-details-missing-client-roles" }, async () => {
+      let cfg: OpenClawConfig = { agents: { entries: { main: {} } } };
+      const enableRoles = () => {
+        cfg = { ...cfg, gateway: { roles: { definitions: {} } } };
         setRuntimeConfigSnapshot(cfg);
-        await replaceSessionEntry(
-          { agentId: "main", sessionKey: params.sessionKey },
-          { sessionId: "role-bound-ci", updatedAt: 1, spawnedCwd: "/synthetic/ci" },
-        );
-        if (when === "before") {
-          enableRoles();
-        }
-        const load = vi.fn(async () => {
-          enableRoles();
-          return result;
-        });
-        const respond = vi.fn<RespondFn>();
-        await checksHandler(load)(
-          requestOptions(params, respond, { context: { getRuntimeConfig: () => cfg } }),
-        );
-        expect(load).toHaveBeenCalledTimes(when === "before" ? 0 : 1);
-        expectUnavailable(respond);
+      };
+      setRuntimeConfigSnapshot(cfg);
+      await replaceSessionEntry(
+        { agentId: "main", sessionKey: params.sessionKey },
+        { sessionId: "role-bound-ci", updatedAt: 1, spawnedCwd: "/synthetic/ci" },
+      );
+      if (when === "before") {
+        enableRoles();
+      }
+      const load = vi.fn(async () => {
+        enableRoles();
+        return result;
       });
-    },
-  );
+      const { respond, send } = fixture("sessionPullRequests.checks", undefined, load);
+      await send(
+        params,
+        runtime(() => cfg),
+      );
+      expect(load).toHaveBeenCalledTimes(when === "before" ? 0 : 1);
+      expectUnavailable(respond);
+    });
+  });
 
-  it.each([{ incognito: true as const }, { visibility: "draft" as const }])(
-    "does not expose a hidden session to another profile: %j",
-    async (hidden) => {
-      await withOpenClawTestState({ label: "ci-details-hidden" }, async () => {
-        setRuntimeConfigSnapshot({});
-        await replaceSessionEntry(
-          { agentId: "main", sessionKey: params.sessionKey },
-          {
-            sessionId: "hidden-ci",
-            updatedAt: 1,
-            createdActor: { type: "human", source: "profile", id: "owner" },
-            ...hidden,
-          },
-        );
-        const load = vi.fn().mockResolvedValue(result);
-        const handler = checksHandler(load);
-        const respond = vi.fn<RespondFn>();
-        await handler({ ...requestOptions(params, respond), client: identifiedClient("viewer") });
-        expect(load).not.toHaveBeenCalled();
-        expectUnavailable(respond);
-      });
-    },
-  );
-
-  it("keeps qualified global sessions bound to their resolved agent", async () => {
+  it("pins qualified global session ownership", async () => {
     await withOpenClawTestState({ label: "ci-details-global" }, async () => {
       const cfg: OpenClawConfig = {
         session: { scope: "global" },
@@ -751,12 +681,10 @@ describe("controlUi.sessionPullRequests.checks", () => {
         { sessionId: "research-ci", updatedAt: 1 },
       );
       const load = vi.fn().mockResolvedValue(result);
-      const handler = checksHandler(load);
-      const respond = vi.fn<RespondFn>();
-      await handler(
-        requestOptions({ ...params, sessionKey: "agent:research:main" }, respond, {
-          context: { getRuntimeConfig: () => cfg },
-        }),
+      const { respond, send } = fixture("sessionPullRequests.checks", undefined, load);
+      await send(
+        { ...params, sessionKey: "agent:research:main" },
+        runtime(() => cfg),
       );
       expect(load).toHaveBeenCalledWith(
         expect.objectContaining({ agentId: "research" }),
@@ -781,14 +709,14 @@ describe("controlUi.linkPreview", () => {
   ])("rejects malformed or private targets %j", async (params) => {
     const fetch = vi.fn<typeof globalThis.fetch>();
     vi.stubGlobal("fetch", fetch);
-    const respond = vi.fn();
-    await createControlUiHandlers()["controlUi.linkPreview"]!(requestOptions(params, respond));
+    const { respond, send } = fixture("linkPreview");
+    await send(params);
     expectError(respond, expect.objectContaining({ code: "INVALID_REQUEST" }));
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it.each(["authority", "config", "principal"] as const)(
-    "suppresses a preview when %s changes during the fetch",
+    "rechecks %s during fetch",
     async (change) => {
       let cfg: OpenClawConfig = { gateway: { port: 19010 } };
       setRuntimeConfigSnapshot(cfg);
@@ -804,14 +732,15 @@ describe("controlUi.linkPreview", () => {
         return gate.promise;
       });
       vi.stubGlobal("fetch", fetch);
-      const respond = vi.fn();
-      const pending = createControlUiHandlers()["controlUi.linkPreview"]!({
-        ...requestOptions({ url: `https://rpc-preview.example/retired-${change}` }, respond, {
+      const { respond, send } = fixture("linkPreview");
+      const pending = send(
+        { url: `https://rpc-preview.example/retired-${change}` },
+        {
           client,
           context: { getRuntimeConfig: () => cfg },
-        }),
-        hasCurrentClientAuthority: () => current,
-      });
+          hasCurrentClientAuthority: () => current,
+        },
+      );
       await started.promise;
       if (change === "authority") {
         current = false;
@@ -832,42 +761,32 @@ describe("controlUi.linkPreview", () => {
     },
   );
 
-  it.each([true, false])(
-    "projects public metadata only when fetching is enabled: %s",
-    async (enabled) => {
-      const fetch = vi.fn<typeof globalThis.fetch>();
-      if (enabled) {
-        fetch.mockImplementation(async (input) =>
-          (input instanceof Request ? input.url : input.toString()).endsWith("/favicon.ico")
-            ? new Response(null, { status: 404 })
-            : new Response('<head><meta property="og:title" content="Handler preview"></head>', {
-                headers: { "content-type": "text/html" },
-              }),
-        );
-      }
-      vi.stubGlobal("fetch", fetch);
-      const respond = vi.fn();
-      await createControlUiHandlers()["controlUi.linkPreview"]!(
-        requestOptions(
-          { url: enabled ? "https://rpc-preview.example/page" : "https://disabled.example/page" },
-          respond,
-          enabled
-            ? {}
-            : {
-                context: {
-                  getRuntimeConfig: () => ({
-                    gateway: { controlUi: { automaticallyFetchFavicons: false } },
-                  }),
-                },
-              },
-        ),
+  it.each([true, false])("honors automatic fetching: %s", async (enabled) => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    if (enabled) {
+      fetch.mockImplementation(async (input) =>
+        (input instanceof Request ? input.url : input.toString()).endsWith("/favicon.ico")
+          ? new Response(null, { status: 404 })
+          : new Response('<head><meta property="og:title" content="Handler preview"></head>', {
+              headers: { "content-type": "text/html" },
+            }),
       );
-      expectReply(respond, enabled ? { title: "Handler preview" } : {});
-      if (enabled) {
-        expect(fetch).toHaveBeenCalledTimes(2);
-      } else {
-        expect(fetch).not.toHaveBeenCalled();
-      }
-    },
-  );
+    }
+    vi.stubGlobal("fetch", fetch);
+    const { respond, send } = fixture("linkPreview");
+    await send(
+      { url: enabled ? "https://rpc-preview.example/page" : "https://disabled.example/page" },
+      enabled
+        ? {}
+        : runtime(() => ({
+            gateway: { controlUi: { automaticallyFetchFavicons: false } },
+          })),
+    );
+    expectReply(respond, enabled ? { title: "Handler preview" } : {});
+    if (enabled) {
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } else {
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
 });

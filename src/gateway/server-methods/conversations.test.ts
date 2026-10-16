@@ -17,6 +17,10 @@ vi.mock("../conversation-send.js", () => ({ runGatewayConversationSend: vi.fn() 
 vi.mock("../conversation-turn.js", () => ({ runGatewayConversationTurn: vi.fn() }));
 
 beforeEach(() => vi.resetAllMocks());
+const runConversationList = vi.mocked(runGatewayConversationList);
+const runConversationSend = vi.mocked(runGatewayConversationSend);
+const runConversationTurn = vi.mocked(runGatewayConversationTurn);
+const cancelConversationTurn = vi.mocked(cancelPendingConversationTurn);
 
 const request = {
   agentId: "main",
@@ -75,17 +79,23 @@ function caller(
   client: GatewayClient | null = adminClient,
 ) {
   const gatewayContext = context();
+  const invoke = (respond: RespondFn, params = defaults) =>
+    conversationHandlers[method]!({
+      params,
+      respond,
+      context: gatewayContext,
+      req: { type: "req", id: "1", method },
+      client,
+      isWebchatConnect: () => false,
+    });
   return {
     gatewayContext,
-    invoke: (respond: RespondFn, params = defaults) =>
-      conversationHandlers[method]!({
-        params,
-        respond,
-        context: gatewayContext,
-        req: { type: "req", id: "1", method },
-        client,
-        isWebchatConnect: () => false,
-      }),
+    invoke,
+    async query(params = defaults) {
+      const respond = vi.fn<RespondFn>();
+      await invoke(respond, params);
+      return respond;
+    },
   };
 }
 
@@ -120,16 +130,14 @@ describe("conversations.list Gateway handler", () => {
         },
       ],
     };
-    const runConversationList = vi.mocked(runGatewayConversationList).mockResolvedValue(listed);
-    const { invoke } = caller("conversations.list", {
+    runConversationList.mockResolvedValue(listed);
+    const { query } = caller("conversations.list", {
       agentId: "main",
       channel: "reef",
       query: "@molty",
       limit: 50,
     });
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond);
+    const respond = await query();
 
     expect(runConversationList).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -144,11 +152,8 @@ describe("conversations.list Gateway handler", () => {
   });
 
   it("rejects invalid limits before directory discovery", async () => {
-    const runConversationList = vi.mocked(runGatewayConversationList);
-    const { invoke } = caller("conversations.list");
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond, { agentId: "main", channel: "reef", limit: 101 });
+    const { query } = caller("conversations.list");
+    const respond = await query({ agentId: "main", channel: "reef", limit: 101 });
 
     expect(runConversationList).not.toHaveBeenCalled();
     expectFailure(respond);
@@ -157,11 +162,9 @@ describe("conversations.list Gateway handler", () => {
 
 describe("conversations.send Gateway handler", () => {
   it("owns the send and rejects operation-id reuse with different source input", async () => {
-    const runConversationSend = vi.mocked(runGatewayConversationSend).mockResolvedValue(sendResult);
-    const { invoke } = caller("conversations.send", sendRequest);
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond);
+    runConversationSend.mockResolvedValue(sendResult);
+    const { query } = caller("conversations.send", sendRequest);
+    const respond = await query();
     expect(runConversationSend).toHaveBeenCalledWith(
       expect.objectContaining({
         agentId: "main",
@@ -174,8 +177,7 @@ describe("conversations.send Gateway handler", () => {
     );
     expect(respond).toHaveBeenCalledWith(true, sendResult, undefined, { channel: "reef" });
 
-    const mismatchRespond = vi.fn<RespondFn>();
-    await invoke(mismatchRespond, {
+    const mismatchRespond = await query({
       ...sendRequest,
       sourceSessionKey: "agent:main:discord:channel:other",
     });
@@ -185,34 +187,22 @@ describe("conversations.send Gateway handler", () => {
 });
 
 describe("conversations.turn Gateway handler", () => {
-  it("rejects a source session owned by another agent", async () => {
-    const runConversationTurn = vi.mocked(runGatewayConversationTurn);
-    const { invoke } = caller();
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond, { ...request, sourceSessionKey: "agent:ops:main" });
-
-    expectFailure(respond, { code: "INVALID_REQUEST", message: expect.stringContaining("ops") });
-    expect(runConversationTurn).not.toHaveBeenCalled();
-  });
-
-  it("validates requests before entering the correlation service", async () => {
-    const runConversationTurn = vi.mocked(runGatewayConversationTurn);
-    const { invoke } = caller();
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond, { agentId: "main" });
-
-    expectFailure(respond);
+  it.each([
+    {
+      name: "foreign source owner",
+      params: { ...request, sourceSessionKey: "agent:ops:main" },
+      error: { code: "INVALID_REQUEST", message: expect.stringContaining("ops") },
+    },
+    { name: "malformed request", params: { agentId: "main" }, error: { code: "INVALID_REQUEST" } },
+  ])("rejects $name before entering the correlation service", async ({ params, error }) => {
+    expectFailure(await caller().query(params), error);
     expect(runConversationTurn).not.toHaveBeenCalled();
   });
 
   it("joins concurrent retries and replays the completed idempotent result", async () => {
     const pending = createDeferred<typeof result>();
-    const runConversationTurn = vi
-      .mocked(runGatewayConversationTurn)
-      .mockReturnValue(pending.promise);
-    const { invoke, gatewayContext } = caller();
+    runConversationTurn.mockReturnValue(pending.promise);
+    const { invoke, query, gatewayContext } = caller();
     const firstRespond = vi.fn<RespondFn>();
     const secondRespond = vi.fn<RespondFn>();
     const first = invoke(firstRespond);
@@ -220,8 +210,7 @@ describe("conversations.turn Gateway handler", () => {
     expect(runConversationTurn).toHaveBeenCalledWith(
       expect.objectContaining({ senderIsOwner: true }),
     );
-    const timeoutMismatchRespond = vi.fn<RespondFn>();
-    await invoke(timeoutMismatchRespond, { ...request, timeoutMs: 5_000 });
+    const timeoutMismatchRespond = await query({ ...request, timeoutMs: 5_000 });
     expectFailure(timeoutMismatchRespond);
     const second = invoke(secondRespond);
     pending.resolve(result);
@@ -231,8 +220,7 @@ describe("conversations.turn Gateway handler", () => {
     expectReply(firstRespond);
     expectReply(secondRespond, result, { channel: "reef", cached: true });
 
-    const cachedRespond = vi.fn<RespondFn>();
-    await invoke(cachedRespond);
+    const cachedRespond = await query();
     expect(runConversationTurn).toHaveBeenCalledOnce();
     expect(cachedRespond).toHaveBeenCalledWith(true, result, undefined, { cached: true });
 
@@ -241,8 +229,7 @@ describe("conversations.turn Gateway handler", () => {
         gatewayContext.dedupe.delete(key);
       }
     }
-    const mismatchedRespond = vi.fn<RespondFn>();
-    await invoke(mismatchedRespond, { ...request, message: "different message" });
+    const mismatchedRespond = await query({ ...request, message: "different message" });
     expect(runConversationTurn).toHaveBeenCalledOnce();
     expectFailure(mismatchedRespond);
   });
@@ -250,11 +237,9 @@ describe("conversations.turn Gateway handler", () => {
   it("keeps concurrent turn IDs isolated between agents", async () => {
     const pending = createDeferred<typeof result>();
     const otherResult = { ...result, messageId: "reef-outbound-other" };
-    const runConversationTurn = vi
-      .mocked(runGatewayConversationTurn)
-      .mockImplementation(async ({ agentId }: Parameters<typeof runGatewayConversationTurn>[0]) =>
-        agentId === "main" ? await pending.promise : otherResult,
-      );
+    runConversationTurn.mockImplementation(async ({ agentId }) =>
+      agentId === "main" ? await pending.promise : otherResult,
+    );
     const { invoke } = caller();
     const firstRespond = vi.fn<RespondFn>();
     const otherRespond = vi.fn<RespondFn>();
@@ -275,54 +260,42 @@ describe("conversations.turn Gateway handler", () => {
   });
 
   it("retries transient unavailable failures instead of caching them", async () => {
-    const runConversationTurn = vi
-      .mocked(runGatewayConversationTurn)
+    runConversationTurn
       .mockRejectedValueOnce(new Error("temporary outage"))
       .mockResolvedValueOnce(result);
-    const { invoke } = caller();
-    const failedRespond = vi.fn<RespondFn>();
-
-    await invoke(failedRespond);
+    const { query } = caller();
+    const failedRespond = await query();
     expectFailure(failedRespond, { code: "UNAVAILABLE" }, expect.any(Object));
 
-    const retryRespond = vi.fn<RespondFn>();
-    await invoke(retryRespond);
+    const retryRespond = await query();
     expect(runConversationTurn).toHaveBeenCalledTimes(2);
     expectReply(retryRespond);
   });
 
   it("does not let a durable operation conflict poison the authoritative retry identity", async () => {
-    const runConversationTurn = vi
-      .mocked(runGatewayConversationTurn)
+    runConversationTurn
       .mockRejectedValueOnce(
         new ConversationOperationConflictError(
           `Conversation delivery operation was reused with different input: ${request.turnId}`,
         ),
       )
       .mockResolvedValueOnce(result);
-    const { invoke, gatewayContext } = caller();
-    const conflictRespond = vi.fn<RespondFn>();
-
-    await invoke(conflictRespond, { ...request, message: "conflicting message" });
+    const { query, gatewayContext } = caller();
+    const conflictRespond = await query({ ...request, message: "conflicting message" });
     expectFailure(conflictRespond, { code: "INVALID_REQUEST" }, expect.any(Object));
     expect([...gatewayContext.dedupe.keys()].some((key) => key.endsWith(":identity"))).toBe(false);
 
-    const authoritativeRespond = vi.fn<RespondFn>();
-    await invoke(authoritativeRespond);
+    const authoritativeRespond = await query();
     expect(runConversationTurn).toHaveBeenCalledTimes(2);
     expectReply(authoritativeRespond);
   });
 
   it("maps unsupported conversation input to a stable invalid-request response", async () => {
-    const runConversationTurn = vi
-      .mocked(runGatewayConversationTurn)
-      .mockRejectedValue(
-        new ConversationInputError("Channel matrix does not support correlated turns"),
-      );
-    const { invoke } = caller();
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond);
+    runConversationTurn.mockRejectedValue(
+      new ConversationInputError("Channel matrix does not support correlated turns"),
+    );
+    const { query } = caller();
+    const respond = await query();
 
     const error = {
       code: "INVALID_REQUEST",
@@ -330,15 +303,14 @@ describe("conversations.turn Gateway handler", () => {
     };
     expectFailure(respond, error, expect.any(Object));
 
-    const retryRespond = vi.fn<RespondFn>();
-    await invoke(retryRespond);
+    const retryRespond = await query();
     expect(runConversationTurn).toHaveBeenCalledOnce();
     expectFailure(retryRespond, error, { cached: true });
   });
 
   it("cancels an abandoned turn through the active Gateway connection", async () => {
-    const cancelConversationTurn = vi.mocked(cancelPendingConversationTurn).mockReturnValue(true);
-    const { invoke } = caller(
+    cancelConversationTurn.mockReturnValue(true);
+    const { query } = caller(
       "conversations.turn.cancel",
       {
         agentId: request.agentId,
@@ -346,9 +318,7 @@ describe("conversations.turn Gateway handler", () => {
       },
       null,
     );
-    const respond = vi.fn<RespondFn>();
-
-    await invoke(respond);
+    const respond = await query();
 
     expect(cancelConversationTurn).toHaveBeenCalledWith({
       agentId: request.agentId,
