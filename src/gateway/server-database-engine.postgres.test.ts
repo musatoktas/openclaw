@@ -10,6 +10,7 @@ import { acquireGatewayLock } from "../infra/gateway-lock.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { resetLogger } from "../logging/logger.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { clearSecretsRuntimeSnapshot } from "../secrets/runtime.js";
 import { executeExistingOpenClawStateRead } from "../state/openclaw-state-db-readonly.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
@@ -17,14 +18,19 @@ import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worke
 import { executeOpenClawStateWorker } from "../state/openclaw-state-worker-store.js";
 import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
 import { acquireTestPortBlock } from "../test-utils/port-claims.js";
+import { createDesktopSessionRegistry } from "./desktop/session-registry.js";
 import { installGatewayDatabaseEngine } from "./server-database-engine.js";
 import { prepareGatewayServerBootstrap } from "./server-startup-bootstrap.js";
-import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
+import {
+  createGatewayWorkerEnvironmentRuntime,
+  loadGatewayWorkerEnvironmentStartupState,
+} from "./server-worker-environment-startup.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
 const connection = typeof configured === "string" ? configured : undefined;
@@ -191,6 +197,21 @@ describe.skipIf(!connection)("Gateway PostgreSQL shared-state bootstrap", () => 
     try {
       expect(workers.store.list()).toEqual([]);
       expect(await workers.placementStore.listAsync()).toEqual([]);
+      const registry = createEmptyPluginRegistry();
+      const runtime = await createGatewayWorkerEnvironmentRuntime({
+        scheduler: createTestGatewayScheduler(),
+        getPluginRegistry: () => registry,
+        getPortalRuntime: () => undefined,
+        resolveGatewayContext: () => undefined,
+        desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
+        startup: workers,
+        log: { child: () => ({ info: () => {}, warn: () => {} }) },
+      });
+      try {
+        expect(runtime.workerEnvironmentService).toBeDefined();
+      } finally {
+        await runtime.workerEnvironmentService?.stop();
+      }
     } finally {
       await workers.store.close();
     }
