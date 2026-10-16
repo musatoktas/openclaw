@@ -17,7 +17,12 @@ import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-c
 import { createAgentRuntimeApprovalAuthorityValidator } from "../agent-runtime-approval-authority.js";
 import { QuestionManager } from "../question-manager.js";
 import type { GatewayBroadcastFn } from "../server-broadcast-types.js";
+import { createGatewayBroadcaster } from "../server-broadcast.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
+import type { GatewayClientRegistry } from "../server/client-registry.js";
+import type { SessionRowProjection } from "../session-row-projection.js";
+import { canReceiveSessionEvent, prepareProjectedSessionSharing } from "../session-sharing.js";
+import { resolveSessionStoreIdentity } from "../session-store-key.js";
 import { createQuestionHandlers } from "./question.js";
 import { createSecretStoreWriteService } from "./secrets.js";
 import type { GatewayClient, GatewayRequestOptions, RespondFn } from "./types.js";
@@ -32,6 +37,43 @@ export let storeWriteService: ReturnType<typeof createSecretStoreWriteService>;
 let handlers: ReturnType<typeof createQuestionHandlers>;
 type SecretStoreReload = Parameters<typeof createSecretStoreWriteService>[0]["reloadSecrets"];
 export let reloadSecrets: ReturnType<typeof vi.fn<SecretStoreReload>>;
+
+export const questionNotFound = [false, undefined, { details: { reason: "QUESTION_NOT_FOUND" } }];
+
+export function createProjectedQuestionBroadcaster(
+  cfg: OpenClawConfig,
+  projection: SessionRowProjection,
+  clients: GatewayClientRegistry,
+) {
+  return createGatewayBroadcaster({
+    clients,
+    canReceiveSessionEvent: (client, sessionKeys, agentId, event, payload) =>
+      canReceiveSessionEvent({
+        cfg,
+        client,
+        sessionKeys,
+        agentId,
+        event,
+        payload,
+        prepared: {
+          sharing: prepareProjectedSessionSharing({
+            cfg,
+            client,
+            isMember: (target, identityId) =>
+              projection.hasMembership(target.storePath, target.storeKey, identityId),
+          }),
+          target: (key, targetAgentId) => {
+            const { agentId: ownerAgentId } = resolveSessionStoreIdentity({
+              cfg,
+              sessionKey: key,
+              agentId: targetAgentId,
+            });
+            return projection.sharingTarget({ key, agentId: ownerAgentId });
+          },
+        },
+      }),
+  });
+}
 
 export function installQuestionTestHooks() {
   beforeEach(() => {

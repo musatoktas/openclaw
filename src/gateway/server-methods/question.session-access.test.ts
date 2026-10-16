@@ -26,13 +26,13 @@ import { createGatewayBroadcaster } from "../server-broadcast.js";
 import { GatewayClientRegistry } from "../server/client-registry.js";
 import type { GatewayWsClient } from "../server/ws-types.js";
 import { createSessionRowProjection } from "../session-row-projection.js";
-import { canReceiveSessionEvent, prepareProjectedSessionSharing } from "../session-sharing.js";
 import { roleClient, rolePolicyConfig } from "../session-sharing.test-utils.js";
-import { resolveSessionStoreIdentity } from "../session-store-key.js";
 import {
   adminRequestClient,
   broadcast,
   callQuestionRpc,
+  createProjectedQuestionBroadcaster,
+  questionNotFound,
   installQuestionTestHooks,
   manager,
   requesterAuthority,
@@ -147,12 +147,15 @@ async function fixture(state: OpenClawTestState) {
     });
   const request = (id = "ordinary-question", client = producer) =>
     call("question.request", { ...requestParams, id, timeoutMs: 10_000 }, client);
-  return { owner, viewer, producer, cfg, entry, write, call, request, sourceController };
+  return { owner, viewer, producer, cfg, entry, write, call, request, sourceController, state };
+}
+
+async function withFixture(run: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>) {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => run(await fixture(state)));
 }
 
 it("keeps a trusted narrow question on worker-backed RPCs and fanout through label changes and completion", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const f = await fixture(state);
+  await withFixture(async (f) => {
     const owner = questionPeer(f.owner, "sql-owner");
     const viewer = questionPeer(f.viewer, "sql-viewer");
     const broad = questionPeer(
@@ -204,15 +207,7 @@ it("keeps a trusted narrow question on worker-backed RPCs and fanout through lab
       waitSpy.mockRestore();
       expect(sql.queries.filter((query) => /session_|transcript_/i.test(query))).toEqual([]);
       sql.restore();
-      await upsertSessionEntryCore(
-        { agentId: "main", sessionKey: requestParams.sessionKey },
-        {
-          ...f.entry,
-          updatedAt: 2,
-          label: "Renamed while answering",
-          markedUnreadAt: 2,
-        },
-      );
+      await f.write({ updatedAt: 2, label: "Renamed while answering", markedUnreadAt: 2 });
       sql = observeHostDataSql();
       const answers = { answers: { destination: ["Home"] } };
       expect(await f.call("question.resolve", { id: "trusted-route", answers })).toEqual([
@@ -251,8 +246,7 @@ it("keeps a trusted narrow question on worker-backed RPCs and fanout through lab
 });
 
 it("fans out requester-only questions after draft visibility changes with no global event grant", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const f = await fixture(state);
+  await withFixture(async (f) => {
     const owner = questionPeer(f.owner, "question-owner");
     const viewer = questionPeer(f.viewer, "question-viewer");
     const broad = questionPeer(
@@ -262,34 +256,11 @@ it("fans out requester-only questions after draft visibility changes with no glo
     const projection = await createSessionRowProjection({ cfg: f.cfg });
     sourceReleases.add(() => projection.dispose());
     await projection.ensureMaterialized();
-    const broadcaster = createGatewayBroadcaster({
-      clients: new GatewayClientRegistry([owner.ws, viewer.ws, broad.ws]),
-      canReceiveSessionEvent: (client, sessionKeys, agentId, event, payload) =>
-        canReceiveSessionEvent({
-          cfg: f.cfg,
-          client,
-          sessionKeys,
-          agentId,
-          event,
-          payload,
-          prepared: {
-            sharing: prepareProjectedSessionSharing({
-              cfg: f.cfg,
-              client,
-              isMember: (target, identityId) =>
-                projection.hasMembership(target.storePath, target.storeKey, identityId),
-            }),
-            target: (key, targetAgentId) => {
-              const { agentId: ownerAgentId } = resolveSessionStoreIdentity({
-                cfg: f.cfg,
-                sessionKey: key,
-                agentId: targetAgentId,
-              });
-              return projection.sharingTarget({ key, agentId: ownerAgentId });
-            },
-          },
-        }),
-    });
+    const broadcaster = createProjectedQuestionBroadcaster(
+      f.cfg,
+      projection,
+      new GatewayClientRegistry([owner.ws, viewer.ws, broad.ws]),
+    );
     broadcast.mockImplementation(broadcaster.broadcast);
     expect((await f.request())[0]).toBe(true);
     expect(owner.send).toHaveBeenCalledOnce();
@@ -303,10 +274,7 @@ it("fans out requester-only questions after draft visibility changes with no glo
     } finally {
       get.mockRestore();
     }
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey: requestParams.sessionKey },
-      { ...f.entry, visibility: "draft" },
-    );
+    await f.write({ visibility: "draft" });
     owner.send.mockClear();
     viewer.send.mockClear();
     broad.send.mockClear();
@@ -350,8 +318,7 @@ it("fans out requester-only questions after draft visibility changes with no glo
 it.each(["ordinary", "secret"] as const)(
   "conceals privileged %s questions from narrow readers and fanout",
   async (kind) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       const { ws, send } = questionPeer(f.owner, "narrow-secret");
       broadcast.mockImplementation(
         createGatewayBroadcaster({ clients: new GatewayClientRegistry([ws]) }).broadcast,
@@ -376,18 +343,12 @@ it.each(["ordinary", "secret"] as const)(
         ]);
       } else {
         expect(manager.observe(id)?.sessionAccess).toBeDefined();
-        expect(await f.call("question.resolve", { id, cancel: true })).toMatchObject([
-          false,
-          undefined,
-          { details: { reason: "QUESTION_NOT_FOUND" } },
-        ]);
+        expect(await f.call("question.resolve", { id, cancel: true })).toMatchObject(
+          questionNotFound,
+        );
       }
       for (const method of ["question.get", "question.waitAnswer"]) {
-        expect(await f.call(method, { id })).toMatchObject([
-          false,
-          undefined,
-          { details: { reason: "QUESTION_NOT_FOUND" } },
-        ]);
+        expect(await f.call(method, { id })).toMatchObject(questionNotFound);
       }
       expect(await f.call("question.list", {})).toEqual([true, { questions: [] }, undefined]);
       expect(manager.get(id)?.status).toBe(kind === "secret" ? "answered" : "pending");
@@ -400,34 +361,29 @@ it.each(["ordinary", "secret"] as const)(
 it.each(["pending", "answered"] as const)(
   "retains physical store identity while %s",
   async (status) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       expect((await f.request())[0]).toBe(true);
       if (status === "answered") {
         manager.resolve("ordinary-question", { answers: { destination: ["Original"] } });
       }
       const observation = manager.observe("ordinary-question")!;
       const waiting = manager.waitAnswer("ordinary-question");
-      const replacement = state.statePath("replacement", "catalog.sqlite");
+      const replacement = f.state.statePath("replacement", "catalog.sqlite");
       await upsertSessionEntryCore(
         { agentId: "main", storePath: replacement, sessionKey: requestParams.sessionKey },
         f.entry,
       );
       f.cfg.session = { ...f.cfg.session, store: replacement };
-      await state.writeConfig(f.cfg);
+      await f.state.writeConfig(f.cfg);
       setRuntimeConfigSnapshot(f.cfg);
-      expect(await f.call("question.get", { id: "ordinary-question" })).toMatchObject([
-        false,
-        undefined,
-        { details: { reason: "QUESTION_NOT_FOUND" } },
-      ]);
+      expect(await f.call("question.get", { id: "ordinary-question" })).toMatchObject(
+        questionNotFound,
+      );
       expect(observation.record.status).toBe(status === "pending" ? "cancelled" : status);
       expect(await waiting).toMatchObject({ status: status === "pending" ? "cancelled" : status });
-      expect(await f.call("question.waitAnswer", { id: "ordinary-question" })).toMatchObject([
-        false,
-        undefined,
-        { details: { reason: "QUESTION_NOT_FOUND" } },
-      ]);
+      expect(await f.call("question.waitAnswer", { id: "ordinary-question" })).toMatchObject(
+        questionNotFound,
+      );
       expect(manager.get("ordinary-question")?.status).toBe(
         status === "pending" ? "cancelled" : status,
       );
@@ -438,15 +394,14 @@ it.each(["pending", "answered"] as const)(
 it.each(["closed claim", "absent", "incognito", "disallowed agent"] as const)(
   "refuses narrow question creation with %s before creating a record",
   async (kind) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       let client = f.producer;
       if (kind === "closed claim") {
         releaseAgentRunDelegatedAuthority(requesterAuthority);
       }
       if (kind === "disallowed agent") {
         f.cfg.gateway!.roles!.definitions.view!.agents = ["guest"];
-        await state.writeConfig(f.cfg);
+        await f.state.writeConfig(f.cfg);
         setRuntimeConfigSnapshot(f.cfg);
       }
       if (kind === "absent") {
@@ -462,10 +417,7 @@ it.each(["closed claim", "absent", "incognito", "disallowed agent"] as const)(
         };
       }
       if (kind === "incognito") {
-        await upsertSessionEntryCore(
-          { agentId: "main", sessionKey: requestParams.sessionKey },
-          { ...f.entry, incognito: true },
-        );
+        await f.write({ incognito: true });
       }
       const response = await f.call(
         "question.request",
@@ -485,8 +437,7 @@ it.each(["closed claim", "absent", "incognito", "disallowed agent"] as const)(
 it.each(["generation", "session", "profile", "reused id"] as const)(
   "rechecks held answer delivery after %s",
   async (change) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       const id = "ordinary-question";
       expect((await f.request(id))[0]).toBe(true);
       const entered = createDeferredCore();
@@ -548,8 +499,7 @@ it.each([
 ] as const)(
   "joins terminal preparation after %s without publishing stale facts or undoing the answer",
   async (change) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       const owner = questionPeer(f.owner, "held-owner");
       const broadcaster = createGatewayBroadcaster({
         clients: new GatewayClientRegistry([owner.ws]),
@@ -614,18 +564,18 @@ it.each([
         }
         if (change === "database close") {
           await closeOpenClawAgentDatabaseByPathAsync(
-            resolveOpenClawAgentSqlitePath({ agentId: "main", env: state.env }),
+            resolveOpenClawAgentSqlitePath({ agentId: "main", env: f.state.env }),
           );
         }
         if (change === "database replacement") {
-          const replacement = state.statePath("replacement.sqlite");
+          const replacement = f.state.statePath("replacement.sqlite");
           await upsertSessionEntryCore(
             { agentId: "main", storePath: replacement, sessionKey: requestParams.sessionKey },
             f.entry,
           );
           await closeOpenClawAgentDatabaseByPathAsync(replacement);
-          const original = resolveOpenClawAgentSqlitePath({ agentId: "main", env: state.env });
-          fs.renameSync(original, state.statePath("original.sqlite"));
+          const original = resolveOpenClawAgentSqlitePath({ agentId: "main", env: f.state.env });
+          fs.renameSync(original, f.state.statePath("original.sqlite"));
           fs.copyFileSync(replacement, original);
         }
         if (change === "unrelated") {
@@ -681,8 +631,7 @@ it.each([
 ] as const)(
   "fences question.%s when its %s closes during %s worker preparation",
   async (method, owner, kind) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       if (method === "get") {
         expect((await f.request())[0]).toBe(true);
       }
@@ -757,8 +706,7 @@ it.each([
 it.each(["admin", "narrow"] as const)(
   "preserves %s creation semantics when optional worker facts are unavailable",
   async (kind) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       const failure = new Error("question fixture worker unavailable");
       const admin = questionPeer(adminRequestClient, "optional-admin");
       const narrow = questionPeer(f.viewer, "optional-narrow");
@@ -810,8 +758,7 @@ it.each(["admin", "narrow"] as const)(
 it.each(["source", "generation"] as const)(
   "preserves current broad and admin terminal delivery after the original narrow %s retires",
   async (change) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const f = await fixture(state);
+    await withFixture(async (f) => {
       const source = f.sourceController;
       const narrow = questionPeer(f.owner, "retired-narrow");
       const broad = questionPeer(

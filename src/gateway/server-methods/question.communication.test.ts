@@ -27,6 +27,18 @@ import {
 import type { GatewayClient } from "./types.js";
 
 installQuestionTestHooks();
+const resolve = (cfg: OpenClawConfig, client: GatewayClient, id: string, decision = "Allow once") =>
+  callQuestionRpc(
+    "question.resolve",
+    {
+      id,
+      answers: { answers: { communication: [decision] } },
+    },
+    { cfg, client },
+  );
+const get = (cfg: OpenClawConfig, client: GatewayClient, id: string) =>
+  callQuestionRpc("question.get", { id }, { cfg, client });
+
 async function fixture(
   run: (fixture: {
     endpoint: CommunicationEndpoint;
@@ -102,14 +114,9 @@ it("publishes to the real recipient under sender ALS and refuses model/admin sel
     expect(question.sessionKey).toBe(endpoint.sessionKey);
     expect(question.questions[0]?.header.length).toBeLessThanOrEqual(12);
     expect(question.questions[0]?.question).toContain("exact message\n  with whitespace ");
-    const resolve = { id: question.id, answers: { answers: { communication: ["Allow once"] } } };
-    expect((await callQuestionRpc("question.resolve", resolve, { cfg, client: model }))[0]).toBe(
-      false,
-    );
+    expect((await resolve(cfg, model, question.id))[0]).toBe(false);
     expect(manager.get(question.id)?.status).toBe("pending");
-    expect((await callQuestionRpc("question.resolve", resolve, { cfg, client: creator }))[0]).toBe(
-      true,
-    );
+    expect((await resolve(cfg, creator, question.id))[0]).toBe(true);
     await expect(pending).resolves.toBeUndefined();
   });
 });
@@ -119,20 +126,18 @@ it("retains creator/admin rights without treating assigned responsibility as aut
     endpoint.entry!.owner = { actor: { type: "human", id: "sender" } };
     const pending = expect(ask()).rejects.toThrow("not authorized");
     const question = manager.list()[0]!;
-    const canRead = async (client: GatewayClient) =>
-      (await callQuestionRpc("question.get", { id: question.id }, { cfg, client }))[0];
+    const canRead = async (client: GatewayClient) => (await get(cfg, client, question.id))[0];
     expect(await canRead(creator)).toBe(true);
     expect(await canRead(admin)).toBe(true);
     expect(await canRead(peer)).toBe(false);
+    expect((await callQuestionRpc("question.list", {}, { cfg, client: peer }))[1]).toEqual({
+      questions: [],
+    });
     const solo = { ...admin, internal: { operatorRoleActor: { kind: "system" as const } } };
     expect(await canRead(solo)).toBe(true);
     creator.invalidated = true;
     await expect(canRead(creator)).rejects.toThrow("requester authority changed");
-    await callQuestionRpc(
-      "question.resolve",
-      { id: question.id, answers: { answers: { communication: ["Deny"] } } },
-      { cfg, client: admin },
-    );
+    await resolve(cfg, admin, question.id, "Deny");
     await pending;
   });
 });
@@ -150,50 +155,11 @@ it("rejects an already displayed decision after the recipient incarnation change
         lifecycleRevision: "replacement-recipient-lifecycle",
       },
     );
-    expect(
-      (
-        await callQuestionRpc(
-          "question.resolve",
-          {
-            id: question.id,
-            answers: { answers: { communication: ["Allow once"] } },
-          },
-          { cfg, client: creator },
-        )
-      )[0],
-    ).toBe(false);
+    expect((await resolve(cfg, creator, question.id))[0]).toBe(false);
     expect(manager.get(question.id)?.status).toBe("pending");
-    expect(
-      (
-        await callQuestionRpc(
-          "question.resolve",
-          { id: question.id, answers: { answers: { communication: ["Allow once"] } } },
-          { cfg, client: admin },
-        )
-      )[0],
-    ).toBe(false);
+    expect((await resolve(cfg, admin, question.id))[0]).toBe(false);
     manager.cancel(question.id, "recipient-replaced");
     await denied;
-  });
-});
-
-it("does not leak bound questions through broad question list/get scopes", async () => {
-  await fixture(async ({ cfg, peer, admin, ask }) => {
-    const pending = ask();
-    const rejected = expect(pending).rejects.toThrow("not authorized");
-    const question = manager.list()[0]!;
-    expect(
-      (await callQuestionRpc("question.get", { id: question.id }, { cfg, client: peer }))[0],
-    ).toBe(false);
-    expect((await callQuestionRpc("question.list", {}, { cfg, client: peer }))[1]).toEqual({
-      questions: [],
-    });
-    await callQuestionRpc(
-      "question.resolve",
-      { id: question.id, answers: { answers: { communication: ["Deny"] } } },
-      { cfg, client: admin },
-    );
-    await rejected;
   });
 });
 
@@ -303,15 +269,7 @@ it.each(["Allow once", "Deny"] as const)(
         ]);
         expect(ensureTarget).not.toHaveBeenCalled();
         expect(callGateway).not.toHaveBeenCalled();
-        expect(
-          (
-            await callQuestionRpc(
-              "question.resolve",
-              { id: senderId, answers: { answers: { communication: ["Allow once"] } } },
-              { cfg, client: creator },
-            )
-          )[0],
-        ).toBe(true);
+        expect((await resolve(cfg, creator, senderId))[0]).toBe(true);
         const recipientId = await Promise.race([
           receiveQuestion.promise,
           pending.then(() => {
@@ -325,15 +283,7 @@ it.each(["Allow once", "Deny"] as const)(
           status: "pending",
         });
         expect((await read(target.sessionKey)).entry?.sessionId).toBe("created-empty-main");
-        expect(
-          (
-            await callQuestionRpc(
-              "question.resolve",
-              { id: recipientId, answers: { answers: { communication: [decision] } } },
-              { cfg, client: admin },
-            )
-          )[0],
-        ).toBe(true);
+        expect((await resolve(cfg, admin, recipientId, decision))[0]).toBe(true);
         const result = await observed;
         if (decision === "Deny") {
           expect(result.error).toBeInstanceOf(Error);

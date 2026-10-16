@@ -27,17 +27,16 @@ import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { prepareGatewayRecipientProfile } from "../expected-profile.js";
 import { invalidateOperatorRolePolicy } from "../operator-role-policy.js";
 import { captureGatewayOperatorRunAuthority } from "../operator-run-authority.js";
-import { createGatewayBroadcaster } from "../server-broadcast.js";
 import { createSyntheticPluginRuntimeClient } from "../server-plugin-runtime-client.js";
 import { GatewayClientRegistry } from "../server/client-registry.js";
 import type { GatewayWsClient } from "../server/ws-types.js";
 import { createSessionRowProjection } from "../session-row-projection.js";
-import { canReceiveSessionEvent, prepareProjectedSessionSharing } from "../session-sharing.js";
 import { canReceivePreparedSessionEvent } from "../session-sharing.test-utils.js";
-import { resolveSessionStoreIdentity } from "../session-store-key.js";
 import {
   broadcast,
   callQuestionRpc,
+  createProjectedQuestionBroadcaster,
+  questionNotFound,
   installQuestionTestHooks,
   manager,
   requestParams,
@@ -149,34 +148,7 @@ async function createOwnRunFixture() {
   const projection = await createSessionRowProjection({ cfg });
   await projection.ensureMaterialized();
   const clients = new GatewayClientRegistry([browser.client]);
-  const broadcaster = createGatewayBroadcaster({
-    clients,
-    canReceiveSessionEvent: (client, sessionKeys, agentId, event, payload) =>
-      canReceiveSessionEvent({
-        cfg,
-        client,
-        sessionKeys,
-        agentId,
-        event,
-        payload,
-        prepared: {
-          sharing: prepareProjectedSessionSharing({
-            cfg,
-            client,
-            isMember: (target, identityId) =>
-              projection.hasMembership(target.storePath, target.storeKey, identityId),
-          }),
-          target: (key, targetAgentId) => {
-            const { agentId: ownerAgentId } = resolveSessionStoreIdentity({
-              cfg,
-              sessionKey: key,
-              agentId: targetAgentId,
-            });
-            return projection.sharingTarget({ key, agentId: ownerAgentId });
-          },
-        },
-      }),
-  });
+  const broadcaster = createProjectedQuestionBroadcaster(cfg, projection, clients);
   broadcast.mockImplementation(broadcaster.broadcast);
   const call = (
     method: string,
@@ -471,7 +443,7 @@ describe("own-run question admission", () => {
               { id, ...(method === "question.resolve" ? { answers } : {}) },
               peer.client,
             ),
-          ).toMatchObject([false, undefined, { details: { reason: "QUESTION_NOT_FOUND" } }]);
+          ).toMatchObject(questionNotFound);
           expect(retainedReads, "foreign keyed reads must not probe the retained session").toBe(0);
         }
         expect(peer.socket.send).not.toHaveBeenCalled();
@@ -530,7 +502,7 @@ describe("own-run question admission", () => {
               id: record.id,
               ...(method === "question.resolve" ? { cancel: true } : {}),
             }),
-          ).toMatchObject([false, undefined, { details: { reason: "QUESTION_NOT_FOUND" } }]);
+          ).toMatchObject(questionNotFound);
         }
         expect(manager.get(record.id)?.status).toBe("pending");
       }
@@ -620,11 +592,7 @@ describe("own-run question admission", () => {
             expect(recipient.client.invalidated).not.toBe(true);
             expect(observation.record.status).toBe("pending");
             release.resolve();
-            expect(await request).toMatchObject([
-              false,
-              undefined,
-              { details: { reason: "QUESTION_NOT_FOUND" } },
-            ]);
+            expect(await request).toMatchObject(questionNotFound);
             expect(observation.record.status).toBe("cancelled");
             expect(await waiting).toEqual({ status: "cancelled" });
             await manager.drain();
@@ -650,11 +618,7 @@ describe("own-run question admission", () => {
         const observation = manager.observe(id)!;
         const waiting = manager.waitAnswer(id);
         replaceSessionEntrySync(sessionScope, { ...f.entry, [field]: "replacement", updatedAt: 2 });
-        expect(await f.call("question.get", { id })).toMatchObject([
-          false,
-          undefined,
-          { details: { reason: "QUESTION_NOT_FOUND" } },
-        ]);
+        expect(await f.call("question.get", { id })).toMatchObject(questionNotFound);
         // The first worker-confirmed denial retires the original entry without another get().
         expect(observation.record.status).toBe("cancelled");
         expect(await waiting).toEqual({ status: "cancelled" });
@@ -663,7 +627,7 @@ describe("own-run question admission", () => {
         for (const method of ["question.waitAnswer", "question.resolve"]) {
           expect(
             await f.call(method, { id, ...(method === "question.resolve" ? { answers } : {}) }),
-          ).toMatchObject([false, undefined, { details: { reason: "QUESTION_NOT_FOUND" } }]);
+          ).toMatchObject(questionNotFound);
         }
         expect((await f.call("question.list", {}))[1]).toEqual({ questions: [] });
         expect(manager.get(id)?.status).toBe("cancelled");
