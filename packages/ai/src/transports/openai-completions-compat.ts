@@ -237,7 +237,8 @@ function resolveOpenAICompletionsCompatDefaults(
               ? "openrouter"
               : "openai",
     visibleReasoningDetailTypes: isOpenRouterLike ? ["response.output_text", "response.text"] : [],
-    supportsStrictMode: !isZai && !usesConfiguredNonOpenAIEndpoint,
+    supportsStrictMode:
+      !isZai && (!usesConfiguredNonOpenAIEndpoint || endpointClass === "openrouter"),
     requiresTypedUnionBranches: isMoonshot,
     supportsJsonSchemaResponseFormat:
       (endpointClass === "openai-public" ||
