@@ -65,7 +65,11 @@ describe
           database.db
             .prepare("UPDATE session_nodes SET entry_json = ? WHERE session_key = ?")
             .run(`${legacyJson.slice(0, -1)},"opaque":9007199254740993}`, legacyScope.sessionKey);
-          markCanonicalSessionValidationPending(database, [legacyScope.sessionKey]);
+          // Legacy repair clears its own row; retain normal work for the pooled validator.
+          markCanonicalSessionValidationPending(database, [
+            scope.sessionKey,
+            legacyScope.sessionKey,
+          ]);
         });
         withEngineStoreAdmission(() => closeOpenClawAgentDatabases(stateDir));
         await cleanupSessionStateForTest({ stateDir });
