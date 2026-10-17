@@ -85,10 +85,10 @@ import {
 } from "./app-sidebar-session-types.ts";
 import type { SessionAttention } from "./session-attention.ts";
 import { SessionDataOwner } from "./session-data.ts";
-import type { SessionOrganizerController } from "./session-organizer-controller.ts";
+import type { SessionOrganizer } from "./session-organizer.ts";
 import { SessionOwnerFilter } from "./session-owner-filter.ts";
 import { SidebarEmptyGroupsPreference } from "./sidebar-empty-groups.ts";
-import type { SidebarMenusController } from "./sidebar-menus-controller.tsx";
+import type { SidebarMenus } from "./sidebar-menus.tsx";
 import type { SidebarNavigationCatalog } from "./sidebar-navigation-catalog.ts";
 import {
   memoizedSidebarCatalogs,
@@ -288,8 +288,8 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
   abstract get sidebarNarrationLines(): ReadonlyMap<string, string>;
   abstract get sidebarTools(): ReadonlyMap<string, SidebarToolActivity>;
   abstract get sidebarObserverDigests(): ReadonlyMap<string, SessionObserverDigest>;
-  declare readonly sessionOrganizer: SessionOrganizerController;
-  declare readonly sidebarMenus: SidebarMenusController;
+  declare readonly sessionOrganizer: SessionOrganizer;
+  declare readonly sidebarMenus: SidebarMenus;
 
   get sessionDataContext() {
     return this.context;
@@ -311,7 +311,10 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   protected override willUpdate() {
     if (this.emptyGroups.reconcile() && this.sidebarMenus.sessionSortMenuPosition) {
-      this.sidebarMenus.closePositionedMenu("sessionSort");
+      // Menu state writes belong after the preparation memo commits.
+      void this.updateComplete.then(
+        (committed) => committed && this.sidebarMenus.closePositionedMenu("sessionSort"),
+      );
     }
     super.willUpdate();
   }
