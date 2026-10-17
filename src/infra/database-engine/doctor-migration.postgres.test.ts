@@ -602,7 +602,9 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         postgresMigrations: [],
       };
       const targetNamespace = withEngineStoreAdmission(() => {
-        using anchor = openNodeSqliteDatabase(":memory:");
+        using anchor = openNodeSqliteDatabase(
+          path.join(env.OPENCLAW_STATE_DIR!, `agent-reference-${foreignWrite}.sqlite`),
+        );
         const engine = openEngineStore({
           anchor,
           schema: candidate,
