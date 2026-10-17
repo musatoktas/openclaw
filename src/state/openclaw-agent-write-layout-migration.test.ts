@@ -30,8 +30,6 @@ const schemaV27 = fs.readFileSync(
 const scope = [
   "memory_entry_origins",
   "schema_meta",
-  "session_nodes",
-  "session_reactions",
   "session_windows",
   "sqlite_stat1",
   "sqlite_stat4",
@@ -288,7 +286,7 @@ describe("agent write layout migration", () => {
         resolveSchemaMigrationBackupTables({
           kind: "agent",
           foundVersion: 27,
-          supportedVersion: OPENCLAW_AGENT_SCHEMA_VERSION,
+          supportedVersion: AGENT_WRITE_LAYOUT_SCHEMA_VERSION,
         }),
       ).toEqual(scope);
       await withAgentDatabaseMaintenanceLease({ env: state.env }, async (lease) => {
