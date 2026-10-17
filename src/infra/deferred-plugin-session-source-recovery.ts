@@ -1,14 +1,13 @@
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { formatCliCommand } from "../cli/command-format.js";
 import {
   isPrimarySessionTranscriptFileName,
   isTrajectorySessionArtifactName,
 } from "../config/sessions/artifacts.js";
 import { extractGeneratedTranscriptSessionId } from "../config/sessions/generated-transcript-session-id.js";
 import { readLegacySessionStoreEntries } from "../config/sessions/legacy-store-inspection.js";
-import type { DB } from "../state/openclaw-state-db.generated.js";
-import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
+import { runOpenClawStateWorkerOperation } from "../state/openclaw-state-worker-store.js";
 import {
   collectArchivedSources,
   existingSessionSourcePaths,
@@ -25,12 +24,12 @@ import {
   verifyDeferredSessionDatabase,
   verifyMissingDeferredSessionTranscript,
 } from "./deferred-plugin-session-verification.js";
-import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
 import {
   readMigrationArtifactIdentity,
   sameMigrationArtifact,
   statMigrationPath,
 } from "./session-sqlite-migration-artifact.js";
+import { createSqliteWorkerWriteAdmission } from "./sqlite-worker-store.js";
 import {
   parseSessionImportReceipt,
   supersedeDeferredPluginSessionImport,
@@ -102,13 +101,13 @@ export async function rebuildDeferredPluginSessionSourceIndex(
     if (
       isPrimarySessionTranscriptFileName(path.basename(source.path)) &&
       existingSessionSourcePaths(source.path, target, params.env, archives).length === 0 &&
-      verifyMissingDeferredSessionTranscript({
+      (await verifyMissingDeferredSessionTranscript({
         target,
         env: params.env,
         identity: source.identity,
         sessionId:
           extractGeneratedTranscriptSessionId(source.path) ?? path.basename(source.path, ".jsonl"),
-      })
+      }))
     ) {
       settledSources.push({
         ...source,
@@ -224,42 +223,25 @@ export async function rebuildDeferredPluginSessionSourceIndex(
   if (isDeepStrictEqual(rebuilt, recorded)) {
     return false;
   }
-  runOpenClawStateWriteTransaction(
-    ({ db }) => {
-      const current = readDeferredPluginSessionImportReceipt({ ...params, database: db });
-      if (!receiptStillBound(current)) {
-        throw new Error(
-          `Deferred session import changed in ${path.dirname(params.target.storePath)} before its source index was rebuilt. Run ${formatCliCommand("openclaw doctor --fix --non-interactive --yes", params.env)} against the same state/config to retry.`,
-        );
-      }
-      const reportJson = JSON.stringify(rebuilt);
-      const rebuiltIndex = sources.find((source) => source.path === path.resolve(target.storePath));
-      const query = getNodeSqliteKysely<DB>(db);
-      executeSqliteQuerySync(
-        db,
-        query
-          .updateTable("migration_sources")
-          .set({
-            report_json: reportJson,
-            ...(rebuiltIndex
-              ? {
-                  source_sha256: rebuiltIndex.identity.sha256,
-                  source_size_bytes: rebuiltIndex.identity.size,
-                }
-              : {}),
-          })
-          .where("source_key", "=", receipt.sourceKey),
-      );
-      executeSqliteQuerySync(
-        db,
-        query
-          .updateTable("migration_runs")
-          .set({ report_json: reportJson })
-          .where("id", "=", receipt.sourceKey),
-      );
+  const context = captureOpenClawStateWorkerContext({ env: params.env });
+  await runOpenClawStateWorkerOperation(
+    context,
+    (scope) =>
+      scope.execute({
+        type: "deferredSessionImport.rebuildSources",
+        input: {
+          receipt,
+          rebuilt,
+          storePath: target.storePath,
+          sqlitePath: params.sqlitePath,
+          physicalIdentity,
+        },
+      }),
+    {
+      createAdmission: createSqliteWorkerWriteAdmission(context.admission.assertCurrent, [
+        context.admission.databasePath,
+      ]),
     },
-    { env: params.env },
-    { operationLabel: "state.rebuild-plugin-session-source-index" },
   );
   for (const source of settledSources.slice(recorded.settledSources?.length ?? 0)) {
     params.onMissingSource?.(source.path, source.reason);

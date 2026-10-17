@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -15,13 +14,9 @@ import {
   shouldFilterLegacySessionRecordsByTarget,
   type LegacySessionStoreTarget,
 } from "../config/sessions/legacy-store-inspection.js";
-import { getSessionKysely } from "../config/sessions/session-accessor.sqlite-scope.js";
-import { transcriptEventJsonSql } from "../config/sessions/transcript-payload.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import { sha256Hex } from "./crypto-digest.js";
 import { recoverEmptyRetainedTranscript } from "./deferred-plugin-session-empty.js";
-import { iterateSqliteQuerySync } from "./kysely-sync.js";
 import {
   readMigrationArtifactIdentity,
   type MigrationArtifactIdentity,
@@ -34,8 +29,10 @@ import {
   readOnlySqliteValidationSnapshot,
 } from "./session-sqlite-migration-readers.js";
 import { verifyCanonicalSessionTranscriptSources } from "./session-sqlite-transcript-verification.js";
+import { runSqliteReadOnlyOperation } from "./sqlite-readonly-worker.js";
 import {
   databaseFileIdentityKey,
+  readDatabasePathIdentitySync,
   readDatabaseIdentityBirthtime,
 } from "./sqlite-worker-identity.js";
 
@@ -226,41 +223,30 @@ export function sameSourceContent(
 }
 
 /** Only an exact byte match can replace a missing original; row counts cannot prove coverage. */
-export function verifyMissingDeferredSessionTranscript(params: {
+export async function verifyMissingDeferredSessionTranscript(params: {
   target: { agentId: string; sqlitePath: string };
   sessionId: string;
   identity: MigrationArtifactIdentity;
   env: NodeJS.ProcessEnv;
-}): boolean {
+}): Promise<boolean> {
   if (params.identity.size === 0) {
     return false;
   }
-  const result = withOpenClawAgentDatabaseReadOnly(
-    ({ db }) => {
-      const query = getSessionKysely(db);
-      const hash = createHash("sha256");
-      let bytes = 0;
-      for (const row of iterateSqliteQuerySync(
-        db,
-        query
-          .selectFrom("transcript_events")
-          .select(transcriptEventJsonSql(db).as("event_json"))
-          .where("session_id", "=", params.sessionId)
-          .orderBy("seq", "asc"),
-      )) {
-        const line = `${row.event_json}\n`;
-        bytes += Buffer.byteLength(line);
-        if (bytes > params.identity.size) {
-          return false;
-        }
-        hash.update(line);
-        if (bytes === params.identity.size) {
-          return hash.digest("hex") === params.identity.sha256;
-        }
-      }
-      return false;
+  return await runSqliteReadOnlyOperation(
+    params.target.sqlitePath,
+    {
+      type: "deferredSessionImport.verifyMissingTranscript",
+      input: {
+        agentId: params.target.agentId,
+        sessionId: params.sessionId,
+        identity: params.identity,
+      },
     },
-    { agentId: params.target.agentId, path: params.target.sqlitePath, env: params.env },
+    {
+      source: "canonical",
+      expectedIdentity: readDatabasePathIdentitySync(params.target.sqlitePath).key,
+      artifactPreserving: true,
+      env: params.env,
+    },
   );
-  return result.found && result.value;
 }

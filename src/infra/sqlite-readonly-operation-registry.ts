@@ -5,6 +5,7 @@ import {
   createWorkerOperationRegistry,
   type WorkerOperations,
 } from "../state/worker-operation-registry.js";
+import type { DeferredSessionTranscriptReadOperations } from "./deferred-plugin-session-source-recovery.worker-contract.js";
 import type { immutableInstallReadOperations } from "./package-update-activation-immutable.js";
 import type { pageCacheReadOperations } from "./sqlite-page-cache.worker.js";
 import type { SqliteReadOnlyOperationContext } from "./sqlite-readonly-operation-types.js";
@@ -15,12 +16,17 @@ export type SqliteReadOnlyOperations = WorkerOperations<
     typeof pageCacheReadOperations &
     typeof stateSnapshotReadOperations
 > &
+  DeferredSessionTranscriptReadOperations &
   AgentDeletionSessionStoreAbsentReadOperations;
 
 export const sqliteReadOnlyOperations = createWorkerOperationRegistry<
   SqliteReadOnlyOperations,
   SqliteReadOnlyOperationContext
 >({
+  deferredSessionImport: () =>
+    import("./deferred-plugin-session-source-recovery.worker.js").then(
+      (module) => module.deferredSessionTranscriptReadOperations,
+    ),
   agentRetirement: () =>
     import("../agents/agent-delete-session-store-safety.kernel.js").then(
       (module) => module.agentDeletionSessionStoreAbsentReadOperations,

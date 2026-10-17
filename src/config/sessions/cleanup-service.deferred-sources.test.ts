@@ -13,7 +13,8 @@ import { runSessionsCleanup } from "./cleanup-service.js";
 import { replaceSessionEntrySync } from "./session-accessor.entry.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
-vi.mock("./store-maintenance-runtime.js", () => ({
+vi.mock("./store-maintenance-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./store-maintenance-runtime.js")>()),
   resolveMaintenanceConfig: () => ({
     mode: "enforce" as const,
     pruneAfterMs: 24 * 60 * 60 * 1000,
