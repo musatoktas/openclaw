@@ -11,6 +11,7 @@ import {
 } from "../../test/helpers/fixture-receipts.js";
 import { withinTest } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import {
   encodeSessionArchiveContent,
   materializeSessionArchiveForRead,
@@ -80,6 +81,7 @@ function transcriptText(sessionId: string, entry: unknown): string {
 describe("session cost usage worker I/O", () => {
   it("refuses unvalidated legacy session keys before assigning usage ownership", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       const database = openOpenClawAgentDatabase({ agentId: "main" });
       database.db
         .prepare(
