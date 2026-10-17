@@ -141,7 +141,7 @@ export function SidebarAgentRoster(props: RosterProps) {
     return () => {
       if (host.readRosterCollapsedAgentIds === readCollapsed) {
         host.readRosterCollapsedAgentIds = null;
-        host.requestUpdate();
+        host.invalidate();
       }
     };
   });

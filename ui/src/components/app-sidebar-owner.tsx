@@ -75,7 +75,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
     return this.readNarration()?.observerDigests ?? this.emptyObserverDigests;
   }
 
-  override readonly sessionOrganizer = new SessionOrganizer(this, () => this.requestUpdate());
+  override readonly sessionOrganizer = new SessionOrganizer(this, () => this.invalidate());
   // Native sidebar custody outlives provider/view roots.
   private readonly menuRoot = runWithOwner(null, () =>
     createRoot((dispose) => ({
@@ -83,7 +83,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
         host: this,
         element: this.hostElement,
         commit: () => {
-          this.requestUpdate();
+          this.invalidate();
           return this.updateComplete;
         },
       }),
@@ -92,7 +92,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
   );
   override readonly sidebarMenus = this.menuRoot.menus;
   readonly disposeMenus = this.menuRoot.dispose;
-  readonly people = new SidebarPeoplePreferences(() => this.requestUpdate());
+  readonly people = new SidebarPeoplePreferences(() => this.invalidate());
   peopleView?: ReturnType<typeof createSidebarPeople>;
   // A connected host retains its pending boot read when Solid recreates the view.
   readonly snapshot = createSidebarSnapshot(this);
@@ -226,7 +226,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
     (module) => {
       this.catalogRenderer = module.renderSessionCatalogGroups;
       if (this.isConnected) {
-        this.requestUpdate();
+        this.invalidate();
       }
     },
   );
@@ -348,7 +348,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
         sectionId,
         limit,
       );
-      this.requestUpdate();
+      this.invalidate();
     } else {
       this.sessionData.setVisibleSessionLimit(sectionId, limit);
     }
@@ -361,7 +361,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
   setCatalogProjectGrouping(next: CatalogProjectGrouping): void {
     storeSidebarCatalogGrouping(next);
     this.catalogProjectGrouping = next;
-    this.requestUpdate();
+    this.invalidate();
   }
 
   hideSessionCatalog(catalogId: string): void {

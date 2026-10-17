@@ -101,7 +101,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
         context.plugins.subscribe(current.sessionData.requestSessionDataUpdate),
         listen(window, SIDEBAR_HIDDEN_SESSION_CATALOGS_CHANGED_EVENT, () => {
           current.hiddenSessionCatalogIds = loadStoredHiddenSessionCatalogIds();
-          current.requestUpdate();
+          current.invalidate();
         }),
         listen(window, "openclaw:native-gateways-changed", () => {
           if (current.isConnected) {
@@ -267,7 +267,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
           const timer = globalThis.setTimeout(
             () => {
               owner.sessionProjection.invalidate();
-              owner.requestUpdate();
+              owner.invalidate();
             },
             Math.max(0, deadline - Date.now()),
           );

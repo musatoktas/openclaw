@@ -147,7 +147,7 @@ describe("AppSidebar gateway footer subtitle", () => {
       dirty: false,
       release: true,
     });
-    sidebar.requestUpdate();
+    sidebar.invalidate();
     await sidebar.updateComplete;
 
     expect(sidebar.querySelector(".sidebar-identity-card")?.getAttribute("aria-label")).toBe(
@@ -271,7 +271,7 @@ describe("AppSidebar gateway footer subtitle", () => {
         { instanceId: "old-connection", ts: 1, user: { id: "profile-alex", name: "Alex" } },
       ],
     };
-    sidebar.requestUpdate();
+    sidebar.invalidate();
     await sidebar.updateComplete;
     expect(name()).toBe("Owner");
     gateway.publish({ phase: "connected", selfUser: null });

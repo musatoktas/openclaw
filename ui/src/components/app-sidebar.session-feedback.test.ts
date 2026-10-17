@@ -153,7 +153,7 @@ describe("sidebar session feedback", () => {
         ),
       }),
     );
-    sidebar.requestUpdate();
+    sidebar.invalidate();
     await settleLitElement(sidebar);
     expect(sidebar.textContent).not.toContain(hint);
   });
@@ -278,7 +278,7 @@ describe("sidebar session feedback", () => {
             ...sidebar.sessionData.sessionsResult!,
             hasMore: true,
           };
-          sidebar.requestUpdate();
+          sidebar.invalidate();
         }
         await settleLitElement(sidebar);
         expect(sidebar.textContent).not.toContain(hint);
