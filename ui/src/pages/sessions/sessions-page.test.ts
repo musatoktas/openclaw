@@ -116,10 +116,7 @@ describe("sessions page lifecycle", () => {
   it("disables refresh during transport loss and restores it after reconnect", async () => {
     const { page, connection, sessions } = await mountMutation();
     const refreshList = vi.mocked(sessions.refreshList);
-    const refresh = () =>
-      [...page.querySelectorAll<HTMLButtonElement>("button")].find(
-        (button) => button.textContent?.trim() === "Refresh",
-      )!;
+    const refresh = () => page.querySelector<HTMLButtonElement>('button[aria-label="Refresh"]')!;
     await vi.waitFor(() => expect(refresh().disabled).toBe(false));
     for (const phase of ["reconnecting", "offline"] as const) {
       connection.emit({ phase });

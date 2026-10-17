@@ -1,4 +1,3 @@
-import { untrack } from "solid-js";
 import { isSettingsNavigationRoute, isSettingsTakeover } from "../app-navigation.ts";
 import { isSessionRouteId } from "../app-route-paths.ts";
 import { APP_ROUTE_IDS } from "../app-routes.ts";
@@ -19,6 +18,7 @@ import type { ShellViewCallbacks } from "./app-shell-view-callbacks.ts";
 import type { ApplicationRuntime } from "./bootstrap.ts";
 import { canGoBackInNativeEmbed } from "./browser.ts";
 import type { ApplicationNavigationOptions } from "./context.ts";
+import type { ControlUiReadinessOutlet } from "./control-ui-readiness.ts";
 import { gatewayPresentationScope } from "./gateway-presentation-scope.ts";
 import {
   APP_SIDEBAR_ELEMENT,
@@ -32,6 +32,7 @@ import {
   floatingSidebarAttentionVisible,
   navigationSurfaceIsHidden,
   NAVIGATION_RAIL_WIDTH,
+  type ShellNavigationElements,
 } from "./navigation-surface.ts";
 import { readGatewayOperatorAccess } from "./operator-access.ts";
 import {
@@ -43,7 +44,9 @@ import { resolveProfileAppearancePrefs } from "./server-prefs-profile.ts";
 import { NAV_WIDTH_MAX, normalizeCatalogOpenTarget } from "./settings.ts";
 import type { ShellLayoutOwner } from "./shell-layout-owner.ts";
 
-export interface ShellViewHost extends ShellLazyOverlayHost {
+export interface ShellViewHost extends ShellLazyOverlayHost, ShellNavigationElements {
+  routeOutlet?: ControlUiReadinessOutlet;
+  terminalPanel?: HTMLElement & { readonly available?: boolean };
   readonly devicePairSetup: DevicePairSetupLoader;
   readonly shellRevision: () => number;
   readonly settingsSidebar: SettingsSidebarLoader;
@@ -74,16 +77,12 @@ export interface ShellViewHost extends ShellLazyOverlayHost {
   readonly navigate: (routeId: string, options?: ApplicationNavigationOptions) => void;
   refreshControlUi: () => Promise<boolean>;
   recoverNotFoundRoute: () => boolean;
-  prepareView(): void;
   invalidate(): void;
-  querySelectorAll: ParentNode["querySelectorAll"];
   resizeNavigation(splitRatio: number): void;
   readonly toggleNavigationSurface: (trigger?: HTMLElement) => void;
 }
 
 export function readShellView(host: ShellViewHost) {
-  // Imperative preparation consumes current owner facts; it must not widen view dependencies.
-  untrack(() => host.prepareView());
   const context = host.context;
   const runtime = host.runtime;
   const callbacks = host.viewCallbacks;
@@ -97,9 +96,10 @@ export function readShellView(host: ShellViewHost) {
   const navigationSnapshot = context.navigation.snapshot;
   const overlaySnapshot = context.overlays.snapshot;
   const controlUiRefreshRequired = overlaySnapshot.controlUiRefreshRequired;
-  const historyRecovering = [...host.querySelectorAll<ChatPaneElement>("openclaw-chat-pane")].some(
-    (pane) => pane.conversationPresented && pane.historyRecovering,
-  );
+  // Chat owns the live panes beneath its retained route island.
+  const historyRecovering = [
+    ...(host.routeOutlet?.querySelectorAll<ChatPaneElement>("openclaw-chat-pane") ?? []),
+  ].some((pane) => pane.conversationPresented && pane.historyRecovering);
   const connectionStatus = resolveGatewayStatus(
     gatewaySnapshot,
     controlUiRefreshRequired,
@@ -333,6 +333,7 @@ export function readShellView(host: ShellViewHost) {
   };
   return {
     nowMs: Date.now(),
+    routeReady: host.routeState.routeId !== undefined || host.routeState.routeFailed,
     context,
     runtime,
     callbacks,

@@ -34,6 +34,7 @@ export function buildProps(result: SessionsListResult): SessionsProps {
     refreshing: false,
     refreshDisabled: false,
     agentId: "main",
+    allAgentsScope: true,
     mainKey: "main",
     result,
     error: null,
