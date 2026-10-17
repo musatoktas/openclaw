@@ -105,15 +105,17 @@ export function bindPostgresMemoryPublication(
     const previousFacts = rebuilding && { ...rebuilding };
     const previousMetadata = metadata;
     const previousCreated = created;
-    const retained = embeddingCacheSizes.get(db);
-    const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
-    cacheSize = retained?.token === token ? retained?.size : undefined;
-    const previousCacheSize = cacheSize;
+    let previousCacheSize: number | undefined;
     try {
       const value = db.runTransaction(
         () => {
           context.admit("transaction");
           entered = true;
+          // Another owner may commit while this transaction waits for the store's writer lock.
+          const retained = embeddingCacheSizes.get(db);
+          const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
+          cacheSize = retained?.token === token ? retained?.size : undefined;
+          previousCacheSize = cacheSize;
           return run();
         },
         {

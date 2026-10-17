@@ -642,6 +642,36 @@ describe.skipIf(!connection)("PostgreSQL memory publication worker", () => {
       }
     }));
 
+  it("keeps the cache bounded when another owner commits before its transaction starts", () =>
+    admitted(() => {
+      const header = {
+        agentId: "publication-fixture",
+        provider: { id: "fixture", model: "fixture" },
+        providerKey: "fixture",
+        maxEntries: 3,
+      };
+      const command = (hashes: string[]) => ({
+        type: "cache.write.inline" as const,
+        input: { header, entries: hashes.map((hash) => ({ hash, embedding: [1] })) },
+      });
+      expect(backend.execute(command(["a", "b"]))).toMatchObject({ ok: true });
+      const other = bind();
+      const runTransaction = pg().runTransaction.bind(pg());
+      const transaction = vi
+        .spyOn(pg(), "runTransaction")
+        .mockImplementationOnce((run, options) => {
+          expect(other.execute(command(["c"]))).toMatchObject({ ok: true });
+          return runTransaction(run, options);
+        });
+      try {
+        expect(backend.execute(command(["d"]))).toMatchObject({ ok: true });
+        expect(pg().prepare("SELECT hash FROM memory_embedding_cache").all()).toHaveLength(3);
+      } finally {
+        transaction.mockRestore();
+        other.close();
+      }
+    }));
+
   it("replays a multi-request cache through bounded connection-local staging", () =>
     admitted(() => {
       const entries = Array.from({ length: 40 }, (_, index) => ({
