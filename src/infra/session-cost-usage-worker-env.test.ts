@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 import * as configEnv from "../config/config-env-vars.js";
+import { writeSessionEntry } from "../config/sessions/session-accessor.sqlite-entry-store.js";
 import { resolveSqliteTranscriptScope } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { appendTranscriptEventsInTransaction } from "../config/sessions/session-accessor.sqlite-transcript-store.js";
 import { unregisterOpenClawAgentDatabase } from "../state/openclaw-agent-db-registry.js";
@@ -64,6 +65,84 @@ it("refreshes retained transcript windows whose session IDs contain colons", asy
         requestRefresh: false,
       }),
     ).resolves.toMatchObject({ summaries: [{ totalTokens: 10, totalCost: 1 }] });
+  });
+});
+
+it("inventories retained usage by transcript recency and logical agent after writes", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const storePath = state.path("shared.sqlite");
+    const database = openOpenClawAgentDatabase({
+      agentId: "main",
+      path: storePath,
+      env: state.env,
+    });
+    const append = (agentId: string, sessionId: string, sessionKey: string, updatedAt: number) => {
+      const scope = resolveSqliteTranscriptScope({
+        agentId,
+        sessionId,
+        sessionKey,
+        storePath,
+        env: state.env,
+      });
+      const clock = vi.spyOn(Date, "now").mockReturnValue(updatedAt);
+      try {
+        runOpenClawAgentWriteTransaction(
+          (owner) =>
+            appendTranscriptEventsInTransaction(
+              owner,
+              scope,
+              [{ type: "message", id: `${sessionId}-${updatedAt}`, message: { role: "user" } }],
+              { scheduleProjectionReconcile: false },
+            ),
+          { agentId: "main", path: database.path, env: state.env },
+        );
+      } finally {
+        clock.mockRestore();
+      }
+    };
+    append("main", "old", "agent:main:old", 1000);
+    append("main", "second", "agent:main:second", 2000);
+    append("main", "first", "agent:main:first", 2000);
+    append("main", "hidden", "agent:main:internal-session-effects:hidden", 3000);
+    append("other", "other", "agent:other:other", 3000);
+    runOpenClawAgentWriteTransaction(
+      (owner) => {
+        writeSessionEntry(owner, "agent:main:metadata-only", {
+          sessionId: "metadata-only",
+          updatedAt: 9000,
+        });
+      },
+      { agentId: "main", path: database.path, env: state.env },
+    );
+    const prepared = prepareUsageCostWorker({ agentId: "main", storePath, env: state.env });
+    await expect(runUsageCostWorker(prepared, { kind: "inventory" })).resolves.toMatchObject({
+      kind: "inventory",
+      files: [
+        { sessionId: "first", mtimeMs: 2000 },
+        { sessionId: "second", mtimeMs: 2000 },
+        { sessionId: "old", mtimeMs: 1000 },
+      ],
+    });
+    await expect(
+      runUsageCostWorker(prepared, { kind: "inventory", minMtimeMs: 2000 }),
+    ).resolves.toMatchObject({
+      kind: "inventory",
+      files: [
+        { sessionId: "first", mtimeMs: 2000 },
+        { sessionId: "second", mtimeMs: 2000 },
+      ],
+    });
+    append("main", "old", "agent:main:old", 4000);
+    await expect(
+      runUsageCostWorker(prepared, { kind: "inventory", minMtimeMs: 2000 }),
+    ).resolves.toMatchObject({
+      kind: "inventory",
+      files: [
+        { sessionId: "old", mtimeMs: 4000 },
+        { sessionId: "first", mtimeMs: 2000 },
+        { sessionId: "second", mtimeMs: 2000 },
+      ],
+    });
   });
 });
 
