@@ -402,13 +402,16 @@ describe("controlUi.githubPreview", () => {
       "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings.",
       false,
     ],
-    ...(["unverified", "rate_limited"] as const).map((reason) => [
-      "managed identity " + reason,
-      true,
-      new githubIdentity.GitHubIdentityError(reason),
-      new githubIdentity.GitHubIdentityError(reason).message,
-      false,
-    ] as const),
+    ...(["unverified", "rate_limited"] as const).map(
+      (reason) =>
+        [
+          "managed identity " + reason,
+          true,
+          new githubIdentity.GitHubIdentityError(reason),
+          new githubIdentity.GitHubIdentityError(reason).message,
+          false,
+        ] as const,
+    ),
     [
       "GitHub quota",
       false,
