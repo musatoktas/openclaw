@@ -21,6 +21,7 @@ import { openOpenClawAgentSqliteWorkerStoreV2 } from "../../state/openclaw-agent
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
 import { observeMainThreadSql } from "../../test-utils/main-thread-sql-spies.test-support.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
+import { sessionNativeProcessEntrypoints } from "./native-process-runtime.test-support.js";
 import {
   loadSessionEntry,
   loadTranscriptEvents,
@@ -39,12 +40,6 @@ import { memorySessionActorOwners } from "./session-actor-memory-owner.js";
 import type { SessionMetadataWorkerOperations } from "./session-manager-write-contract.js";
 import { withOwnedSessionTranscriptWrites } from "./transcript-write-context.js";
 import type { SessionEntry } from "./types.js";
-
-const crashEntrypoint = {
-  currentModuleUrl: import.meta.url,
-  sourceWorkerName: "session-compaction-crash.test-support",
-  distWorkerPath: "config/sessions/session-compaction-crash.test-support.js",
-};
 
 const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-compaction-boundary-");
 
@@ -231,7 +226,10 @@ it("recovers both transcript and accounting after a worker crash before compacti
   const worker = await openOpenClawAgentSqliteWorkerStoreV2<SessionMetadataWorkerOperations>(
     toDatabaseOptions(resolveSqliteTranscriptScope(scope)),
     { version: 2, assertCurrent() {} },
-    { moduleUrl: resolveRuntimeWorkerUrl(crashEntrypoint), input: undefined },
+    {
+      moduleUrl: resolveRuntimeWorkerUrl(sessionNativeProcessEntrypoints.compactionCrash),
+      input: undefined,
+    },
   );
   const { env: _env, ...target } = scope;
   const prepared = preparedBoundary(target, keptId, "interrupted-compaction");
