@@ -317,17 +317,24 @@ describe("conversation registry", () => {
     });
 
     const database = await reopenDatabase(scope);
-    database.db
+    const updatedAssociation = database.db
       .prepare(
         `UPDATE session_conversations SET last_seen_at = ?
          WHERE session_id = ? AND conversation_id = ? AND role = 'primary'`,
       )
       .run(afterCurrentWrite!.lastSeenAt, "ops-session", conversationRef);
+    expect(Number(updatedAssociation.changes)).toBe(1);
     await closeOpenClawAgentDatabasesAsync(tempDir);
     closeOpenClawAgentDatabasesForTest();
 
     expect(await read(conversationRef)).not.toMatchObject({ routeContextObserved: true });
-    expect((await primary(scope, "ops-session"))?.routeContext).toBeUndefined();
+    const unobserved = await primary(scope, "ops-session");
+    expect(unobserved).toMatchObject({
+      conversationRef,
+      sessionId: "ops-session",
+      role: "primary",
+    });
+    expect(unobserved?.routeContext).toBeUndefined();
     await upsertCanonicalSessionEntry(scope, {
       label: "after older writer",
       updatedAt: afterCurrentWrite!.lastSeenAt + 1,
