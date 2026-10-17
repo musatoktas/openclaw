@@ -1,6 +1,7 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import type { EngineConnection } from "../infra/sql-connection.js";
+import type { SqliteReadOnlyOperations } from "../infra/sqlite-readonly-operation-registry.js";
 import { runSqliteWorkerTransactionSync } from "../infra/sqlite-transaction.js";
 import { bindSqliteWorkerDatabase } from "../infra/sqlite-worker-binding.js";
 import type { SqliteWorkerBackend } from "../infra/sqlite-worker-contract.js";
@@ -22,11 +23,15 @@ import {
 import {
   PLUGIN_MODEL_CATALOG_CACHE_SCOPE,
   PLUGIN_MODEL_CATALOG_MIGRATION_SCOPE,
+  readPluginModelCatalogEntriesInDatabase,
   replacePluginModelCatalogEntriesInDatabase,
   type PluginModelCatalogReplacement,
 } from "./plugin-model-catalog.kernel.js";
 
-export type PluginModelCatalogCredentialOperations = {
+export type PluginModelCatalogCredentialOperations = Pick<
+  SqliteReadOnlyOperations,
+  "pluginCatalog.read"
+> & {
   "catalog.removeCredentials": { input: { credentials: string[] }; output: void };
   "catalog.pruneRemovedProviders": {
     input: { removedProviderBaseUrls: Record<string, string> };
@@ -151,6 +156,13 @@ export function bindSqliteWorkerBackend(
 ): SqliteWorkerBackend<PluginModelCatalogCredentialOperations> {
   return bindSqliteWorkerDatabase<PluginModelCatalogCredentialOperations>(context.database, {
     execute(command) {
+      if (command.type === "pluginCatalog.read") {
+        return readPluginModelCatalogEntriesInDatabase(
+          context.database,
+          PLUGIN_MODEL_CATALOG_CACHE_SCOPE,
+          command.input.pluginIds,
+        );
+      }
       return runSqliteWorkerTransactionSync(context, () => {
         if (command.type === "catalog.pruneRemovedProviders") {
           return pruneRemovedProviderCatalogEntriesInDatabase({

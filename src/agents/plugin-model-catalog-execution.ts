@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { resolvePathViaExistingAncestorSync } from "../infra/boundary-path.js";
+import { getDatabaseEngineInput } from "../infra/database-engine/context.js";
 import { withFileLock } from "../infra/file-lock.js";
 import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
@@ -14,6 +16,7 @@ import type { OpenClawAgentDatabaseOptions } from "../state/openclaw-agent-db-co
 import { registerOpenClawAgentDatabaseAsyncResource } from "../state/openclaw-agent-db-resources.js";
 import { captureOpenClawAgentDatabaseExecution } from "../state/openclaw-agent-execution.js";
 import {
+  executeOpenClawAgentWorkerPublication,
   openOpenClawAgentSqliteWorkerStore,
   type OpenClawAgentSqliteWorkerStore,
 } from "../state/openclaw-agent-worker-store.js";
@@ -149,16 +152,64 @@ export async function loadPersistedPluginModelCatalogs(
         }
       },
     });
-    reading = runSqliteReadOnlyOperation(
-      options.path,
-      { type: "pluginCatalog.read", input: { agentId: options.agentId, pluginIds } },
-      { source: "canonical", expectedIdentity: identity.key, env, signal: controller.signal },
-    );
+    reading = getDatabaseEngineInput("agent")
+      ? readNativePluginModelCatalogs(options, pluginIds, assertCurrent, controller.signal)
+      : runSqliteReadOnlyOperation(
+          options.path,
+          { type: "pluginCatalog.read", input: { agentId: options.agentId, pluginIds } },
+          { source: "canonical", expectedIdentity: identity.key, env, signal: controller.signal },
+        );
     const catalogs = await reading;
     assertCurrent();
     return catalogs;
   } finally {
     unregisterRoot?.();
     unregisterAgent();
+  }
+}
+
+/** PostgreSQL reads borrow the admitted agent connection without requesting a writer. */
+async function readNativePluginModelCatalogs(
+  options: { agentId: string; path: string; env: NodeJS.ProcessEnv },
+  pluginIds: readonly string[] | undefined,
+  assertCurrent: () => void,
+  signal: AbortSignal,
+): Promise<PersistedPluginModelCatalog[]> {
+  const execution = captureOpenClawAgentDatabaseExecution(options);
+  try {
+    const catalogs = await execution.runExisting(
+      {
+        assertCurrent,
+        createAdmission: (binding) => () => ({
+          nativeLocations: binding.nativeLocations,
+          admission: createSqliteWorkerOperationAdmission((request, grant) => {
+            binding.authorize(request);
+            assertCurrent();
+            if (!grant()) {
+              throw new Error("Plugin catalog read authority expired");
+            }
+          }, binding.attachment),
+        }),
+      },
+      (scope) =>
+        executeOpenClawAgentWorkerPublication<
+          PluginModelCatalogCredentialOperations,
+          "pluginCatalog.read"
+        >(
+          scope,
+          {
+            id: randomUUID(),
+            moduleUrl: resolveRuntimeWorkerUrl(
+              runtimeProcessEntrypoints.pluginModelCatalogCredentials,
+            ).href,
+            input: undefined,
+            command: { type: "pluginCatalog.read", input: { agentId: options.agentId, pluginIds } },
+          },
+          { signal },
+        ),
+    );
+    return catalogs ?? [];
+  } finally {
+    await execution.release();
   }
 }

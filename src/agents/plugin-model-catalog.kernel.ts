@@ -38,25 +38,34 @@ export function readPluginModelCatalogEntries(
   if (pluginIds?.length === 0) {
     return [];
   }
-  const allowed = pluginIds && new Set(pluginIds);
-  const result = withOpenClawAgentDatabaseReadOnly(({ db }) => {
-    let query = getNodeSqliteKysely<PluginModelCatalogDatabase>(db)
-      .selectFrom("cache_entries")
-      .select(["key", "value_json"])
-      .where("scope", "=", scope)
-      .orderBy("key");
-    if (pluginIds) {
-      query = query.where("key", "in", sqliteStringSet(pluginIds));
-    }
-    // SQLite binding normalizes lone surrogates; retain exact JS membership so
-    // such a selector cannot return a replacement-character catalog.
-    return executeSqliteQuerySync(db, query).rows.flatMap((row) =>
-      row.value_json === null || (allowed && !allowed.has(row.key))
-        ? []
-        : [{ pluginId: row.key, contents: row.value_json }],
-    );
-  }, options);
+  const result = withOpenClawAgentDatabaseReadOnly(
+    ({ db }) => readPluginModelCatalogEntriesInDatabase(db, scope, pluginIds),
+    options,
+  );
   return result.found ? result.value : [];
+}
+
+export function readPluginModelCatalogEntriesInDatabase(
+  db: EngineConnection,
+  scope: string,
+  pluginIds?: readonly string[],
+): PersistedPluginModelCatalog[] {
+  const allowed = pluginIds && new Set(pluginIds);
+  let query = getNodeSqliteKysely<PluginModelCatalogDatabase>(db)
+    .selectFrom("cache_entries")
+    .select(["key", "value_json"])
+    .where("scope", "=", scope)
+    .orderBy("key");
+  if (pluginIds) {
+    query = query.where("key", "in", sqliteStringSet(pluginIds));
+  }
+  // SQLite binding normalizes lone surrogates; retain exact JS membership so
+  // such a selector cannot return a replacement-character catalog.
+  return executeSqliteQuerySync(db, query).rows.flatMap((row) =>
+    row.value_json === null || (allowed && !allowed.has(row.key))
+      ? []
+      : [{ pluginId: row.key, contents: row.value_json }],
+  );
 }
 
 export const pluginModelCatalogReadOperations = createPluginModelCatalogReadOperations(
