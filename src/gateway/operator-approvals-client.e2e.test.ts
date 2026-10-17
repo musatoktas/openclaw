@@ -198,13 +198,31 @@ describe("operator approval gateway client e2e", () => {
     configureManualGatewayBackgroundEnv(tempHome);
 
     const requesterIdentity = loadOrCreateDeviceIdentity({
-      path: path.join(stateDir, "test-device-identities", "approval-requester.sqlite"),
+      path: path.join(
+        stateDir,
+        "test-device-identities",
+        "approval-requester",
+        "client",
+        "credentials.sqlite",
+      ),
     });
     const reviewerIdentity = loadOrCreateDeviceIdentity({
-      path: path.join(stateDir, "test-device-identities", "approval-reviewer.sqlite"),
+      path: path.join(
+        stateDir,
+        "test-device-identities",
+        "approval-reviewer",
+        "client",
+        "credentials.sqlite",
+      ),
     });
     const underscopedIdentity = loadOrCreateDeviceIdentity({
-      path: path.join(stateDir, "test-device-identities", "approval-underscoped.sqlite"),
+      path: path.join(
+        stateDir,
+        "test-device-identities",
+        "approval-underscoped",
+        "client",
+        "credentials.sqlite",
+      ),
     });
     expect(requesterIdentity.deviceId).not.toBe(reviewerIdentity.deviceId);
 

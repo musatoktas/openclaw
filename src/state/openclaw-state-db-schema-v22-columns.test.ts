@@ -27,6 +27,10 @@ import {
 } from "./openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
+import {
+  addPreCutoverClientCredentialTablesForTest,
+  withStateMigrationBackupForTest,
+} from "./openclaw-state-schema.test-support.js";
 import { assertSqliteMigrationScopePreserved } from "./sqlite-migration-scope.test-support.js";
 
 function siblingStatistics(database: DatabaseSync) {
@@ -180,6 +184,7 @@ describe("v21 upgrade preserves portable cursor and resume identities", () => {
     template = path.join(directories.make("v21-portable-template-"), "openclaw.sqlite");
     using db = new DatabaseSync(template);
     db.exec(withLegacyStateHeadLayout(OPENCLAW_STATE_SCHEMA_SQL));
+    addPreCutoverClientCredentialTablesForTest(db);
     // Reconstruct exactly the columns and indexes changed by v22; all other contracts stay current.
     for (const table of STATE_CURSOR_TABLES_V22) {
       const index =
@@ -280,7 +285,7 @@ describe("v21 upgrade preserves portable cursor and resume identities", () => {
   });
 
   it.each(["runtime", "doctor"] as const)(
-    "preserves old cursors and resume results through %s admission",
+    "preserves old cursors and resume results through %s admission with backup custody",
     async (owner) => {
       const stateDir = directories.make(`v21-portable-${owner}-`);
       const pathname = resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: stateDir });
@@ -289,7 +294,7 @@ describe("v21 upgrade preserves portable cursor and resume identities", () => {
       const options = { env: { OPENCLAW_STATE_DIR: stateDir }, path: pathname };
       using scope = new DatabaseSync(pathname, { readOnly: true });
       const statistics = siblingStatistics(scope);
-      const { db } = await assertSqliteMigrationScopePreserved(
+      await assertSqliteMigrationScopePreserved(
         scope,
         [
           "schema_meta",
@@ -298,15 +303,21 @@ describe("v21 upgrade preserves portable cursor and resume identities", () => {
           "sqlite_stat4",
           "acp_sessions",
           "session_state_heads",
+          "device_identities",
+          "device_auth_tokens",
+          "gateway_origin_device_tokens",
+          "exec_approvals_config",
           ...STATE_CURSOR_TABLES_V22,
         ],
-        () => {
-          if (owner === "doctor") {
-            expect(repairOpenClawStateDatabaseSchema(options).warnings).toEqual([]);
-          }
-          return openOpenClawStateDatabase(options);
-        },
+        () =>
+          withStateMigrationBackupForTest(options, () => {
+            if (owner === "doctor") {
+              expect(repairOpenClawStateDatabaseSchema(options).warnings).toEqual([]);
+            }
+            openOpenClawStateDatabase(options);
+          }),
       );
+      const { db } = openOpenClawStateDatabase(options);
       expect(siblingStatistics(scope)).toEqual(statistics);
       expect(db.prepare("PRAGMA user_version").get()).toEqual({
         user_version: OPENCLAW_STATE_SCHEMA_VERSION,
@@ -374,7 +385,9 @@ describe("v21 upgrade preserves portable cursor and resume identities", () => {
         approvals = source.prepare(approvalRowsSql).all();
       }
       const options = { env: { OPENCLAW_STATE_DIR: stateDir }, path: pathname };
-      expect(repairOpenClawStateDatabaseSchema(options).warnings).toEqual([]);
+      await withStateMigrationBackupForTest(options, () => {
+        expect(repairOpenClawStateDatabaseSchema(options).warnings).toEqual([]);
+      });
       const { db } = openOpenClawStateDatabase(options);
       expect(db.prepare("PRAGMA user_version").get()).toEqual({
         user_version: OPENCLAW_STATE_SCHEMA_VERSION,

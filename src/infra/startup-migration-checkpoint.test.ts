@@ -7,11 +7,15 @@ import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db-contra
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import {
   closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
   withOpenClawStateStartupMigrationCheckpointDatabase,
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { claimOpenClawStateOwnership } from "../state/openclaw-state-ownership-operations.js";
+import { withStateMigrationBackupForTest } from "../state/openclaw-state-schema.test-support.js";
+import { runClientCredentialOperation } from "./client-credential-store.js";
+import { generateStoredDeviceIdentity } from "./device-identity-material.js";
 import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
@@ -96,7 +100,7 @@ describe("startup migration lease", () => {
   });
 
   it.each([false, true])(
-    "adopts native version-zero state before lease acquisition (existing lease tables: %s)",
+    "adopts captured native version-zero state before lease acquisition (existing lease tables: %s)",
     async (hasExistingLeaseTables) => {
       const env = {
         OPENCLAW_STATE_DIR: startupMigrationTempDirs.make("openclaw-startup-migration-native-"),
@@ -105,12 +109,19 @@ describe("startup migration lease", () => {
       mkdirSync(path.dirname(databasePath), { recursive: true });
       const { DatabaseSync } = requireNodeSqlite();
       const native = new DatabaseSync(databasePath);
+      const identity = generateStoredDeviceIdentity(1);
       try {
         seedNativeVersionZeroState(native, hasExistingLeaseTables);
+        native
+          .prepare(
+            "UPDATE device_identities SET device_id=?, public_key_pem=?, private_key_pem=? WHERE identity_key='node'",
+          )
+          .run(identity.deviceId, identity.publicKeyPem, identity.privateKeyPem);
       } finally {
         native.close();
       }
 
+      await withStateMigrationBackupForTest({ env }, () => openOpenClawStateDatabase({ env }));
       const lease = await acquireStartupMigrationLeaseWithWait({
         env,
         owner: "native-bootstrap",
@@ -129,9 +140,22 @@ describe("startup migration lease", () => {
           ).toEqual({ schema_version: OPENCLAW_STATE_SCHEMA_VERSION });
           expect(
             initialized
-              .prepare("SELECT device_id FROM device_identities WHERE identity_key = 'node'")
+              .prepare("SELECT name FROM sqlite_schema WHERE name='device_identities'")
               .get(),
-          ).toEqual({ device_id: "native-device" });
+          ).toBeUndefined();
+          expect(
+            runClientCredentialOperation(env, { kind: "identity.read", identity_key: "node" }),
+          ).toEqual({
+            kind: "identity",
+            identity: {
+              identity_key: "node",
+              device_id: identity.deviceId,
+              public_key_pem: identity.publicKeyPem,
+              private_key_pem: identity.privateKeyPem,
+              created_at_ms: 1,
+              updated_at_ms: 1,
+            },
+          });
           expect(
             initialized
               .prepare("SELECT config_key FROM exec_approvals_config WHERE config_key = 'current'")

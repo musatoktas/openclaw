@@ -6,6 +6,7 @@ import {
   retireProviderReviewAcknowledgment,
   type ProviderReviewAcknowledgment,
 } from "../../sessions/provider-review.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { projectSessionProviderReview } from "../session-provider-review-projection.js";
 import { normalizeChatSendRequest } from "./chat-send-request.js";
@@ -135,40 +136,42 @@ afterEach(() => {
 
 describe("registered provider review continuation", () => {
   it("hands the reviewed literal input and host capability to ordinary chat admission", async () => {
-    const options = request();
-    await coreGatewayHandlers["sessions.providerReview.continue"]!(options);
-    expect(mocks.handoff).toHaveBeenCalledTimes(1);
-    expect(mocks.releaseAuthorization).toHaveBeenCalledTimes(1);
-    const [chatOptions, acknowledgment] = mocks.handoff.mock.calls[0] as [
-      GatewayRequestHandlerOptions,
-      ProviderReviewAcknowledgment,
-    ];
-    expect(chatOptions.params).toEqual({
-      sessionKey,
-      agentId: "main",
-      sessionId,
-      message,
-      idempotencyKey: "next-run",
-      deliver: false,
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const options = request();
+      await coreGatewayHandlers["sessions.providerReview.continue"]!(options);
+      expect(mocks.handoff).toHaveBeenCalledTimes(1);
+      expect(mocks.releaseAuthorization).toHaveBeenCalledTimes(1);
+      const [chatOptions, acknowledgment] = mocks.handoff.mock.calls[0] as [
+        GatewayRequestHandlerOptions,
+        ProviderReviewAcknowledgment,
+      ];
+      expect(chatOptions.params).toEqual({
+        sessionKey,
+        agentId: "main",
+        sessionId,
+        message,
+        idempotencyKey: "next-run",
+        deliver: false,
+      });
+      expect(readProviderReviewAcknowledgment(acknowledgment).review.id).toBe("review-a");
+      await loadOrCreateProcessDeviceIdentityAsync();
+      const normalized = await normalizeChatSendRequest({
+        params: chatOptions.params,
+        client: chatOptions.client,
+        providerReviewAcknowledgment: acknowledgment,
+      });
+      expect(normalized).toMatchObject({
+        ok: true,
+        value: {
+          inboundMessage: message,
+          rawMessage: message,
+          suppressCommandInterpretation: true,
+          stopCommand: false,
+          turnKind: "main",
+        },
+      });
+      expect(entry.providerReview?.id).toBe("review-a");
     });
-    expect(readProviderReviewAcknowledgment(acknowledgment).review.id).toBe("review-a");
-    await loadOrCreateProcessDeviceIdentityAsync();
-    const normalized = await normalizeChatSendRequest({
-      params: chatOptions.params,
-      client: chatOptions.client,
-      providerReviewAcknowledgment: acknowledgment,
-    });
-    expect(normalized).toMatchObject({
-      ok: true,
-      value: {
-        inboundMessage: message,
-        rawMessage: message,
-        suppressCommandInterpretation: true,
-        stopCommand: false,
-        turnKind: "main",
-      },
-    });
-    expect(entry.providerReview?.id).toBe("review-a");
   });
 
   it.each(["review", "generation", "authority"])(

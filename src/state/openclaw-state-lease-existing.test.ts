@@ -22,6 +22,10 @@ import {
   openOpenClawStateDatabase,
 } from "./openclaw-state-db.js";
 import { withOpenClawStateLease, type OpenClawStateLeaseContext } from "./openclaw-state-lease.js";
+import {
+  addPreCutoverClientCredentialTablesForTest,
+  withStateMigrationBackupForTest,
+} from "./openclaw-state-schema.test-support.js";
 
 const dirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(async () => {
@@ -38,6 +42,7 @@ function source(holdAgent = false, provenance = true) {
   closeOpenClawStateDatabaseForTest();
   const db = openNodeSqliteDatabase(pathname);
   try {
+    addPreCutoverClientCredentialTablesForTest(db);
     db.exec(`PRAGMA foreign_keys=OFF;
       PRAGMA user_version=15;
       UPDATE schema_meta SET schema_version=15 WHERE meta_key='primary';`);
@@ -160,12 +165,15 @@ it("does not create missing existing-only lease state", async () => {
   ).rejects.toThrow();
   expect(fs.existsSync(pathname)).toBe(false);
 });
-it("keeps the maintenance lease live across an explicitly owned migration", async () => {
+it("keeps the maintenance lease live across a captured, explicitly owned migration", async () => {
   const f = source();
   const beforeMigration = await withOpenClawStateLease(f.lease, async (lease) => {
     const version = inspect(f.pathname).version;
     lease.assertOwned();
-    openOpenClawStateDatabase(f.options);
+    await withStateMigrationBackupForTest(f.options, () => {
+      openOpenClawStateDatabase(f.options);
+      lease.assertOwned();
+    });
     lease.assertOwned();
     return version;
   });

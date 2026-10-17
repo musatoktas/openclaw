@@ -18,6 +18,10 @@ import {
 } from "./openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
+import {
+  addPreCutoverClientCredentialTablesForTest,
+  withStateMigrationBackupForTest,
+} from "./openclaw-state-schema.test-support.js";
 
 const directories = useAutoCleanupTempDirTracker((cleanup) => {
   afterEach(async () => {
@@ -78,6 +82,7 @@ function legacyTaskDatabase(previousVersion: 22 | 23, refusePublication = false)
   mkdirSync(path.dirname(pathname), { recursive: true });
   using db = new DatabaseSync(pathname);
   db.exec(OPENCLAW_STATE_SCHEMA_SQL);
+  addPreCutoverClientCredentialTablesForTest(db);
   for (const [name] of replacementIndexes) {
     db.exec(`DROP INDEX IF EXISTS ${name}`);
   }
@@ -127,12 +132,16 @@ it.each([
   { owner: "runtime", previousVersion: 23 },
   { owner: "doctor", previousVersion: 23 },
 ] as const)(
-  "migrates v$previousVersion task indexes through $owner without losing retained tasks or subsequent cron writes",
+  "migrates v$previousVersion task indexes through $owner with backup custody without losing retained tasks or subsequent cron writes",
   async ({ owner, previousVersion }) => {
     const { options, retained } = legacyTaskDatabase(previousVersion);
-    if (owner === "doctor") {
-      expect(repairOpenClawStateDatabaseSchema(options).warnings).toEqual([]);
-    }
+    await withStateMigrationBackupForTest(options, () => {
+      if (owner === "doctor") {
+        expect(repairOpenClawStateDatabaseSchema(options).warnings).toEqual([]);
+      } else {
+        openOpenClawStateDatabase(options);
+      }
+    });
     const { db } = openOpenClawStateDatabase(options);
     expect(db.prepare("PRAGMA user_version").get()).toEqual({
       user_version: OPENCLAW_STATE_SCHEMA_VERSION,
@@ -198,7 +207,9 @@ it.each([
 
 it("rolls back task index replacement when schema publication fails", async () => {
   const { options, pathname, retained } = legacyTaskDatabase(23, true);
-  expect(() => openOpenClawStateDatabase(options)).toThrow("fixture publication refusal");
+  await withStateMigrationBackupForTest(options, () => {
+    expect(() => openOpenClawStateDatabase(options)).toThrow("fixture publication refusal");
+  });
   await closeOpenClawStateDatabaseAsync();
   using db = new DatabaseSync(pathname, { readOnly: true });
   expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 23 });
