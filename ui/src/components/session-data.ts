@@ -186,6 +186,10 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
     this.inputs.sessionCatalogIdsWithoutVisibleRows();
 
   readonly requestSessionDataUpdate = () => {
+    const roster = this.roster?.snapshot;
+    if (roster) {
+      publishSidebarSessionList(this, { ...roster, agentId: null });
+    }
     if (!this.active || !this.inputs.navigationVisible || this.renderFrame !== undefined) {
       return;
     }
@@ -242,6 +246,8 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
       this.stopRoster?.();
       this.roster = roster;
       this.stopRoster = roster?.subscribe(this.requestSessionDataUpdate);
+      this.updateSessions(this.context.sessions);
+      this.requestSessionDataUpdate();
       void this.scheduleSidebarSessions();
     }
     this.lineage.synchronize();
@@ -449,7 +455,7 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
       this.lineage.reset(true);
       this.requestSessionDataUpdate();
     }
-    if (hasSidebarListFilter(this.inputs)) {
+    if (this.roster || hasSidebarListFilter(this.inputs)) {
       return;
     }
     const presentation = sessions.presentation;
@@ -457,7 +463,6 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
       this.clearSessionCache();
     }
     publishSidebarSessionList(this, { ...snapshot, ...presentation });
-    this.sessionsLoading = snapshot.loading;
     this.requestSessionDataUpdate();
   };
 

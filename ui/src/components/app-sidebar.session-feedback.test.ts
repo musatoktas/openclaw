@@ -10,6 +10,7 @@ import {
   createTestSessionCapability,
   sessionsResult,
 } from "../lib/sessions/session-capability.test-support.ts";
+import { sessionMenu } from "../test-helpers/app-sidebar-cases/multi-select-support.ts";
 import {
   mountRoster,
   selectFilter,
@@ -22,11 +23,13 @@ import {
   createSessionsHarness,
   mountSidebar,
 } from "../test-helpers/app-sidebar.ts";
+import { registerSessionPluginAction } from "../test-helpers/control-ui-plugin-action.ts";
 import {
   createGatewayRequestMock,
   createTestGatewayClient,
 } from "../test-helpers/gateway-client.ts";
 import { settleLitElement } from "../test-helpers/lit-settle.ts";
+import { menuItemLabels, openSubmenu } from "../test-helpers/session-menu.ts";
 import "../test-helpers/app-sidebar-suite.ts";
 import {
   SIDEBAR_SESSION_PAGE_SIZE,
@@ -74,6 +77,8 @@ describe("sidebar session feedback", () => {
     "uses only the roster membership read in roster mode (involvingMe=%s)",
     async (involvingMe) => {
       const viewer = "profile-ada";
+      const groups = ["Planning", "Research"];
+      const sectionOrder = ["category:Research", "category:Planning"];
       const rows: GatewaySessionRow[] = (
         [
           ["mine", "My project", viewer],
@@ -118,7 +123,7 @@ describe("sidebar session feedback", () => {
           return { subscribed: true };
         }
         if (method === "sessions.groups.list") {
-          return { names: [], groups: [], sectionOrder: [] };
+          return { groups: groups.map((name, position) => ({ name, position })), sectionOrder };
         }
         if (method === "sessions.describe") {
           return { session: rows.find((row) => row.key === params?.key) ?? null };
@@ -126,7 +131,18 @@ describe("sidebar session feedback", () => {
         return {};
       });
       const gateway = createGatewayHarness(createTestGatewayClient(request));
-      gateway.publish({ selfUser: { id: viewer, name: "Ada" } });
+      gateway.publish({
+        selfUser: { id: viewer, name: "Ada" },
+        hello: {
+          ...gateway.gateway.snapshot.hello!,
+          features: {
+            methods: [
+              ...gateway.gateway.snapshot.hello!.features!.methods!,
+              "sessions.groups.list",
+            ],
+          },
+        },
+      });
       patchSettings({
         gatewayUrl: gateway.gateway.connection.gatewayUrl,
         sidebarAgentsMode: "roster",
@@ -147,6 +163,13 @@ describe("sidebar session feedback", () => {
           agents: [{ id: "main", name: "Harbor" }],
         },
       );
+      const plugin = registerSessionPluginAction(context, {
+        id: "review",
+        label: "Review session",
+        placement: "session",
+        resolve: ({ session }) => ({ label: `Review ${session?.label}` }),
+        run: async () => {},
+      });
       const filteredSidebarReads = () =>
         request.mock.calls.flatMap(([method, raw]) => {
           const params = raw as Record<string, unknown> | undefined;
@@ -171,6 +194,19 @@ describe("sidebar session feedback", () => {
         await settleLitElement(sidebar);
         await vi.waitFor(expectRoster);
         expect.soft(filteredSidebarReads()).toEqual([]);
+        await vi.waitFor(() => expect(sessions.state.groups).toEqual(groups));
+        expect.soft(sidebar.knownSessionGroups()).toEqual(groups);
+        expect.soft(sidebar.knownSectionOrder()).toEqual(sectionOrder);
+
+        const menuSession = sidebar.findSidebarMenuSessionByKey("agent:main:mine");
+        expect(menuSession).toBeDefined();
+        sidebar.sidebarMenus.openSessionMenu(menuSession!, 0, 0);
+        await settleLitElement(sidebar);
+        const menu = await sessionMenu(sidebar);
+        expect.soft(menuItemLabels(menu)).toContain("Review My project");
+        const groupMenu = await openSubmenu(menu, "Move to group");
+        expect.soft(menuItemLabels(groupMenu)).toEqual(expect.arrayContaining(groups));
+        sidebar.sidebarMenus.closeSessionMenu();
 
         sidebar.sidebarAgentsMode = "chip";
         await settleLitElement(sidebar);
@@ -196,7 +232,15 @@ describe("sidebar session feedback", () => {
         await settleLitElement(sidebar);
         expect(sidebar.querySelector(".sidebar-agent-roster__link")).toBeNull();
         expectRoster();
+
+        sidebar.setSessionOwnerFilter(null);
+        sidebar.sidebarAgentsMode = "chip";
+        await settleLitElement(sidebar);
+        await vi.waitFor(() => expect(sessionKeys(sidebar)).toEqual(rows.map((row) => row.key)));
+        expect(sidebar.knownSessionGroups()).toEqual(groups);
+        expect(sidebar.knownSectionOrder()).toEqual(sectionOrder);
       } finally {
+        plugin.lifetime.abort();
         provider.remove();
         context.connectionBootstrap.reset();
         sessions.dispose();
