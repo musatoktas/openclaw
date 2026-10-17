@@ -1,4 +1,4 @@
-import { createEffect, createMemo, For, onSettled, Show, untrack } from "solid-js";
+import { createEffect, createMemo, For, onCleanup, onSettled, Show, untrack } from "solid-js";
 import { isSessionRouteId, pathForAgentPanel } from "../app-route-paths.ts";
 import { togglePinnedAgent } from "../app/bootstrap-navigation-preferences.ts";
 import { registerAgentsHomeEnglish } from "../i18n/locales/en-agents-home.ts";
@@ -103,6 +103,21 @@ function useRoster(props: RosterProps) {
 
 export function SidebarAgentRoster(props: RosterProps) {
   const roster = useRoster(props);
+  const agentLinks = new Map<string, HTMLAnchorElement>();
+  const createAgentLinkRef = (card: () => { id: string }) => {
+    // The keyed row keeps this identity until its branch is removed.
+    const id = untrack(() => card().id);
+    let link: HTMLAnchorElement | undefined;
+    onCleanup(() => {
+      if (agentLinks.get(id) === link) {
+        agentLinks.delete(id);
+      }
+    });
+    return (element: HTMLAnchorElement) => {
+      link = element;
+      agentLinks.set(id, element);
+    };
+  };
   const presented = () => props.active;
   const parkedSections = createParkedProjection(() => props.sections, presented);
   const navigation = createMemo(() =>
@@ -141,7 +156,7 @@ export function SidebarAgentRoster(props: RosterProps) {
     return () => {
       if (host.readRosterCollapsedAgentIds === readCollapsed) {
         host.readRosterCollapsedAgentIds = null;
-        host.requestUpdate();
+        host.publishPresentation();
       }
     };
   });
@@ -202,10 +217,7 @@ export function SidebarAgentRoster(props: RosterProps) {
             const id = card().id;
             togglePinnedAgent(roster.context().navigation, id);
             // Pinning replaces the menu trigger; keep keyboard focus on its agent.
-            onSettled(() => {
-              const selector = `[data-agent-id="${CSS.escape(id)}"]`;
-              roster.host().querySelector<HTMLElement>(selector)?.focus();
-            });
+            onSettled(() => agentLinks.get(id)?.focus());
             break;
           }
           case "sessions":
@@ -273,22 +285,26 @@ export function SidebarAgentRoster(props: RosterProps) {
             <>
               <section class="sidebar-pinned-agents" aria-label={t("agentsHome.pinnedAgents")}>
                 <For each={pinnedCards()} keyed={(card) => card.id}>
-                  {(card) => (
-                    <SidebarPinnedAgent
-                      agent={card()}
-                      href={card().target.href}
-                      loading={roster.snapshot().loading}
-                      active={
-                        isSessionRouteId(roster.host().activeRouteId) &&
-                        areUiSessionKeysEquivalent(
-                          roster.host().getRouteSessionKey(),
-                          card().mainKey,
-                        )
-                      }
-                      onOpen={() => roster.host().openMainSession(card().id)}
-                      menu={agentMenu(card)}
-                    />
-                  )}
+                  {(card) => {
+                    const linkRef = createAgentLinkRef(card);
+                    return (
+                      <SidebarPinnedAgent
+                        linkRef={linkRef}
+                        agent={card()}
+                        href={card().target.href}
+                        loading={roster.snapshot().loading}
+                        active={
+                          isSessionRouteId(roster.host().activeRouteId) &&
+                          areUiSessionKeysEquivalent(
+                            roster.host().getRouteSessionKey(),
+                            card().mainKey,
+                          )
+                        }
+                        onOpen={() => roster.host().openMainSession(card().id)}
+                        menu={agentMenu(card)}
+                      />
+                    );
+                  }}
                 </For>
               </section>
               <For each={pinnedCards()} keyed={(card) => card.id}>
@@ -303,6 +319,7 @@ export function SidebarAgentRoster(props: RosterProps) {
           </Show>
           <For each={unpinnedCards()} keyed={(card) => card.id}>
             {(card) => {
+              const linkRef = createAgentLinkRef(card);
               const mainKey = () => roster.host().selectedAgentMainSessionKey(card().id);
               const sections = () =>
                 parkedSections().filter((section) => section.id.startsWith(`agent:${card().id}:`));
@@ -340,6 +357,7 @@ export function SidebarAgentRoster(props: RosterProps) {
                     ]}
                   >
                     <a
+                      ref={linkRef}
                       class="sidebar-agent-roster__row"
                       data-agent-id={card().id}
                       href={card().target.href}

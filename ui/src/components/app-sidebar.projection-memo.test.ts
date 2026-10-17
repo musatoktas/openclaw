@@ -219,7 +219,7 @@ describe("sidebar projection memo", () => {
     const cached = sidebarBootSnapshot(captureBootRoster(sessions.sessions.state));
     expect(cached.roster?.agentId).toBe(owner.expandedAgentId());
     owner.restoreSidebarSnapshot({ ...cached, mode: "chip" });
-    owner.requestUpdate();
+    owner.publishPresentation();
     await settleLitElement(sidebar);
     expect(owner.sidebarSnapshot).toBeNull();
 
@@ -269,7 +269,7 @@ describe("sidebar projection memo", () => {
       const navigation = sidebar.getSessionNavigationState();
       expect(result?.sessions.some((value) => value.key === created.key)).toBe(true);
       creation.admitted = true;
-      sidebar.requestUpdate();
+      sidebar.publishPresentation();
       await settleLitElement(sidebar);
       expect(sidebar.sessionData.sessionsResult).toBe(result);
       expect(sidebar.getSessionNavigationState()).not.toBe(navigation);
@@ -304,17 +304,17 @@ describe("sidebar projection memo", () => {
     projectRows.mockClear();
     for (const change of [
       () => {
-        sidebar.requestUpdate();
+        sidebar.publishPresentation();
       },
       () => {
         sidebar.devGitBranch = "feature/sidebar";
       },
       () => {
-        sidebar.requestUpdate();
+        sidebar.publishPresentation();
       },
       () => {
         sidebar.sidebarMenus.closePositionedMenu("sessionSort");
-        sidebar.requestUpdate();
+        sidebar.publishPresentation();
       },
     ]) {
       change();
@@ -420,17 +420,17 @@ describe("sidebar projection memo", () => {
         sidebar.sessionData.sessionCatalogs = catalogPage([
           { threadId: "adopted-thread", sessionKey: target.key, name: "Adopted catalog thread" },
         ]).catalogs;
-        sidebar.requestUpdate();
+        sidebar.publishPresentation();
         await settleLitElement(sidebar);
         expect(row(target.key)?.hasAttribute("data-catalog-session-key")).toBe(true);
         sidebar.sessionData.sessionResultsByAgent = {
           work: { ...cachedResult, sessions: [snoozed] },
         };
-        sidebar.requestUpdate();
+        sidebar.publishPresentation();
       }
       await settleLitElement(sidebar);
       expect(row(target.key) !== null).toBe(statusFilter === "snoozed");
-      sidebar.requestUpdate();
+      sidebar.publishPresentation();
       await settleLitElement(sidebar);
       await vi.advanceTimersByTimeAsync(999);
       await settleLitElement(sidebar);

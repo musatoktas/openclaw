@@ -153,9 +153,9 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
   private readonly homeMemos = new Map<string, SidebarProjectionMemo<SidebarHomeSession>>();
   readonly sessionOwnerFilter = new SessionOwnerFilter(
     () => this.context?.gateway,
-    () => this.requestUpdate(),
+    () => this.publishPresentation(),
   );
-  readonly sessionData = new SessionDataOwner(this, () => this.requestUpdate());
+  readonly sessionData = new SessionDataOwner(this, () => this.publishPresentation());
 
   samePresence(previous: PresencePayload | undefined, next: PresencePayload | undefined): boolean {
     return this.sessionProjection.samePresence(previous, next, sidebarPresenceScope(this));
@@ -214,7 +214,7 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   setSessionSortMode(mode: SidebarSessionSortMode) {
     this.sessionSortMode = storeSidebarSessionSortMode(mode, this.sessionPeopleSortCapability());
-    this.requestUpdate();
+    this.publishPresentation();
   }
 
   sidebarSessionOwnerFilter() {
@@ -239,7 +239,7 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   private readonly sessionSelection = createSidebarSessionSelection(
     () => this.visibleSessionRowsInOrder(),
-    () => this.requestUpdate(),
+    () => this.publishPresentation(),
   );
   get selectedSessionKeys(): ReadonlySet<string> {
     return this.sessionSelection.selectedKeys;
@@ -257,7 +257,7 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   setSessionsEmptyGroupsMode(mode: SidebarEmptyGroupsMode): void {
     this.emptyGroups.set(mode);
-    this.requestUpdate();
+    this.publishPresentation();
   }
   sessionsStatusFilter: SidebarSessionStatusFilter = loadStoredSidebarSessionStatusFilter();
   hiddenSessionCatalogIds: ReadonlySet<string> = loadStoredHiddenSessionCatalogIds();
@@ -305,28 +305,25 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   promoteCreatedSession(sessionKey: string) {
     if (this.sessionProjection.promoteCreatedSession(sessionKey)) {
-      this.requestUpdate();
+      this.publishPresentation();
     }
   }
 
-  protected override willUpdate() {
+  synchronizeNavigationPreferences(): void {
     if (this.emptyGroups.reconcile() && this.sidebarMenus.sessionSortMenuPosition) {
       // Menu state writes belong after the preparation memo commits.
       void this.updateComplete.then(
         (committed) => committed && this.sidebarMenus.closePositionedMenu("sessionSort"),
       );
     }
-    super.willUpdate();
   }
 
-  override disconnectedCallback() {
+  resetNavigationPresentation(): void {
     this.sessionProjection.invalidate();
     this.homeMemos.clear();
-    super.disconnectedCallback();
   }
 
-  override updated() {
-    super.updated();
+  commitNavigationPreferences(): void {
     if (this.sessionSortMode === "people" && this.sessionPeopleSortCapability() === false) {
       this.setSessionSortMode("created");
     }
@@ -756,12 +753,12 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
         this.sessionData.discardEmptyChildSessionSnapshot(key);
       }
     }
-    this.requestUpdate();
+    this.publishPresentation();
   }
 
   showMoreChildren(sessionKey: string) {
     this.sessionProjection.children.showMore(sessionKey);
-    this.requestUpdate();
+    this.publishPresentation();
   }
 
   agentUnreadCount(agentId: string): number {

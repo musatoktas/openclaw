@@ -15,12 +15,14 @@ export function SidebarPinnedAgent(props: {
   active: boolean;
   loading: boolean;
   onOpen: () => void;
+  linkRef: (element: HTMLAnchorElement) => void;
   menu: JSX.Element;
 }) {
   return (
     <div class="sidebar-pinned-agent session-row-host" data-pinned-agent={props.agent.id}>
       <openclaw-tooltip class="sidebar-pinned-agent__tooltip" prop:placement="right-start">
         <a
+          ref={props.linkRef}
           class="sidebar-pinned-agent__link"
           data-agent-id={props.agent.id}
           href={props.href}

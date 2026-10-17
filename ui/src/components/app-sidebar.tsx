@@ -101,7 +101,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
         context.plugins.subscribe(current.sessionData.requestSessionDataUpdate),
         listen(window, SIDEBAR_HIDDEN_SESSION_CATALOGS_CHANGED_EVENT, () => {
           current.hiddenSessionCatalogIds = loadStoredHiddenSessionCatalogIds();
-          current.requestUpdate();
+          current.publishPresentation();
         }),
         listen(window, "openclaw:native-gateways-changed", () => {
           if (current.isConnected) {
@@ -251,6 +251,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
       owner.readNarration();
       scroll.capture();
     },
+    // These imperative commit hooks sample current host state without adding render dependencies.
     () =>
       untrack(() => {
         owner.sessionData.refreshPresentation();
@@ -267,7 +268,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
           const timer = globalThis.setTimeout(
             () => {
               owner.sessionProjection.invalidate();
-              owner.requestUpdate();
+              owner.publishPresentation();
             },
             Math.max(0, deadline - Date.now()),
           );
@@ -283,7 +284,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
       owner.sessionData.connect();
     }
     let frame = requestAnimationFrame(() => {
-      frame = requestAnimationFrame(() => owner.classList.add("sidebar-r"));
+      frame = requestAnimationFrame(() => host.classList.add("sidebar-r"));
     });
     return () => {
       cancelAnimationFrame(frame);

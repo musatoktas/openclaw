@@ -77,7 +77,7 @@ function pluginNavigation(
       subscribe: () => () => {},
     },
   });
-  sidebar.requestUpdate();
+  sidebar.publishPresentation();
   return openPage;
 }
 

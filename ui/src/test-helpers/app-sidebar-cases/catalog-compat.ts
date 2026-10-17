@@ -45,7 +45,7 @@ describe("AppSidebar session catalog pagination", () => {
       };
       selection.selectedId = "research";
       selection.scopeId = "research";
-      sidebar.requestUpdate();
+      sidebar.publishPresentation();
       await sidebar.updateComplete;
       await vi.advanceTimersByTimeAsync(50);
 
