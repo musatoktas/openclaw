@@ -269,7 +269,7 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
         assert(isPostgresSqlConnection(db));
         db.runTransaction(() => {
           db.exec(`INSERT INTO schema_meta VALUES ('primary', 'agent', 27, 'migration', NULL, 1, 1);
-            INSERT INTO session_key_contract VALUES (1, 'main', 0);
+            INSERT INTO session_key_contract (id, main_key, updated_at) VALUES (1, 'main', 0);
             INSERT INTO memory_index_state VALUES (1, 0);`);
           db.prepare(`INSERT INTO session_nodes
             (session_key, current_session_id, entry_json, entry_valid, updated_at)

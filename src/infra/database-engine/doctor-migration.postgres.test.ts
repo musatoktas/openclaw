@@ -603,7 +603,16 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
       };
       const targetNamespace = withEngineStoreAdmission(() => {
         using anchor = openNodeSqliteDatabase(":memory:");
-        const engine = openAgentEngineStore(anchor, "main", `${agentPath}.target`);
+        const engine = openEngineStore({
+          anchor,
+          schema: candidate,
+          input: { connection: connection!, schemaPrefix: "doctor_fixture" },
+          inspectSqlite: () => ({ hasExistingData: false, hasEngineAnchor: false }),
+          prepareAnchor() {},
+          openSqlite() {
+            throw new Error("Expected PostgreSQL");
+          },
+        });
         try {
           return getPostgresPhysicalFacts(engine)!.namespace;
         } finally {
@@ -638,7 +647,8 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
       await client.query(`
         INSERT INTO "${agentNamespace}".schema_meta
           VALUES ('primary', 'agent', 27, 'main', NULL, 1, 1);
-        INSERT INTO "${agentNamespace}".session_key_contract VALUES (1, 'main', 0);
+        INSERT INTO "${agentNamespace}".session_key_contract (id, main_key, updated_at)
+          VALUES (1, 'main', 0);
         INSERT INTO "${agentNamespace}".memory_index_state VALUES (1, 0);
         INSERT INTO "${agentNamespace}".session_nodes
           (session_key, current_session_id, entry_json, updated_at)
