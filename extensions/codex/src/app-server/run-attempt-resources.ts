@@ -237,6 +237,9 @@ export function prepareCodexAttemptResources(prompt: CodexAttemptPrompt) {
       await unregisterNativeSubagentMonitor();
       bindingRead = await bindingStore.prepareRead(bindingIdentity);
       connection.assertCurrent();
+      if (!bindingRead) {
+        throw new Error("Codex native subagent binding reader is unavailable");
+      }
       const parentSession = parent?.entry;
       const historyOwner = createCodexNativeSubagentHistoryOwner({
         parentThreadId,
@@ -390,6 +393,9 @@ export function prepareCodexAttemptResources(prompt: CodexAttemptPrompt) {
     }
     const retained = await bindingStore.withLease(bindingIdentity, async () => {
       const prepared = await bindingStore.prepareRead(bindingIdentity);
+      if (!prepared) {
+        return false;
+      }
       using bindingRead = { read: prepared.read, [Symbol.dispose]: prepared.release };
       if (state.nativeSettlementExpired) {
         return false;

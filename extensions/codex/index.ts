@@ -5,9 +5,9 @@ import {
   resolveLivePluginConfigObject,
 } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import {
-  type PluginStateKeyedStore,
-  type PluginStateSyncKeyedStore,
+import type {
+  PluginStateKeyedStore,
+  PluginStateSyncKeyedStore,
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { registerCodexCliMetadata } from "./cli-metadata.js";
 import {

@@ -24,6 +24,9 @@ export async function withCodexSessionDescendantCancellation<T>(
     return run(async () => ({ killed: 0, cancelledRequesters: [] }));
   }
   const prepared = await bindingStore.prepareRead(identity);
+  if (!prepared) {
+    throw new Error("Codex descendant cancellation binding reader is unavailable");
+  }
   using reader = { read: prepared.read, [Symbol.dispose]: prepared.release };
   const lease = await retainSharedCodexAppServerClientByInstanceId(binding.clientId, {
     waitForExit: false,

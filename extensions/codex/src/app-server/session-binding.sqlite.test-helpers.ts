@@ -26,7 +26,6 @@ export function createCodexSqliteTestBindingStateStore(
   );
   return {
     ...state,
-    prepareRead: (key: string) => preparePluginStateRead(mutations, key),
     asyncReads: mutations,
     prepareRead: (key: string) => preparePluginStateRead(mutations, key),
     withCurrent: mutations.withCurrent.bind(mutations),
@@ -42,7 +41,6 @@ export function createCodexRuntimeTestBindingStateStore(
   const mutations = runtime.state.openKeyedStoreV2<StoredCodexAppServerBinding>(options);
   return {
     ...state,
-    prepareRead: (key: string) => preparePluginStateRead(mutations, key),
     asyncReads: mutations,
     prepareRead: (key: string) => preparePluginStateRead(mutations, key),
     withCurrent: (authority: Parameters<CodexBindingStateStore["withCurrent"]>[0]) =>

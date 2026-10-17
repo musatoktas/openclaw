@@ -291,10 +291,19 @@ it("keeps native monitor guards current through worker-published binding reads",
     expect(() => assignments.assertCurrent()).toThrow(
       "Native assignment binding is no longer current",
     );
+    await peer.mutate(identity, { kind: "set", binding });
+    submissions.assertCurrent();
+    assignments.assertCurrent();
   } finally {
     reader.release();
   }
   expect(reader.read()).toBeUndefined();
+  expect(() => submissions.assertCurrent()).toThrow(
+    "Native submission binding is no longer current",
+  );
+  expect(() => assignments.assertCurrent()).toThrow(
+    "Native assignment binding is no longer current",
+  );
 });
 
 it("keeps ordered failures without synchronous reads or retrying failed bulk acquisition", async () => {
