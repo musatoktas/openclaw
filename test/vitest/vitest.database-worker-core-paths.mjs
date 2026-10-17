@@ -1252,7 +1252,6 @@ export const databaseWorkerCoreTestFiles = [
   "src/agents/auth-profiles/usage.inherited-owner.test.ts",
   "test/helpers/stage-live-auth-profiles.test.ts",
   "src/agents/embedded-agent-runner/run/failover-retry-controller.inline-auth.worker.test.ts",
-  "src/agents/embedded-agent-runner/run/auth-profile-personal-usage.worker.test.ts",
   "src/agents/embedded-agent-runner/run/auth-profile-shared-usage.worker.test.ts",
   "src/agents/embedded-agent-runner/run/auth-controller.test.ts",
   "src/agents/auth-profiles.markauthprofilefailure.test.ts",
