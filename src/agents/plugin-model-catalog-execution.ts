@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isMainThread } from "node:worker_threads";
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { resolvePathViaExistingAncestorSync } from "../infra/boundary-path.js";
 import { getDatabaseEngineInput } from "../infra/database-engine/context.js";
@@ -168,13 +169,21 @@ export async function loadPersistedPluginModelCatalogs(
   }
 }
 
-/** PostgreSQL reads borrow the admitted agent connection without requesting a writer. */
+/** PostgreSQL workers use scoped readers; the main thread delegates to its admitted executor. */
 async function readNativePluginModelCatalogs(
   options: { agentId: string; path: string; env: NodeJS.ProcessEnv },
   pluginIds: readonly string[] | undefined,
   assertCurrent: () => void,
   signal: AbortSignal,
 ): Promise<PersistedPluginModelCatalog[]> {
+  if (!isMainThread) {
+    const { pluginModelCatalogReadOperations } = await import("./plugin-model-catalog.kernel.js");
+    assertCurrent();
+    return pluginModelCatalogReadOperations["pluginCatalog.read"](
+      { agentId: options.agentId, pluginIds },
+      options,
+    );
+  }
   const execution = captureOpenClawAgentDatabaseExecution(options);
   try {
     const catalogs = await execution.runExisting(

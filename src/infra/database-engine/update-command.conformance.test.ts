@@ -171,7 +171,17 @@ describe.skipIf(!connection)("PostgreSQL updater command admission", () => {
     await fs.mkdir(process.env.OPENCLAW_CONFIG_PATH!, { recursive: true });
     await expect(
       updateCommand({ tag: "main", yes: true, json: true, restart: false }),
-    ).rejects.toMatchObject({ code: "CONFIG_READ_FAILED" });
+    ).rejects.toMatchObject({ code: 1 });
+    expect(defaultRuntime.writeJson).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        status: "error",
+        reason: "config-read-failed",
+        failedStep: expect.objectContaining({
+          name: "config-read-failed",
+          failureFacts: [expect.objectContaining({ check: "config", code: "EISDIR" })],
+        }),
+      }),
+    );
     await expect(fs.stat(fixture.databasePath)).rejects.toMatchObject({ code: "ENOENT" });
     expect(packageUpdate.stagePackageInstallUpdate).not.toHaveBeenCalled();
     expect(getDatabaseEngineSelection()).toBeUndefined();

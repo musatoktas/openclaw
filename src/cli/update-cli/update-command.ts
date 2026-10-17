@@ -76,7 +76,7 @@ async function withUpdateDatabaseEngine<T>(
   const [
     { cloneEnvWithPlatformSemantics },
     { createConfigIO },
-    { createConfigReadError, isConfigReadFailure },
+    { isConfigReadFailure },
     { resolveDatabaseEngineSelection },
     { withDatabaseEngineSelection },
     { loadDotEnvAsync },
@@ -96,7 +96,7 @@ async function withUpdateDatabaseEngine<T>(
     pluginValidation: "core-only",
   }).readConfigFileSnapshot();
   if (isConfigReadFailure(snapshot)) {
-    throw createConfigReadError(snapshot);
+    throw createUpdateConfigFailure(snapshot);
   }
   // Candidate Doctor owns config recovery; admission only needs the authored engine choice.
   const selection = await resolveDatabaseEngineSelection(snapshot.sourceConfig, configEnv);
@@ -118,14 +118,16 @@ async function updateCommandWithRuntime(
   );
   // Post-core children report phase results; the outer updater owns the run ledger.
   if (prepared.postCoreUpdateResume) {
-    return await withUpdateDatabaseEngine(recoveryState.triageTarget.env, () =>
-      withUpdateInProgressEnv(invocationCwd, async () =>
-        (await import("./update-execution.runtime.js")).resumePostCoreUpdate({
-          root: prepared.discoveredRoot,
-          channel: prepared.postCoreUpdateChannel,
-          opts: inputOpts,
-          timeoutMs: prepared.timeoutMs ?? DEFAULT_UPDATE_STEP_TIMEOUT_MS,
-        }),
+    return await withUpdateAdmissionReporting(inputOpts, () =>
+      withUpdateDatabaseEngine(recoveryState.triageTarget.env, () =>
+        withUpdateInProgressEnv(invocationCwd, async () =>
+          (await import("./update-execution.runtime.js")).resumePostCoreUpdate({
+            root: prepared.discoveredRoot,
+            channel: prepared.postCoreUpdateChannel,
+            opts: inputOpts,
+            timeoutMs: prepared.timeoutMs ?? DEFAULT_UPDATE_STEP_TIMEOUT_MS,
+          }),
+        ),
       ),
     );
   }

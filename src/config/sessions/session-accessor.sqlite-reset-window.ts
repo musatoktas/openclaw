@@ -723,8 +723,8 @@ export function readVisibleTranscriptStats(
     .select((eb) => [
       eb.fn.count<number>("active.event_seq").as("event_count"),
       /* kysely-allow-raw: JSONL size includes one terminating newline per event. */
-      sql<number>`COALESCE(SUM(${transcriptEventReadBytesSql("event")} ), 0)
-        + COUNT(*)`.as("size_bytes"),
+      sql<number>`CAST(COALESCE(SUM(${transcriptEventReadBytesSql("event")} ), 0)
+        + COUNT(*) AS BIGINT)`.as("size_bytes"),
     ])
     .where("active.session_id", "=", projection.resolved.sessionId)
     .where("active.context_eligible", "=", 1);
