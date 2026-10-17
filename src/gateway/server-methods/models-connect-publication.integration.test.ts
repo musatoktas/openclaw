@@ -62,6 +62,7 @@ it("connect negotiates snapshots and preserves draft and saved-session catalog s
       elapsedMs: Math.round(performance.now() - startedAt),
       snapshots: publications.length,
       activeRootWork: getActiveGatewayRootWorkCount(),
+      activeRootWorkHolders: getActiveGatewayRootWorkHolders(),
     });
   });
   enterPhase("test state");
