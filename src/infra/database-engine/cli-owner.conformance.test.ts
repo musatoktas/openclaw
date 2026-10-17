@@ -7,6 +7,8 @@ import { Command } from "commander";
 import { Client } from "pg";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { ensureCliExecutionBootstrap } from "../../cli/command-execution-startup.js";
+import { resolveCliStartupPolicy } from "../../cli/command-startup-policy.js";
 import { createConfigIO } from "../../config/io.factory.js";
 import { captureRuntimeConfigAsyncReader } from "../../config/io.runtime.js";
 import { configWritePostCommitRollback } from "../../config/io.types.js";
@@ -278,6 +280,64 @@ it.skipIf(!connection)(
     });
     expect(warning).not.toHaveBeenCalled();
     await expect(fs.stat(f.databasePath)).rejects.toMatchObject({ code: "ENOENT" });
+  },
+);
+
+it.skipIf(!connection).each([
+  { command: "index", flags: [] },
+  { command: "status", flags: ["--index"] },
+  { command: "status", flags: ["--fix"] },
+])(
+  "validates memory $command $flags before PostgreSQL ownership without health writes",
+  async ({ command, flags }) => {
+    await using f = await configWriteFixture();
+    const selection = await resolveDatabaseEngineSelection(f.config, f.env);
+    const namespace = await withDatabaseEngineSelection(selection, async () => {
+      const schema = withEngineStoreAdmission(
+        () => getPostgresPhysicalFacts(openOpenClawStateDatabase({ env: f.env }).db)?.namespace,
+      );
+      await closeOpenClawStateDatabaseByPathAsync(f.databasePath);
+      return schema;
+    });
+    assert(namespace);
+    const before = readAnchor(f.databasePath);
+    const healthRows = async () =>
+      (
+        await f.client.query<{ config_path: string }>(
+          `SELECT config_path FROM "${namespace}".config_health_entries`,
+        )
+      ).rows;
+    expect(await healthRows()).toEqual([]);
+    const commandPath = ["memory", command];
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: () => {
+        throw new Error("fixture config rejected");
+      },
+    };
+    const validate = () =>
+      ensureCliExecutionBootstrap({
+        runtime,
+        commandPath,
+        startupPolicy: resolveCliStartupPolicy({
+          argv: ["node", "openclaw", ...commandPath, ...flags],
+          commandPath,
+          jsonOutputMode: false,
+        }),
+        loadPlugins: false,
+      });
+    using warning = vi.spyOn(console, "warn");
+    await validate();
+    expect(runtime.error).not.toHaveBeenCalled();
+    await fs.writeFile(f.configPath, JSON.stringify({ gateway: { mode: "invalid-mode" } }));
+    await expect(validate()).rejects.toThrow("fixture config rejected");
+    expect(warning).not.toHaveBeenCalledWith(
+      expect.stringContaining("Config health-state write failed:"),
+    );
+    expect(await healthRows()).toEqual([]);
+    expect(readAnchor(f.databasePath)).toEqual(before);
+    expect(getDatabaseEngineSelection()).toBeUndefined();
   },
 );
 
