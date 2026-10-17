@@ -124,7 +124,7 @@ export function bindPostgresMemoryPublication(
           },
         },
       );
-      return { ok: true, value, facts: rebuilding ?? readMemoryDatabaseFacts(db) };
+      return { ok: true, value };
     } catch (error) {
       if (!committed) {
         rebuilding = previousFacts;
@@ -154,6 +154,8 @@ export function bindPostgresMemoryPublication(
       }
     }
   };
+  const withFacts = <T>(result: MemoryPublicationResult<T>): MemoryPublicationResult<T> =>
+    result.ok ? { ...result, facts: rebuilding ?? readMemoryDatabaseFacts(db) } : result;
   const ensureSpool = () => {
     if (created) {
       return;
@@ -259,34 +261,36 @@ export function bindPostgresMemoryPublication(
     typeof bindSqliteWorkerDatabase<MemoryPublicationOperations>
   >[1]["execute"] = (command) => {
     if (command.type === "database.reset") {
-      return write(() => {
-        const query = getNodeSqliteKysely<
-          Record<(typeof MEMORY_INDEX_DERIVED_TABLES)[number], unknown> & {
-            memory_index_state: { id: number; revision: number };
+      return withFacts(
+        write(() => {
+          const query = getNodeSqliteKysely<
+            Record<(typeof MEMORY_INDEX_DERIVED_TABLES)[number], unknown> & {
+              memory_index_state: { id: number; revision: number };
+            }
+          >(db);
+          let changed = false;
+          // Admitted facts include optional vector projections; generated text columns
+          // disappear with their source rows while the index definitions stay admitted.
+          for (const table of MEMORY_INDEX_DERIVED_TABLES) {
+            if (table === MEMORY_INDEX_STATE_TABLE || !tableExists(db, table)) {
+              continue;
+            }
+            const result = executeSqliteQuerySync(db, query.deleteFrom(table));
+            changed ||= (result.numAffectedRows ?? 0n) > 0n;
           }
-        >(db);
-        let changed = false;
-        // Admitted facts include optional vector projections; generated text columns
-        // disappear with their source rows while the index definitions stay admitted.
-        for (const table of MEMORY_INDEX_DERIVED_TABLES) {
-          if (table === MEMORY_INDEX_STATE_TABLE || !tableExists(db, table)) {
-            continue;
+          cacheSize = 0;
+          if (changed) {
+            executeSqliteQuerySync(
+              db,
+              query
+                .updateTable(MEMORY_INDEX_STATE_TABLE)
+                .set((eb) => ({ revision: eb("revision", "+", 1) }))
+                .where("id", "=", 1),
+            );
           }
-          const result = executeSqliteQuerySync(db, query.deleteFrom(table));
-          changed ||= (result.numAffectedRows ?? 0n) > 0n;
-        }
-        cacheSize = 0;
-        if (changed) {
-          executeSqliteQuerySync(
-            db,
-            query
-              .updateTable(MEMORY_INDEX_STATE_TABLE)
-              .set((eb) => ({ revision: eb("revision", "+", 1) }))
-              .where("id", "=", 1),
-          );
-        }
-        return changed;
-      });
+          return changed;
+        }),
+      );
     }
     if (stageId && !stages.has(stageId) && command.type !== "database.stage.start") {
       throw new Error("Memory reindex connection was lost; retry the full reindex.");
@@ -351,57 +355,61 @@ export function bindPostgresMemoryPublication(
     }
     if (command.type === "database.stage.start") {
       retainState = stageId !== undefined;
-      return write(() => {
-        ensureSpool();
-        rebuilding = {
-          ...readMemoryDatabaseFacts(db),
-          meta: null,
-          serialized: null,
-          hasIndexedChunks: false,
-          hasSemanticChunks: false,
-          invalidatedSources: [],
-          vectorState: { state: "empty" },
-        };
-      });
+      return withFacts(
+        write(() => {
+          ensureSpool();
+          rebuilding = {
+            ...readMemoryDatabaseFacts(db),
+            meta: null,
+            serialized: null,
+            hasIndexedChunks: false,
+            hasSemanticChunks: false,
+            invalidatedSources: [],
+            vectorState: { state: "empty" },
+          };
+        }),
+      );
     }
     if (command.type === "database.stage.publish") {
-      return write(() => {
-        if (!rebuilding || !metadata) {
-          throw new Error("Memory reindex stage is incomplete");
-        }
-        if (readMemoryDatabaseFacts(db).revision !== command.input.expectedRevision) {
-          throw new MemoryIndexRevisionConflictError(
-            "Memory index changed while full reindex was building; retry the full reindex.",
-          );
-        }
-        db.exec("DELETE FROM memory_index_chunks; DELETE FROM memory_index_sources");
-        const rows = records("reindex");
-        let next = rows.next();
-        while (!next.done) {
-          if (typeof next.value.header !== "string") {
-            throw new Error("Memory reindex source header is missing");
+      return withFacts(
+        write(() => {
+          if (!rebuilding || !metadata) {
+            throw new Error("Memory reindex stage is incomplete");
           }
-          // SAFETY: Only stageSource writes headers into the reindex lane.
-          const source = JSON.parse(next.value.header) as MemorySourceIndexHeader;
-          checkSource(source);
-          next = rows.next();
-          function* fragments() {
-            while (!next.done && next.value.header === null) {
-              yield next.value;
-              next = rows.next();
+          if (readMemoryDatabaseFacts(db).revision !== command.input.expectedRevision) {
+            throw new MemoryIndexRevisionConflictError(
+              "Memory index changed while full reindex was building; retry the full reindex.",
+            );
+          }
+          db.exec("DELETE FROM memory_index_chunks; DELETE FROM memory_index_sources");
+          const rows = records("reindex");
+          let next = rows.next();
+          while (!next.done) {
+            if (typeof next.value.header !== "string") {
+              throw new Error("Memory reindex source header is missing");
             }
+            // SAFETY: Only stageSource writes headers into the reindex lane.
+            const source = JSON.parse(next.value.header) as MemorySourceIndexHeader;
+            checkSource(source);
+            next = rows.next();
+            function* fragments() {
+              while (!next.done && next.value.header === null) {
+                yield next.value;
+                next = rows.next();
+              }
+            }
+            new MemorySourceIndexKernel(db, {
+              vector: { enabled: true, available: true },
+              fts: { enabled: true, available: true },
+            }).replaceRows(source, decode<MemorySourceIndexRow>(fragments()));
           }
-          new MemorySourceIndexKernel(db, {
-            vector: { enabled: true, available: true },
-            fts: { enabled: true, available: true },
-          }).replaceRows(source, decode<MemorySourceIndexRow>(fragments()));
-        }
-        writeMemoryIndexMetadata(db, metadata);
-        if (command.input.vectorIndexComplete) {
-          markMemoryVectorIndexClean(db);
-        }
-        rebuilding = undefined;
-      });
+          writeMemoryIndexMetadata(db, metadata);
+          if (command.input.vectorIndexComplete) {
+            markMemoryVectorIndexClean(db);
+          }
+          rebuilding = undefined;
+        }),
+      );
     }
     if (command.type === "index.facts") {
       return rebuilding ?? readMemoryDatabaseFacts(db);
@@ -445,35 +453,41 @@ export function bindPostgresMemoryPublication(
     if (command.type === "index.upgradeProviderKey") {
       return rebuilding
         ? { ok: true, value: false }
-        : write(() => {
-            const changed = upgradeMemoryIndexProviderKey(db, command.input);
-            if (changed) {
-              cacheSize = undefined;
-            }
-            return changed;
-          });
+        : withFacts(
+            write(() => {
+              const changed = upgradeMemoryIndexProviderKey(db, command.input);
+              if (changed) {
+                cacheSize = undefined;
+              }
+              return changed;
+            }),
+          );
     }
     if (command.type === "index.writeMetadata") {
-      return write(() => {
-        if (rebuilding) {
-          metadata = command.input;
-          rebuilding.meta = metadata;
-          rebuilding.serialized = JSON.stringify(metadata);
-        } else {
-          writeMemoryIndexMetadata(db, command.input);
-        }
-      });
+      return withFacts(
+        write(() => {
+          if (rebuilding) {
+            metadata = command.input;
+            rebuilding.meta = metadata;
+            rebuilding.serialized = JSON.stringify(metadata);
+          } else {
+            writeMemoryIndexMetadata(db, command.input);
+          }
+        }),
+      );
     }
     if (command.type === "source.refresh") {
       return rebuilding
         ? { ok: true, value: false }
-        : write(() => refreshMemorySessionSourceState(db, command.input));
+        : withFacts(write(() => refreshMemorySessionSourceState(db, command.input)));
     }
     if (command.type === "source.delete") {
       return rebuilding
         ? { ok: true, value: false }
-        : write(() =>
-            new MemorySourceIndexKernel(db, command.input.state).deleteIfCurrent(command.input),
+        : withFacts(
+            write(() =>
+              new MemorySourceIndexKernel(db, command.input.state).deleteIfCurrent(command.input),
+            ),
           );
     }
     if (command.type === "cache.clear") {
@@ -528,34 +542,37 @@ export function bindPostgresMemoryPublication(
           cacheSize: bounded ? readCacheSize() : 0,
           entries,
         });
-        // Unbounded upserts return an upper bound because existing hashes can be replaced.
+        // Bounded upserts retain an upper bound; the helper counts before capacity can be exceeded.
+        // Unbounded writes started from zero, so invalidate instead of retaining a partial count.
         cacheSize = bounded ? nextSize : undefined;
         return true;
       });
     }
-    return write(() => {
-      const sources =
-        command.type === "source.replace.group"
-          ? command.input.sources
-          : command.type === "source.replace.inline"
-            ? [command.input]
-            : [{ header: header as MemorySourceIndexHeader, fragments: undefined }]; // SAFETY: Paired source stage.start header.
-      for (const source of sources) {
-        if (!source.header) {
-          throw new Error("Memory source staging was not started");
+    return withFacts(
+      write(() => {
+        const sources =
+          command.type === "source.replace.group"
+            ? command.input.sources
+            : command.type === "source.replace.inline"
+              ? [command.input]
+              : [{ header: header as MemorySourceIndexHeader, fragments: undefined }]; // SAFETY: Paired source stage.start header.
+        for (const source of sources) {
+          if (!source.header) {
+            throw new Error("Memory source staging was not started");
+          }
+          if (rebuilding) {
+            stageSource(source.header, source.fragments);
+          } else {
+            checkSource(source.header);
+            new MemorySourceIndexKernel(db, command.input.state).replaceRows(
+              source.header,
+              decode<MemorySourceIndexRow>(source.fragments ?? records("source")),
+            );
+          }
         }
-        if (rebuilding) {
-          stageSource(source.header, source.fragments);
-        } else {
-          checkSource(source.header);
-          new MemorySourceIndexKernel(db, command.input.state).replaceRows(
-            source.header,
-            decode<MemorySourceIndexRow>(source.fragments ?? records("source")),
-          );
-        }
-      }
-      return true;
-    });
+        return true;
+      }),
+    );
   };
   return bindSqliteWorkerDatabase<MemoryPublicationOperations>(db, {
     execute(command) {
