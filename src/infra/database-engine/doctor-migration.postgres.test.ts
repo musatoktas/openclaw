@@ -47,6 +47,7 @@ import type { StoreSchema } from "./contract.js";
 import { openEngineStore } from "./open.js";
 import { getPostgresPhysicalFacts } from "./physical-facts.js";
 import type { PortDescriptor } from "./port-descriptor.js";
+import { postgresCatalogQuery, readPostgresCatalog } from "./postgres-catalog.js";
 import { resolveDatabaseFamilyEngines } from "./registry.js";
 import { statePortProvider } from "./state-port.js";
 
@@ -612,7 +613,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         postgres: migration.fromSchema.postgres,
         postgresMigrations: [],
       };
-      // The fingerprint-only anchor must stay outside the update backup's state inventory.
+      // The reference anchor must stay outside the update backup's state inventory.
       const referenceRoot = dirs.make("doctor-pg-agent-reference-");
       const targetNamespace = withEngineStoreAdmission(() => {
         using anchor = openNodeSqliteDatabase(path.join(referenceRoot, "agent.sqlite"));
@@ -633,9 +634,14 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         }
       });
       namespaces.add(targetNamespace);
-      const targetAgentFingerprint = (
-        await client.query(`SELECT fingerprint FROM "${targetNamespace}".openclaw_schema_meta`)
-      ).rows[0].fingerprint;
+      // Fingerprints include namespace-qualified definitions; compare catalogs after relocation.
+      const readAgentCatalog = async (schema: string) =>
+        readPostgresCatalog(
+          (await client.query(postgresCatalogQuery(schema, true))).rows[0].catalog,
+        )
+          .map((fact) => JSON.stringify(fact).replaceAll(schema, "fixture_namespace"))
+          .toSorted();
+      const targetAgentCatalog = await readAgentCatalog(targetNamespace);
       // Build the actual historical layout; dropping current columns would leave
       // PostgreSQL attribute-number holes and change the later migration catalog.
       let agentNamespace = withEngineStoreAdmission(() => {
@@ -842,13 +848,8 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           expect(result.warnings).toEqual([]);
           closeOpenClawStateDatabaseForTest();
           expect(await readAgent()).toEqual([{ value_json: '"after"' }]);
-          expect(
-            (
-              await client.query(
-                `SELECT version, fingerprint FROM "${agentNamespace}".openclaw_schema_meta`,
-              )
-            ).rows,
-          ).toEqual([{ version: String(candidate.version), fingerprint: targetAgentFingerprint }]);
+          expect(admit(candidate, agentPath)?.version).toBe(candidate.version);
+          expect(await readAgentCatalog(agentNamespace)).toEqual(targetAgentCatalog);
           expect(await readAllocation()).toEqual([{ last_value: "72", is_called: true }]);
           expect(await readNavigationFunction()).toEqual([
             { proisstrict: true, proconfig: ["search_path=pg_catalog"] },
