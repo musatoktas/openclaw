@@ -1,19 +1,9 @@
-import { createHash } from "node:crypto";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { getSessionKysely } from "../config/sessions/session-accessor.sqlite-scope-helpers.js";
-import { transcriptEventJsonSql } from "../config/sessions/transcript-payload.js";
-import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import type { DB } from "../state/openclaw-state-db.generated.js";
 import type { WorkerWriteOperationContext } from "../state/worker-operation-registry.js";
-import type { DeferredSessionTranscriptReadOperations } from "./deferred-plugin-session-source-recovery.worker-contract.js";
 import { databaseIdentity } from "./deferred-plugin-session-verification.js";
-import {
-  executeSqliteQuerySync,
-  getNodeSqliteKysely,
-  iterateSqliteQuerySync,
-} from "./kysely-sync.js";
-import type { SqliteReadOnlyOperationContext } from "./sqlite-readonly-operation-types.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
 import type { DeferredPluginSessionImport } from "./state-migrations.deferred-session-import.js";
 import {
   readLegacyMigrationReceiptFromDatabase,
@@ -74,40 +64,4 @@ export const deferredSessionImportOperations = {
       },
       { operationLabel: "state.rebuild-plugin-session-source-index" },
     ),
-};
-
-export const deferredSessionTranscriptReadOperations = {
-  "deferredSessionImport.verifyMissingTranscript": (
-    input: DeferredSessionTranscriptReadOperations["deferredSessionImport.verifyMissingTranscript"]["input"],
-    context: SqliteReadOnlyOperationContext,
-  ): boolean => {
-    const result = withOpenClawAgentDatabaseReadOnly(
-      ({ db }) => {
-        const query = getSessionKysely(db);
-        const hash = createHash("sha256");
-        let bytes = 0;
-        for (const row of iterateSqliteQuerySync(
-          db,
-          query
-            .selectFrom("transcript_events")
-            .select(transcriptEventJsonSql(db).as("event_json"))
-            .where("session_id", "=", input.sessionId)
-            .orderBy("seq", "asc"),
-        )) {
-          const line = `${row.event_json}\n`;
-          bytes += Buffer.byteLength(line);
-          if (bytes > input.identity.size) {
-            return false;
-          }
-          hash.update(line);
-          if (bytes === input.identity.size) {
-            return hash.digest("hex") === input.identity.sha256;
-          }
-        }
-        return false;
-      },
-      { agentId: input.agentId, path: context.path, env: context.env },
-    );
-    return result.found && result.value;
-  },
 };

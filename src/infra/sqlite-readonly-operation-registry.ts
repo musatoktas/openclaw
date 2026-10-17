@@ -24,7 +24,7 @@ export const sqliteReadOnlyOperations = createWorkerOperationRegistry<
   SqliteReadOnlyOperationContext
 >({
   deferredSessionImport: () =>
-    import("./deferred-plugin-session-source-recovery.worker.js").then(
+    import("./deferred-plugin-session-transcript-read.worker.js").then(
       (module) => module.deferredSessionTranscriptReadOperations,
     ),
   agentRetirement: () =>

@@ -237,7 +237,6 @@ export async function verifyMissingDeferredSessionTranscript(params: {
     {
       type: "deferredSessionImport.verifyMissingTranscript",
       input: {
-        agentId: params.target.agentId,
         sessionId: params.sessionId,
         identity: params.identity,
       },
