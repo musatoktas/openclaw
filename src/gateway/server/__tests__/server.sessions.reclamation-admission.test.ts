@@ -360,10 +360,10 @@ test("sessions.delete rejects revoked authority before repairing the same databa
     await expect(loadSeededTranscriptEvents(transcriptScope)).resolves.toEqual(originalTranscript);
     expect(Atomics.load(validation.gate, 2)).toBeGreaterThan(0);
     expect(Atomics.load(validation.gate, 3)).toBeGreaterThan(0);
+    expect(readRepairIndex()).toBeUndefined();
     // Refused native opening joins broker termination before returning its authority error.
     expect(reclamation.exitCodes).toEqual([1]);
     expect(readLeases()).toEqual(originalLeases);
-    expect(readRepairIndex()).toBeUndefined();
     await closeOpenClawAgentDatabasesAsync();
     expect(reclamation.exitCodes).toEqual([1]);
   } finally {
