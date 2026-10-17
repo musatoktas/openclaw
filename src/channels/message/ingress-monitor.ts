@@ -19,6 +19,7 @@ import {
   waitForPending,
 } from "./ingress-monitor-tasks.js";
 import type {
+  ChannelIngressMonitorAdmissionResult,
   ChannelIngressMonitorDeliveryResult,
   ChannelIngressMonitorFacts,
   ChannelIngressMonitorLifecycle,
@@ -549,9 +550,8 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
       payload: TStoredPayload;
       index: number;
     }> = [];
-    const results: Array<
-      { kind: "ignored" } | { kind: "durable"; queueResult: Awaited<ReturnType<Queue["enqueue"]>> }
-    > = [];
+    const results: ChannelIngressMonitorAdmissionResult<Awaited<ReturnType<Queue["enqueue"]>>>[] =
+      [];
     const { receivedAt } = admitOptions;
     for (const raw of rawEvents) {
       try {
