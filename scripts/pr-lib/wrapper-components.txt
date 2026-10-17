@@ -2223,6 +2223,7 @@ src/config/sessions/activity-summary.ts
 src/config/sessions/session-actor.ts
 src/config/sessions/session-entry-cohort-scope.ts
 src/config/sessions/session-transcript-index-maintenance.ts
+src/config/sessions/session-transcript-index-readiness.ts
 src/config/sessions/session-transcript-projection-writer.ts
 src/config/sessions/session-transcript-reconcile-pool.ts
 src/config/sessions/session-transcript-reconcile-readiness.ts
