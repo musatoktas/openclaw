@@ -1,4 +1,3 @@
-import { sql } from "kysely";
 import { engineTextHexSql } from "../../infra/database-engine/text-bytes.js";
 import {
   executeSqliteQuerySync,
@@ -109,9 +108,9 @@ export function collectSessionAdmissionReferences(params: {
     params.database.db,
     db
       .selectFrom("session_nodes")
-      .select([
+      .select((eb) => [
         "session_key",
-        engineTextHexSql(params.database.db, sql.ref("session_key")).as("key_bytes"),
+        engineTextHexSql(params.database.db, eb.ref("session_key")).as("key_bytes"),
       ]),
   )) {
     if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
@@ -132,10 +131,12 @@ export function collectSessionAdmissionReferences(params: {
             db
               .selectFrom("session_nodes")
               .select("session_key")
-              .where(
-                engineTextHexSql(params.database.db, sql.ref("session_key")),
-                "in",
-                sqliteStringSet(admittedKeyBytes),
+              .where((eb) =>
+                eb(
+                  engineTextHexSql(params.database.db, eb.ref("session_key")),
+                  "in",
+                  sqliteStringSet(admittedKeyBytes),
+                ),
               ),
           ),
       )

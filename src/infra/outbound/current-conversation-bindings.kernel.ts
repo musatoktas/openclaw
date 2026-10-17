@@ -99,7 +99,10 @@ function createCurrentConversationBindingQueries(db: EngineConnection) {
           .where((eb) =>
             eb.or([
               eb(
-                parameter((params) => params.scope?.channel ?? null),
+                eb.cast(
+                  parameter((params) => params.scope?.channel ?? null),
+                  "text",
+                ),
                 "is",
                 null,
               ),

@@ -9,6 +9,11 @@ import { CronService } from "../../cron/service.js";
 import { createWorkerSessionPlacementStore } from "../../gateway/worker-environments/placement-store.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { getCanonicalUserPreferences } from "../../state/user-preferences.js";
+import { setAvatar } from "../../state/user-profile-writes.worker.js";
+import { createProfileAvatarReader } from "../../state/user-profiles-avatar.js";
+import { ensureUserProfileRoleSchema } from "../../state/user-profiles-schema.js";
+import { ensureGatewayOwnerProfile } from "../../state/user-profiles.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
 import { mixedAgentConnection, useMixedAgentPair } from "./mixed-agent.conformance.test-support.js";
@@ -17,6 +22,28 @@ describe.skipIf(!mixedAgentConnection).each(["sqlite", "postgres"] as const)(
   "%s post-ready storage consumers",
   (engine) => {
     const fixture = useMixedAgentPair(engine, engine);
+
+    it("reads operator preferences with absent and binary profile avatars", async () => {
+      const profile = withEngineStoreAdmission(() => {
+        const owner = ensureGatewayOwnerProfile("Synthetic operator");
+        ensureUserProfileRoleSchema({});
+        return owner;
+      });
+      await expect(getCanonicalUserPreferences(profile.id)).resolves.toEqual({
+        profileId: profile.id,
+        entries: {},
+      });
+      const bytes = new Uint8Array([0, 1, 127, 128, 255]);
+      expect(withEngineStoreAdmission(() => setAvatar(profile.id, bytes, "image/png")).ok).toBe(
+        true,
+      );
+      await expect(getCanonicalUserPreferences(profile.id)).resolves.toEqual({
+        profileId: profile.id,
+        entries: {},
+      });
+      const avatar = await createProfileAvatarReader(profile.id).inspect();
+      await expect(avatar.loadBytes()).resolves.toMatchObject({ bytes, mime: "image/png" });
+    });
 
     it("reads cold placement projections and committed turn claims", async () => {
       withEngineStoreAdmission(() => openOpenClawStateDatabase());

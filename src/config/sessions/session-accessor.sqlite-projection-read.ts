@@ -200,8 +200,7 @@ export function selectMessageRows(
         "in",
         selection.positions.length <= 500
           ? selection.positions
-          : /* kysely-allow-raw: Retained positions are numeric on both engines and use one binding. */
-            sql<number>`(SELECT CAST(value AS BIGINT) FROM ${jsonArrayElements(database.db, sql.val(JSON.stringify(selection.positions)))})`,
+          : sql<number>`(SELECT CAST(value AS BIGINT) FROM ${jsonArrayElements(database.db, sql.val(JSON.stringify(selection.positions)))})` /* kysely-allow-raw: Retained positions are numeric on both engines and use one binding. */,
       )
     : query
         .where("active.message_position", ">=", selection.start)

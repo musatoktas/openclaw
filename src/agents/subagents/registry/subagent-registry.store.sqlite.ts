@@ -1,4 +1,4 @@
-import { sql, type ExpressionBuilder, type RawBuilder } from "kysely";
+import { expressionBuilder, sql, type ExpressionBuilder, type RawBuilder } from "kysely";
 import { jsonRemovePaths, jsonValid } from "../../../infra/database-engine/json-values.js";
 import {
   executeSqliteQuerySync,
@@ -128,7 +128,7 @@ function subagentMetadataPayload(db: EngineConnection): RawBuilder<string | null
       string | null
     >`CASE WHEN pg_input_is_valid(payload_json, 'jsonb') THEN ${jsonRemovePaths(
       db,
-      sql.ref("payload_json"),
+      expressionBuilder<SubagentRegistryDatabase, "subagent_runs">().ref("payload_json"),
       subagentRetainedPayloadPaths.flatMap((path) => [
         sql.val(path),
         sql.val(`$.parentCompletion${path.slice(1)}`),
@@ -218,7 +218,10 @@ function projectSessionListJsonMembers(
     /* kysely-allow-raw: this recursive projection owns every generated alias. */ sql.id(alias);
   if (isPostgresSqlConnection(db)) {
     const valueType = sql`json_typeof(${value})`;
-    const ordinal = sql.ref(`${alias}.ordinality`);
+    const ordinal =
+      /* kysely-allow-raw: depth aliases belong to this static metadata projection. */ sql.ref(
+        `${alias}.ordinality`,
+      );
     const nested = [...members].flatMap(([name, children]) =>
       children.length
         ? [
@@ -270,7 +273,9 @@ function readSubagentSessionListRows(
 ) {
   const { db } = database;
   const postgres = isPostgresSqlConnection(db);
-  const payload = sql.ref("payload_json");
+  const payload = expressionBuilder<SubagentRegistryDatabase, "subagent_runs">().ref(
+    "payload_json",
+  );
   const stateDb = getNodeSqliteKysely<SubagentRegistryDatabase>(db);
   return executeSqliteQuerySync(
     db,
@@ -314,9 +319,9 @@ function readSubagentSessionListRows(
         ).as("payload_json"),
       ])
       .where(
-        /* kysely-allow-raw: malformed payloads cannot enter JSON member projection. */ postgres
-          ? sql<boolean>`json_typeof(${payload}::json) = 'object'`
-          : sql<boolean>`json_valid(payload_json) AND json_type(payload_json) = 'object'`,
+        postgres
+          ? /* kysely-allow-raw: malformed payloads cannot enter JSON member projection. */ sql<boolean>`json_typeof(${payload}::json) = 'object'`
+          : /* kysely-allow-raw: malformed payloads cannot enter JSON member projection. */ sql<boolean>`json_valid(payload_json) AND json_type(payload_json) = 'object'`,
       )
       .orderBy("created_at", "asc")
       .orderBy("run_id", "asc"),

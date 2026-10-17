@@ -285,8 +285,12 @@ it("keeps native monitor guards current through worker-published binding reads",
     );
     const peer = createBindingStore(createSqliteState(options));
     await peer.mutate(identity, { kind: "set", binding: { ...binding, threadId: "replacement" } });
-    expect(submissions.assertCurrent).toThrow("Native submission binding is no longer current");
-    expect(assignments.assertCurrent).toThrow("Native assignment binding is no longer current");
+    expect(() => submissions.assertCurrent()).toThrow(
+      "Native submission binding is no longer current",
+    );
+    expect(() => assignments.assertCurrent()).toThrow(
+      "Native assignment binding is no longer current",
+    );
   } finally {
     reader.release();
   }

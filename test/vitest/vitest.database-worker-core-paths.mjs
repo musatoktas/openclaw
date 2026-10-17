@@ -53,6 +53,8 @@ export const databaseWorkerCoreTestFiles = [
   "src/infra/database-engine/subagent-registry.conformance.test.ts",
   "src/infra/database-engine/gateway-agent-inspection.conformance.test.ts",
   "src/infra/database-engine/post-ready.conformance.test.ts",
+  "src/infra/database-engine/cli-owner.conformance.test.ts",
+  "src/infra/database-engine/update-command.conformance.test.ts",
   "src/infra/database-engine/transcript-reports.conformance.test.ts",
   "src/infra/database-engine/plugin-registry.conformance.test.ts",
   "src/infra/database-engine/physical-facts.test.ts",

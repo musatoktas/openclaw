@@ -8,6 +8,7 @@ import {
 } from "../../config/sessions/conversation-registry.js";
 import {
   bindCurrentConversationRecordAsync,
+  listCurrentConversationBindingRecordsBySessionsAsync,
   readCurrentConversationBindingSelectionAsync,
 } from "../outbound/current-conversation-bindings.js";
 import type { SessionBindingRecord } from "../outbound/session-binding.types.js";
@@ -55,10 +56,14 @@ describe
       }
     });
 
-    it("selects binding batches in request order with absences and duplicates", async () => {
+    it("selects and lists binding batches with absences, duplicates, and account scope", async () => {
       const records: SessionBindingRecord[] = ["first", "second"].map((id) => ({
-        bindingId: `fixture:${id}`,
-        conversation: { channel: "demo", accountId: "default", conversationId: id },
+        bindingId: id === "first" ? "generic:demo\u241fdefault\u241f\u241ffirst" : `fixture:${id}`,
+        conversation: {
+          channel: "demo",
+          accountId: id === "first" ? "default" : "other",
+          conversationId: id,
+        },
         targetSessionKey: `agent:main:${id}`,
         targetKind: "session",
         status: "active",
@@ -78,6 +83,30 @@ describe
           second.conversation,
         ]),
       ).toEqual([second, null, first, second]);
+      const targets = [
+        second.targetSessionKey,
+        "agent:main:missing",
+        first.targetSessionKey,
+        second.targetSessionKey,
+      ];
+      expect(await listCurrentConversationBindingRecordsBySessionsAsync(targets)).toEqual([
+        [],
+        [],
+        [first],
+        [],
+      ]);
+      expect(
+        await listCurrentConversationBindingRecordsBySessionsAsync(targets, {
+          channel: "demo",
+          accountId: "default",
+        }),
+      ).toEqual([[], [], [first], []]);
+      expect(
+        await listCurrentConversationBindingRecordsBySessionsAsync(targets, {
+          channel: "demo",
+          accountId: "other",
+        }),
+      ).toEqual([[second], [], [], [second]]);
     });
   },
 );
