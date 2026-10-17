@@ -255,8 +255,8 @@ const sidebarView = values["sidebar-view"];
 if (sidebarView !== "sessions" && sidebarView !== "online") {
   throw new Error("Expected sidebar-view sessions or online");
 }
-const route = values.route;
-if (route !== "board" && route !== "chat") {
+const routeKind = values.route;
+if (routeKind !== "board" && routeKind !== "chat") {
   throw new Error("Expected route board or chat");
 }
 const runs = Number(values.runs);
@@ -450,7 +450,7 @@ try {
   const url = controlUiSessionUrl(
     server.baseUrl,
     fixture.selectedSessionKey,
-    route === "board" ? "dashboard" : "chat",
+    routeKind === "board" ? "dashboard" : "chat",
   );
   async function settle() {
     try {
@@ -465,7 +465,7 @@ try {
       if (sidebarView === "online") {
         await page.locator('[data-online-user-id="team-person-120"]').waitFor();
       }
-      if (route === "board") {
+      if (routeKind === "board") {
         await page
           .frameLocator(".board-widget__frame")
           .frameLocator("iframe")
@@ -478,7 +478,7 @@ try {
         .frameLocator("iframe")
         .getByText("Team metric 12", { exact: true })
         .waitFor();
-      if (route === "board") {
+      if (routeKind === "board") {
         await page.waitForFunction(() => {
           const ready = Reflect.get(window, "__readWidgetReadiness")();
           return ready.firstBoardReadyMs !== null;
@@ -534,10 +534,11 @@ try {
   await page.locator('aside.sidebar[data-snapshot-saved="true"]').waitFor();
   for (let run = 0; run < runs; run++) {
     await page.evaluate("globalThis.__name = (fn) => fn");
-    const snapshotSave = await page.evaluate(persistColdLoadWarmState, {
+    const warmInput: Parameters<typeof persistColdLoadWarmState>[0] = {
       sessionKey: fixture.selectedSessionKey,
-      sidebarView,
-    });
+      sidebarView: sidebarView === "online" ? "online" : "sessions",
+    };
+    const snapshotSave = await page.evaluate(persistColdLoadWarmState, warmInput);
     runTransfer =
       sidebarRowTransfer === "delta" || (sidebarRowTransfer === "interleaved" && run % 2 === 1)
         ? "delta"
@@ -980,7 +981,7 @@ try {
         bundleDir,
         fixture: fixture.counts,
         sidebarView,
-        route,
+        route: routeKind,
         streamingReply: values["streaming-reply"],
         sidebarListChurn: values["sidebar-list-churn"],
         sidebarLiveChurn: fixture.sidebarLiveChurn,
