@@ -10,6 +10,7 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
+import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { compactEmbeddedAgentSessionDirect } from "../embedded-agent-runner/compact.js";
 import { withSessionCompactionPersistenceAsync } from "../sessions/session-compaction-persistence.js";
@@ -285,12 +286,13 @@ it.each([1, 2])(
       );
       await Promise.all(paths.map((file) => writeFile(file, png)));
       const manager = await SessionManager.openAsync(target, state.workspaceDir);
-      await manager.appendMessageAsync({
+      const imageTurn: PersistedUserTurnMessage = {
         ...makeUserMessage("Stored image question", 1),
         __openclaw: {
           media: paths.map((file) => ({ path: file, contentType: "image/png", kind: "image" })),
         },
-      });
+      };
+      await manager.appendMessageAsync(imageTurn);
       const recent = expectDefined(
         await manager.appendMessageAsync(makeUserMessage("Recent text", 2)),
         "recent media turn",
