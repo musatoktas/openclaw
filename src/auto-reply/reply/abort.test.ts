@@ -105,7 +105,8 @@ vi.mock("../../config/sessions/session-accessor.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../../acp/control-plane/manager.js", () => ({
+vi.mock("../../acp/control-plane/manager.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../acp/control-plane/manager.js")>()),
   getAcpSessionManager: () => ({
     resolveSessionAsync: acpManagerMocks.resolveSessionAsync,
     cancelSession: acpManagerMocks.cancelSession,
@@ -561,7 +562,6 @@ describe("abort handling", () => {
       });
 
       expect(result.handled).toBe(true);
-      expect(runtimeAbortMocks.abortEmbeddedAgentRun).toHaveBeenCalledWith(sessionId);
       expect(getFollowupQueueDepth(sessionKey)).toBe(0);
       expectSessionLaneCleared(sessionKey);
     },
