@@ -19,7 +19,6 @@ import {
   projectContextEngineAssemblyForCodex,
 } from "./context-engine-projection.js";
 import { joinPresentSections } from "./developer-instruction-sections.js";
-import { sanitizeCodexHistoryImagePayloads } from "./image-payload-sanitizer.js";
 import type { CodexAttemptContext } from "./run-attempt-context.js";
 import type { CodexAppServerBindingIdentity, CodexBindingAuthority } from "./session-binding.js";
 import {
@@ -139,13 +138,13 @@ export async function prepareCodexContextEngineHistory(params: {
     ? undefined
     : prepareSeed
       ? async (assertSeedCurrent: () => void) => {
+          // Retain the host's message identities and their prepared media snapshots.
           const seed = Array.from(
             await prepareSeed({
               assertCurrent: assertSeedCurrent,
               signal: params.runtimeParams.abortSignal,
               tokenBudget: params.historyTokenBudget,
             }),
-            (message) => sanitizeCodexHistoryImagePayloads(message, "codex fresh thread seed"),
           ).filter(includeMessage);
           assertSeedCurrent();
           return buildSeed(seed);

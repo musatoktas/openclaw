@@ -1,3 +1,6 @@
+import { unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { expect, it, vi } from "vitest";
 import { makeUserMessage } from "../../../test/helpers/user-message.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
@@ -12,6 +15,7 @@ import { compactEmbeddedAgentSessionDirect } from "../embedded-agent-runner/comp
 import { withSessionCompactionPersistenceAsync } from "../sessions/session-compaction-persistence.js";
 import { SessionManager } from "../sessions/session-manager.js";
 import { makeAssistantMessageFixture } from "../test-helpers/assistant-message-fixtures.js";
+import { prepareHarnessContextMedia } from "./context-media-runtime.js";
 import { bindBoundedSeed } from "./host-seed.js";
 
 // mock-isolation: Keep real transcript and atomic persistence, replacing only summary model execution.
@@ -111,8 +115,14 @@ it.each([
         transcriptByteCompactionLatch: { activeBytes: 4096, maxBytes: 1024, sessionId: "seed" },
       });
       const manager = await SessionManager.openAsync(target, state.workspaceDir);
-      const old = await manager.appendMessageAsync(makeUserMessage("old".repeat(oldBytes), 1));
-      const recent = await manager.appendMessageAsync(makeUserMessage("recent request", 2));
+      const old = expectDefined(
+        await manager.appendMessageAsync(makeUserMessage("old".repeat(oldBytes), 1)),
+        "old seed turn",
+      );
+      const recent = expectDefined(
+        await manager.appendMessageAsync(makeUserMessage("recent request", 2)),
+        "recent seed turn",
+      );
       if (summary) {
         await manager.appendCompactionAsync(
           summary,
@@ -249,6 +259,110 @@ it.each([false, true])(
       if (refresh) {
         expect(seed).toContainEqual(current);
         expect(seed).not.toContainEqual(stale);
+      }
+    });
+  },
+);
+
+it.each([1, 2])(
+  "bounds restored images and reuses their prepared snapshot (%s)",
+  async (imageCount) => {
+    await withOpenClawTestState({ label: "native-media-seed" }, async (state) => {
+      setRuntimeConfigSnapshot({});
+      const target = {
+        agentId: "main",
+        sessionId: "media",
+        sessionKey: "agent:main:media",
+        storePath: state.statePath("sessions.sqlite"),
+      };
+      await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
+      const paths = Array.from({ length: imageCount }, (_, index) =>
+        path.join(state.workspaceDir, `image-${index}.png`),
+      );
+      const png = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=",
+        "base64",
+      );
+      await Promise.all(paths.map((file) => writeFile(file, png)));
+      const manager = await SessionManager.openAsync(target, state.workspaceDir);
+      await manager.appendMessageAsync({
+        ...makeUserMessage("Stored image question", 1),
+        __openclaw: {
+          media: paths.map((file) => ({ path: file, contentType: "image/png", kind: "image" })),
+        },
+      });
+      const recent = expectDefined(
+        await manager.appendMessageAsync(makeUserMessage("Recent text", 2)),
+        "recent media turn",
+      );
+      const compact = vi.mocked(compactEmbeddedAgentSessionDirect).mockReset();
+      compact.mockImplementationOnce(async (_params, persist) => {
+        await withSessionCompactionPersistenceAsync(manager, persist, () =>
+          manager.appendCompactionAsync("Image question summarized", recent, 4000),
+        );
+        return { ok: true, compacted: true };
+      });
+      const restore = vi.fn((request: Parameters<typeof prepareHarnessContextMedia>[0]) =>
+        prepareHarnessContextMedia(request),
+      );
+      const media = {
+        capabilities: {
+          prepareContextMedia: (
+            request: Pick<Parameters<typeof prepareHarnessContextMedia>[0], "message" | "maxChars">,
+          ) =>
+            restore({
+              ...request,
+              workspaceDir: state.workspaceDir,
+              modelInput: ["text", "image"],
+              assertCurrent: () => {},
+            }),
+        },
+      };
+      const source = new AbortController();
+      const bound = bindBoundedSeed(
+        {
+          sessionTarget: target,
+          workspaceDir: state.workspaceDir,
+          contextTokenBudget: 8192,
+          config: { agents: { defaults: { compaction: { maxActiveTranscriptBytes: "20mb" } } } },
+        },
+        () => {},
+        async (run) => run(),
+        source.signal,
+        media,
+      );
+      if (!bound?.prepareBoundedSeed) {
+        throw new Error("Missing media seed capability");
+      }
+      const seed = await bound.prepareBoundedSeed({
+        assertCurrent: () => {},
+        tokenBudget: imageCount === 1 ? 4096 : 2048,
+      });
+      const imageMessage = seed.find(
+        (message) => message.role === "user" && message.content === "Stored image question",
+      );
+      if (imageCount === 2) {
+        expect(imageMessage).toBeUndefined();
+        expect(compact).toHaveBeenCalledOnce();
+      } else {
+        if (!imageMessage) {
+          throw new Error("Fitting image turn was omitted");
+        }
+        const calls = restore.mock.calls.length;
+        await Promise.all(paths.map((file) => unlink(file)));
+        const restoreFromSeed = bound.prepareContextMedia ?? media.capabilities.prepareContextMedia;
+        const prepared = await restoreFromSeed({ message: imageMessage, maxChars: 8192 });
+        expect(prepared.images).toHaveLength(1);
+        expect(restore).toHaveBeenCalledTimes(calls);
+        expect(compact).not.toHaveBeenCalled();
+        source.abort(new Error("seed source closed"));
+        await expect(restoreFromSeed({ message: imageMessage, maxChars: 8192 })).rejects.toThrow(
+          "seed source closed",
+        );
+        await expect(bound.prepareBoundedSeed({ assertCurrent: () => {} })).rejects.toThrow(
+          "seed source closed",
+        );
+        expect(restore).toHaveBeenCalledTimes(calls);
       }
     });
   },

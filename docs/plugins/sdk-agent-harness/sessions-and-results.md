@@ -96,9 +96,12 @@ persistence. It attempts one host compaction only if bounding would omit
 unsummarized history, then returns the bounded view. Pass the final reserved
 history allowance as `tokenBudget`; valid smaller values narrow the captured
 host budget, while larger, invalid, or non-finite values cannot widen it.
-The host bounds the post-summary result again and retains the original task
-and completed-message handoff during a runtime refresh. Pass the native binding's
-current-authority assertion and cancellation signal. A retired capability
+The bound includes restored text and image costs. Retain the returned message
+instances when calling `prepareContextMedia`: they share the prepared snapshots
+used for selection, without rereading files before injection. The host bounds
+the post-summary result again and retains the original task and completed-message
+handoff during a runtime refresh. Pass the native binding's current-authority
+assertion and cancellation signal. A retired capability
 rejects; it cannot target another session. Explicit context engines retain
 their own projections rather than receiving this host-history capability.
 

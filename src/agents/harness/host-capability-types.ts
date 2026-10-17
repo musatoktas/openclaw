@@ -3,7 +3,11 @@ import type {
   ApprovalDecision,
   ApprovalTerminalReason,
 } from "../../../packages/gateway-protocol/src/schema/approvals.js";
+import type { ImageContent } from "../../../packages/llm-core/src/types.js";
 import type { AnyAgentTool } from "../tools/common.js";
+
+export type AgentHarnessContextMedia = { text?: string; images: ImageContent[] };
+export type AgentHarnessContextMediaRequest = { message: AgentMessage; maxChars: number };
 
 type AgentHarnessHostApprovalResult = Readonly<{
   decision: ApprovalDecision | null | undefined;
@@ -109,10 +113,9 @@ export type AgentHarnessHostCapabilities = Readonly<{
     signal?: AbortSignal;
   }) => Promise<string | undefined>;
   /** Rebuilds retained attachments under this host's captured media policy and run authority. */
-  prepareContextMedia?: (request: {
-    message: import("../runtime/index.js").AgentMessage;
-    maxChars: number;
-  }) => Promise<{ text?: string; images: import("../../llm/types.js").ImageContent[] }>;
+  prepareContextMedia?: (
+    request: AgentHarnessContextMediaRequest,
+  ) => Promise<AgentHarnessContextMedia>;
   /** Stages reply attachments under captured policy and live run authority. */
   prepareReplyMedia?: (
     request: {

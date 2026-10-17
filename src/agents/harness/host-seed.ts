@@ -1,17 +1,22 @@
+import { IMAGE_BLOCK_TOKENS } from "../../../packages/agent-core/src/harness/compaction/compaction-cut-point.js";
 import type { AgentMessage } from "../../../packages/agent-core/src/types.js";
 import { persistCompactionBoundaryWithSessionEntryAsync } from "../../config/sessions/session-accessor.js";
 import { readSessionEntryReadOnlyInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import { withOwnedSessionTranscriptWrites } from "../../config/sessions/transcript-write-context.js";
 import { boundContextEngineAssembly } from "../../context-engine/bounded-context.js";
-import type { ContextEngineRuntimeContext } from "../../context-engine/types.js";
 import { resolveMaxActiveTranscriptBytes } from "../../context-engine/transcript-byte-limit.js";
+import type { ContextEngineRuntimeContext } from "../../context-engine/types.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { requireCompactionWriterEntry } from "../embedded-agent-runner/compaction-successor.js";
 import { attachCompactionAccountingRecorder } from "../embedded-agent-runner/run/compaction-accounting-bridge.js";
 import type { EmbeddedRunAttemptInternalParams } from "../embedded-agent-runner/run/internal-params.js";
 import { normalizeContextTokenBudget } from "../embedded-agent-runner/utils.js";
 import { SessionManager } from "../sessions/session-manager.js";
-import type { AgentHarnessHostCapabilities } from "./host-capability-types.js";
+import type {
+  AgentHarnessHostCapabilities,
+  AgentHarnessContextMedia,
+  AgentHarnessContextMediaRequest,
+} from "./host-capability-types.js";
 
 type SeedSourceScope = <T>(run: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
 
@@ -21,7 +26,8 @@ export function bindBoundedSeed(
   assertActive: () => void,
   withSource: SeedSourceScope,
   hostSignal?: AbortSignal,
-): Pick<AgentHarnessHostCapabilities, "prepareBoundedSeed"> | undefined {
+  media?: { capabilities: Pick<AgentHarnessHostCapabilities, "prepareContextMedia"> },
+): Pick<AgentHarnessHostCapabilities, "prepareBoundedSeed" | "prepareContextMedia"> | undefined {
   const { config, workspaceDir, contextEngine } = input;
   const target = input.preparedSessionTarget?.target ?? input.sessionTarget;
   const maxBytes = resolveMaxActiveTranscriptBytes(config);
@@ -55,6 +61,13 @@ export function bindBoundedSeed(
         : hostSignal
       : input.abortSignal,
   };
+  const prepareMedia = media?.capabilities.prepareContextMedia;
+  const preparedMedia = new WeakMap<AgentMessage, AgentHarnessContextMedia>();
+  const assertSource = () => {
+    assertActive();
+    attempt.abortSignal?.throwIfAborted();
+    attempt.preparedSessionTarget?.assertCurrent();
+  };
   const prepare: NonNullable<AgentHarnessHostCapabilities["prepareBoundedSeed"]> = async ({
     assertCurrent,
     signal: callerSignal,
@@ -66,8 +79,7 @@ export function bindBoundedSeed(
         : (callerSignal ?? attempt.abortSignal);
     const assert = () => {
       signal?.throwIfAborted();
-      assertActive();
-      attempt.preparedSessionTarget?.assertCurrent();
+      assertSource();
       assertCurrent();
     };
     assert();
@@ -103,12 +115,34 @@ export function bindBoundedSeed(
       }
       return history.filter((message) => !isAdmittedUser(message));
     };
+    const select = async (messages: AgentMessage[]) => {
+      const bounded = boundContextEngineAssembly(
+        { messages, estimatedTokens: 0 },
+        maxSeedBytes,
+        tokenBudget,
+      );
+      if (!prepareMedia) {
+        return bounded;
+      }
+      const additionalBytes = new Map<AgentMessage, number>();
+      for (const message of bounded.messages) {
+        if (message.role !== "user") {
+          continue;
+        }
+        const prepared = await prepareMedia({ message, maxChars: tokenBudget * 4 });
+        assert();
+        preparedMedia.set(message, prepared);
+        additionalBytes.set(
+          message,
+          Buffer.byteLength(prepared.text ?? "", "utf8") +
+            (prepared.text ? 2 : 0) +
+            prepared.images.length * IMAGE_BLOCK_TOKENS * 4,
+        );
+      }
+      return boundContextEngineAssembly(bounded, maxSeedBytes, tokenBudget, additionalBytes);
+    };
     let messages = await read();
-    let bounded = boundContextEngineAssembly(
-      { messages, estimatedTokens: 0 },
-      maxSeedBytes,
-      tokenBudget,
-    );
+    let bounded = await select(messages);
     const omitted = messages.length - bounded.messages.length;
     if (
       config?.agents?.defaults?.compaction?.enabled !== false &&
@@ -176,11 +210,7 @@ export function bindBoundedSeed(
       );
       assert();
       messages = await read();
-      bounded = boundContextEngineAssembly(
-        { messages, estimatedTokens: 0 },
-        maxSeedBytes,
-        tokenBudget,
-      );
+      bounded = await select(messages);
     }
     assert();
     if (bounded.messages.length < messages.length) {
@@ -191,5 +221,13 @@ export function bindBoundedSeed(
   };
   return {
     prepareBoundedSeed: (request) => withSource(() => prepare(request), request.signal),
+    prepareContextMedia:
+      prepareMedia &&
+      (async (request: AgentHarnessContextMediaRequest) => {
+        assertSource();
+        const prepared = preparedMedia.get(request.message) ?? (await prepareMedia(request));
+        assertSource();
+        return prepared;
+      }),
   };
 }
