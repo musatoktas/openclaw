@@ -24,7 +24,10 @@ import {
   createStreamingReplyProbeInitScript,
 } from "../ui/src/test-helpers/control-ui-streaming-reply.ts";
 import { createControlUiTeamScaleFixture } from "../ui/src/test-helpers/control-ui-team-scale-fixture.ts";
-import { persistColdLoadWarmState } from "./lib/control-ui-bench-warm-state.ts";
+import {
+  persistColdLoadWarmState,
+  restoreColdLoadWarmState,
+} from "./lib/control-ui-bench-warm-state.ts";
 import {
   mapColdLoadCpuProfile,
   prepareColdLoadTraceEvent,
@@ -536,11 +539,13 @@ try {
     sessionKey: fixture.selectedSessionKey,
     sidebarView: sidebarView === "online" ? "online" : "sessions",
   };
+  await page.evaluate("globalThis.__name = (fn) => fn");
+  const { storage: warmStorage, ...snapshotSave } = await page.evaluate(
+    persistColdLoadWarmState,
+    warmInput,
+  );
   for (let run = 0; run < runs; run++) {
-    await page.evaluate("globalThis.__name = (fn) => fn");
-    const { snapshot, ...snapshotSave } = await page.evaluate(persistColdLoadWarmState, warmInput);
-    // Post-reload live/streaming probes must not change the next reload's cached transcript.
-    warmInput.snapshot ??= snapshot;
+    await restoreColdLoadWarmState(page, warmStorage);
     runTransfer =
       sidebarRowTransfer === "delta" || (sidebarRowTransfer === "interleaved" && run % 2 === 1)
         ? "delta"
