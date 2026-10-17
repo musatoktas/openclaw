@@ -85,7 +85,6 @@ import {
   loadSessionRowBackfillOperations,
   loadAgentAuthProfileOperations,
   loadAgentPluginModelCatalogReadOperations,
-  loadAgentSchemaInspectionOperations,
   type RegisteredAgentWorkerOperations,
 } from "./openclaw-agent-execution-operations.js";
 import {
@@ -434,7 +433,6 @@ function openAgentDatabaseBackend(
   >({
     "authProfiles.read": loadAgentAuthProfileOperations,
     "pluginCatalog.read": loadAgentPluginModelCatalogReadOperations,
-    "database.schema.inspect": loadAgentSchemaInspectionOperations,
     "session.entry.read": loadAgentEntryReadOperations,
     "session.entry.readResult": loadAgentEntryReadOperations,
     "voice.session.read": loadAgentVoiceSessionOperations,

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseEngineSelection } from "../infra/database-engine/context.js";
 import { setSqliteBusyTimeout } from "../infra/sqlite-busy-timeout.js";
 import { readSqliteDatabaseIntegrityVerification } from "../infra/sqlite-database-admission.js";
 import { readSqliteIntegrityFileIdentity } from "../infra/sqlite-file-generation.js";
@@ -26,107 +27,138 @@ if (!process.send || !process.disconnect) {
 const send = (response: AgentSchemaInspectionResponse) => process.send?.(response);
 const disconnect = process.disconnect.bind(process);
 // SAFETY: Only the schema preflight owner sends this private IPC input.
-process.on(
-  "message",
-  (
-    request:
-      | { type: "close" }
-      | {
-          type: "inspect";
-          requestId: number;
-          input: AgentSchemaInspectionInput;
-          snapshot?: AgentSchemaInspectionSnapshot;
-        }
-      | {
-          type: "inspect-state";
-          requestId: number;
-          input: StateSchemaInspectionInput;
-          snapshot?: AgentSchemaInspectionSnapshot;
-        },
-  ) => {
-    if (request.type === "close") {
-      disconnect();
-      return;
-    }
-    const { requestId } = request;
-    try {
-      if (request.type === "inspect-state") {
-        const { input, snapshot } = request;
-        const inspect = (database: DatabaseSync) => inspectStateDatabaseSchema(database, input);
-        let inspection;
-        if (snapshot) {
-          readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
-          inspection = withSqliteSourceReadDatabase(
-            snapshot.pathname,
-            "snapshot",
-            (database) => {
-              readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
-              return inspect(database);
-            },
-            { timeout: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS },
-          );
-          readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
-        } else {
-          inspection = tryInspectSqliteReadOnlyInProcess(input.pathname, inspect)?.value;
-        }
-        send({
-          requestId,
-          ok: true,
-          inspection: null,
-          stateInspection: inspection
-            ? {
-                ...inspection,
-                inspectionErrors: inspection.inspectionErrors.map(
-                  serializeAgentSchemaInspectionError,
-                ),
-              }
-            : null,
-        });
-        return;
+async function inspectRequest(
+  request:
+    | { type: "close" }
+    | {
+        type: "inspect";
+        requestId: number;
+        input: AgentSchemaInspectionInput;
+        snapshot?: AgentSchemaInspectionSnapshot;
+        agentId?: string;
+        databaseEngineSelection?: DatabaseEngineSelection;
       }
+    | {
+        type: "inspect-state";
+        requestId: number;
+        input: StateSchemaInspectionInput;
+        snapshot?: AgentSchemaInspectionSnapshot;
+      },
+) {
+  if (request.type === "close") {
+    disconnect();
+    return;
+  }
+  const { requestId } = request;
+  try {
+    if (request.type === "inspect-state") {
       const { input, snapshot } = request;
-      const readVerification = () =>
-        !snapshot && input.requireStartupMigrationReadiness
-          ? readSqliteDatabaseIntegrityVerification(input.pathname)
-          : undefined;
-      const inspect = (database: DatabaseSync, verification = readVerification()) => {
-        setSqliteBusyTimeout(database, OPENCLAW_SQLITE_BUSY_TIMEOUT_MS);
-        if (input.requireStartupMigrationReadiness) {
-          configureSqliteMaintenanceCache(database);
-        }
-        return inspectAgentDatabaseSchema(database, {
-          ...input,
-          startupIntegrityVerification: verification,
-        });
-      };
+      const inspect = (database: DatabaseSync) => inspectStateDatabaseSchema(database, input);
       let inspection;
       if (snapshot) {
-        // The parent retains its prepared copy until this reader closes the native handle.
         readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
-        inspection = withSqliteSourceReadDatabase(snapshot.pathname, "snapshot", (database) => {
-          readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
-          return inspect(database);
-        });
+        inspection = withSqliteSourceReadDatabase(
+          snapshot.pathname,
+          "snapshot",
+          (database) => {
+            readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
+            return inspect(database);
+          },
+          { timeout: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS },
+        );
         readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
       } else {
-        inspection = tryInspectSqliteReadOnlyInProcess(input.pathname, inspect, {
-          allowClosedWal: readVerification() !== undefined,
-        })?.value;
+        inspection = tryInspectSqliteReadOnlyInProcess(input.pathname, inspect)?.value;
       }
       send({
         requestId,
         ok: true,
-        inspection: inspection
+        inspection: null,
+        stateInspection: inspection
           ? {
               ...inspection,
-              failure: inspection.failure
-                ? serializeAgentSchemaInspectionError(inspection.failure)
-                : undefined,
+              inspectionErrors: inspection.inspectionErrors.map(
+                serializeAgentSchemaInspectionError,
+              ),
             }
           : null,
       });
-    } catch (error) {
-      send({ requestId, ok: false, error: serializeAgentSchemaInspectionError(error) });
+      return;
     }
-  },
-);
+    const { input, snapshot } = request;
+    if (request.databaseEngineSelection) {
+      const agentId = request.agentId;
+      if (!agentId) {
+        throw new Error("PostgreSQL schema inspection requires an agent owner.");
+      }
+      const [admission, engine, readOnly, schema, metadata] = await Promise.all([
+        import("../infra/database-engine/admission-scope.js"),
+        import("../infra/database-engine/context.js"),
+        import("./openclaw-agent-db-readonly-open.js"),
+        import("./openclaw-agent-db-schema-read.js"),
+        import("./openclaw-agent-db-metadata.js"),
+      ]);
+      // Inspection must not leave a runtime worker lease blocking Doctor maintenance.
+      const result = engine.withDatabaseEngineSelection(request.databaseEngineSelection, () =>
+        admission.withEngineStoreAdmission(() =>
+          readOnly.withFreshOpenClawAgentDatabaseReadOnly(
+            ({ db }) => ({
+              version: schema.readAgentDatabaseSchemaVersion(db),
+              integrityGateOutcome: "healthy" as const,
+              agentSchemaMeta: metadata.readExistingAgentSchemaMeta(db),
+            }),
+            { agentId, path: input.pathname, env: input.env },
+          ),
+        ),
+      );
+      send({ requestId, ok: true, inspection: result.found ? result.value : null });
+      return;
+    }
+    const readVerification = () =>
+      !snapshot && input.requireStartupMigrationReadiness
+        ? readSqliteDatabaseIntegrityVerification(input.pathname)
+        : undefined;
+    const inspect = (database: DatabaseSync, verification = readVerification()) => {
+      setSqliteBusyTimeout(database, OPENCLAW_SQLITE_BUSY_TIMEOUT_MS);
+      if (input.requireStartupMigrationReadiness) {
+        configureSqliteMaintenanceCache(database);
+      }
+      return inspectAgentDatabaseSchema(database, {
+        ...input,
+        startupIntegrityVerification: verification,
+      });
+    };
+    let inspection;
+    if (snapshot) {
+      // The parent retains its prepared copy until this reader closes the native handle.
+      readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
+      inspection = withSqliteSourceReadDatabase(snapshot.pathname, "snapshot", (database) => {
+        readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
+        return inspect(database);
+      });
+      readSqliteIntegrityFileIdentity(snapshot.pathname, snapshot.identity);
+    } else {
+      inspection = tryInspectSqliteReadOnlyInProcess(input.pathname, inspect, {
+        allowClosedWal: readVerification() !== undefined,
+      })?.value;
+    }
+    send({
+      requestId,
+      ok: true,
+      inspection: inspection
+        ? {
+            ...inspection,
+            failure: inspection.failure
+              ? serializeAgentSchemaInspectionError(inspection.failure)
+              : undefined,
+          }
+        : null,
+    });
+  } catch (error) {
+    send({ requestId, ok: false, error: serializeAgentSchemaInspectionError(error) });
+  }
+}
+
+process.on("message", (request: Parameters<typeof inspectRequest>[0]) => {
+  void inspectRequest(request);
+});
