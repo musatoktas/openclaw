@@ -8,12 +8,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { withRuntimePreload } from "../../../test/helpers/runtime-preload.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { runCommandWithTimeout } from "../../process/exec.js";
+import { runCommandWithTimeout, type CommandOptions } from "../../process/exec.js";
 import { workspaceQuiescenceArgv } from "./workspace-quiescence-scripts.js";
 import { createWorkerWorkspaceQuiescence } from "./workspace-quiescence.js";
 
 const tempDirs = createTempDirTracker();
-const idleWorkers: ReturnType<typeof spawnIdleWorker>[] = [];
+const idleWorkers: ReturnType<typeof spawn>[] = [];
 const watchdogPids = new Set<number>();
 afterEach(async () => {
   for (const pid of watchdogPids) {
@@ -164,7 +164,7 @@ function runQuiescence(
     timeoutMs: 10_000,
   },
   isolation: Parameters<typeof workspaceQuiescenceArgv>[2] = "dedicated",
-  options: Parameters<typeof runCommandWithTimeout>[1] = {},
+  options: CommandOptions = {},
 ) {
   return runCommandWithTimeout(quiescenceCommand(input.workspace, request, isolation), {
     timeoutMs: 10_000,

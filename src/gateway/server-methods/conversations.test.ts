@@ -87,7 +87,7 @@ function caller(
   return {
     gatewayContext,
     invoke,
-    async query(params = defaults) {
+    query: async (params = defaults) => {
       const respond = vi.fn<RespondFn>();
       await invoke(respond, params);
       return respond;

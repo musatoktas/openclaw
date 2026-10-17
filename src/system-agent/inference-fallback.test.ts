@@ -6,6 +6,19 @@ import type { SystemAgentConfiguredRoute } from "./inference-route.js";
 import type { VerifySetupInferenceResult } from "./setup-inference.js";
 
 const runtime = {} as RuntimeEnv;
+const config: OpenClawConfig = {
+  agents: {
+    defaults: {
+      model: { primary: "zeta/model" },
+      systemAgent: { agentId: "requester" },
+    },
+    entries: {
+      requester: { model: "zeta/model" },
+      beta: { model: "beta/model" },
+      alpha: { model: "alpha/model" },
+    },
+  },
+};
 type FallbackDeps = NonNullable<
   Parameters<typeof verifySystemAgentInferenceWithFallback>[0]["deps"]
 >;

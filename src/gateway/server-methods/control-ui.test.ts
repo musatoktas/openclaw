@@ -589,7 +589,9 @@ describe("controlUi.sessionPullRequests.checks", () => {
         const { respond, send } = fixture("sessionPullRequests.checks", undefined, load);
         await send(
           params,
-          mode !== "missing session" ? { client: identifiedClient("viewer") } : {},
+          mode !== "missing session"
+            ? { client: { ...identifiedClient("viewer"), connId: "viewer" } }
+            : {},
         );
         expect(load).not.toHaveBeenCalled();
         expectUnavailable(respond);

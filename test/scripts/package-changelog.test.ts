@@ -14,6 +14,12 @@ import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
 
+function changelog(strings: TemplateStringsArray, ...values: string[]) {
+  return `${String.raw({ raw: strings }, ...values)
+    .replace(/^\n/u, "")
+    .trimEnd()}\n`;
+}
+
 const notes = (version: string, body: string) => `## ${version}\n${body}\n`;
 const current = notes("2026.5.28", "- Current fix.\n- Complete editorial release notes.");
 const cumulativeChangelog = `# Changelog\nDocs: https://docs.openclaw.ai\n${notes("Unreleased", "- Pending note.")}${current}${notes("2026.5.27", "- Older highlight.")}`;

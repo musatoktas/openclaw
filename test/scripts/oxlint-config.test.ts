@@ -13,7 +13,7 @@ const { createTempDir } = createScriptTestHarness();
 function runTool(
   root: string,
   args: string[],
-  options: SpawnSyncOptionsWithStringEncoding = { encoding: "utf8" },
+  options: Omit<SpawnSyncOptionsWithStringEncoding, "encoding"> = {},
 ) {
   return spawnSync(process.execPath, args, { cwd: root, encoding: "utf8", ...options });
 }

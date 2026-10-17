@@ -506,13 +506,20 @@ process.kill = function(pid, signal) {
     await fs.writeFile(path.join(manifestRoot, `${legacyDigest}.json`), legacyRaw);
     await fs.rm(firstTurnPath);
 
-    // This fixture contains only non-executable regular files.
-    const acceptedRaw = JSON.stringify({
-      ...legacy,
-      entries: legacy.entries
-        .toReversed()
-        .map((entry) => Object.assign({}, entry, { mode: 0o644 })),
-    });
+    const legacyCanonical = structuredClone(legacy);
+    for (const entry of legacyCanonical.entries) {
+      if (entry.type === "directory") {
+        entry.mode = 0o700;
+      } else if (entry.type === "symlink") {
+        entry.mode = 0o777;
+      } else {
+        entry.mode = (entry.mode & 0o111) === 0 ? 0o644 : 0o755;
+      }
+    }
+    legacyCanonical.entries.sort((left, right) =>
+      left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+    );
+    const acceptedRaw = JSON.stringify(legacyCanonical);
     const acceptedDigest = createHash("sha256").update(acceptedRaw).digest("hex");
     const acceptedRef = `sha256:${acceptedDigest}`;
     const acceptedPath = path.join(manifestRoot, `${acceptedDigest}.json`);

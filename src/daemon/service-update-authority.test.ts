@@ -126,7 +126,9 @@ it.each([true, false])("retains Doctor compensation custody (%s)", async (update
   let late!: Promise<void>;
   const restore = vi.fn(async () => {
     expect(() => assertFallbackAllowed("detached launch")).toThrow("not an update-owned");
-    late = ready.promise.then(() => assertUpdateCurrent());
+    late = ready.promise.then(() => {
+      assertUpdateCurrent();
+    });
     return true;
   });
   const install = () =>

@@ -26,19 +26,6 @@ const lifetime = { assertCurrent() {}, assertReadable() {} };
 const targetKey = "agent:research:dashboard:durable-target";
 const actorKey = "agent:main:dashboard:incognito-send-requester";
 const nativeKey = "agent:native:dashboard:incognito-send-requester";
-const privateEntry = (sessionId = "actor-requester") => ({
-  sessionId,
-  lifecycleRevision: "actor-generation",
-  updatedAt: 1,
-  spawnDepth: 1,
-  incognito: true,
-});
-const targetSession = {
-  key: targetKey,
-  agentId: "research",
-  sessionId: "durable-target",
-  kind: "direct",
-};
 const config = {
   agents: { ownership: "explicit", entries: { main: {}, research: {}, native: {} } },
   session: { mainKey: "main", scope: "per-sender" },
@@ -46,6 +33,7 @@ const config = {
 } satisfies OpenClawConfig;
 let state: OpenClawTestState;
 let actor: SessionActorStorageBinding;
+const owners: ReturnType<typeof memorySessionActorOwners.get>[] = [];
 const handles: SessionActorStorageBinding[] = [];
 
 beforeAll(async () => {
@@ -64,6 +52,7 @@ beforeAll(async () => {
       agentId,
       path: resolveIncognitoOpenClawAgentSqlitePath({ agentId, env: state.env }),
     });
+    owners.push(owner);
     const handle = await owner.acquire({ database: owner.identity, sessionKey }, lifetime);
     const binding = { actor: handle, authority, agentId, path: owner.path };
     handles.push(binding);
@@ -71,7 +60,15 @@ beforeAll(async () => {
       await handle.storage!.mutate(
         {
           type: "session.entry.create",
-          input: { entry: privateEntry(sessionId) },
+          input: {
+            entry: {
+              sessionId,
+              lifecycleRevision: "actor-generation",
+              updatedAt: 1,
+              spawnDepth: 1,
+              incognito: true,
+            },
+          },
         },
         authority,
       ),
@@ -85,26 +82,42 @@ afterAll(async () => {
   for (const binding of handles) {
     await binding.actor.release();
   }
+  for (const owner of owners) {
+    memorySessionActorOwners.closeDatabase(owner);
+  }
   await state.cleanup();
 });
 
 function gateway(beforeAdmission?: () => Promise<void>) {
-  return vi.fn(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-    switch (request.method) {
-      case "sessions.resolve":
-        return { key: targetKey, agentId: "research" };
-      case "sessions.list":
-        return { sessions: [targetSession] };
-      case "sessions.describe":
-        return { session: targetSession };
-      case "agent":
-        await beforeAdmission?.();
-        request.assertDispatchCurrent?.();
-        return { runId: "accepted-private-request", status: "accepted" };
-      default:
-        throw new Error(`Unexpected Gateway request: ${request.method}`);
-    }
-  });
+  return vi
+    .fn()
+    .mockImplementation(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+      switch (request.method) {
+        case "sessions.resolve":
+          return { key: targetKey, agentId: "research" };
+        case "sessions.list":
+          return {
+            sessions: [
+              { key: targetKey, agentId: "research", sessionId: "durable-target", kind: "direct" },
+            ],
+          };
+        case "sessions.describe":
+          return {
+            session: {
+              key: targetKey,
+              agentId: "research",
+              sessionId: "durable-target",
+              kind: "direct",
+            },
+          };
+        case "agent":
+          await beforeAdmission?.();
+          request.assertDispatchCurrent?.();
+          return { runId: "accepted-private-request", status: "accepted" };
+        default:
+          throw new Error(`Unexpected Gateway request: ${request.method}`);
+      }
+    });
 }
 
 it.each([
@@ -142,7 +155,11 @@ it.each([
         await replaceSessionEntry(
           { agentId: "main", sessionKey: actorKey },
           {
-            ...privateEntry(change === "incarnation" ? "replacement-requester" : "actor-requester"),
+            sessionId: change === "incarnation" ? "replacement-requester" : "actor-requester",
+            lifecycleRevision: "actor-generation",
+            updatedAt: 1,
+            spawnDepth: 1,
+            incognito: true,
             ...(change === "policy" ? { communication: { send: "never" } } : {}),
           },
         );
@@ -173,20 +190,36 @@ it.each([
           ? { status: "accepted", sessionKey: targetKey, delivery: { status: "skipped" } }
           : { status: "error", error: expect.stringMatching(/changed|no longer current/) },
       );
-      const dispatches = callGateway.mock.calls.filter(([request]) => request.method === "agent");
-      expect(dispatches).toHaveLength(1);
-      expect(dispatches[0]?.[0].params).toMatchObject({
-        sessionKey: targetKey,
-        agentId: "research",
-        inputProvenance: { sourceSessionKey: requesterKey, sourceRole: "subagent" },
-      });
+      expect(callGateway.mock.calls.filter(([request]) => request.method === "agent")).toEqual([
+        [
+          expect.objectContaining({
+            params: expect.objectContaining({
+              sessionKey: targetKey,
+              agentId: "research",
+              inputProvenance: expect.objectContaining({
+                sourceSessionKey: requesterKey,
+                sourceRole: "subagent",
+              }),
+            }),
+          }),
+        ],
+      ]);
       expect(requesterSql).toEqual([]);
       expect(memorySessionActorOwners.list()).toEqual(beforeOwners);
     } finally {
       await work.drain();
       observers.forEach((observer) => observer.mockRestore());
       if (change !== "none") {
-        await replaceSessionEntry({ agentId: "main", sessionKey: actorKey }, privateEntry());
+        await replaceSessionEntry(
+          { agentId: "main", sessionKey: actorKey },
+          {
+            sessionId: "actor-requester",
+            lifecycleRevision: "actor-generation",
+            updatedAt: 1,
+            spawnDepth: 1,
+            incognito: true,
+          },
+        );
       }
     }
   },

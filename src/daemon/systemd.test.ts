@@ -1531,7 +1531,8 @@ describe("stageSystemdService", () => {
       "ExecStart=/opt/operator/openclaw gateway run --operator-flag",
     );
     expect(backup).toContain("CUSTOM_SETTING=kept");
-    expect(backup).toContain("Environment=FROM_SINGLE=kept\nEnvironment=\n");
+    expect(backup.split("\n")).toContain("Environment=FROM_SINGLE=kept");
+    expect(backup.split("\n")).toContain("Environment=");
     expect(backup).not.toContain("FILE_ONLY_SECRET");
     expect(unit).not.toContain("fresh-file-value");
     expect(unitStat.mode & 0o777).toBe(0o600);

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expect } from "vitest";
-import { runCommandWithTimeout } from "../../process/exec.js";
+import { runCommandWithTimeout, type CommandOptions } from "../../process/exec.js";
 import type { WorkerWorkspaceManifest } from "./workspace-manifest.js";
 import { REMOTE_WORKSPACE_MANIFEST_JS } from "./workspace-sync-scripts.js";
 
@@ -27,7 +27,7 @@ export async function expectWorkspaceFiles(root: string, files: Record<string, s
 }
 
 export function workspaceScriptRunner(script: string, workspace: string, baseEnv = process.env) {
-  return (args: string[] = [], options: Parameters<typeof runCommandWithTimeout>[1] = {}) =>
+  return (args: string[] = [], options: CommandOptions = {}) =>
     runCommandWithTimeout([process.execPath, "-e", script, workspace, ...args], {
       timeoutMs: 10_000,
       baseEnv,

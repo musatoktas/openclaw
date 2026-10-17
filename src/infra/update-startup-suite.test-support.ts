@@ -5,11 +5,11 @@ import type { UpdateRunRecord } from "./update-run-record.js";
 import type { UpdateRunResult } from "./update-run-result.js";
 
 export function pauseAt<T>(
-  entered: ReturnType<typeof createDeferred>,
+  entered: ReturnType<typeof createDeferred<void>>,
   result: ReturnType<typeof createDeferred<T>>,
 ) {
   return () => {
-    entered.resolve();
+    entered.resolve(undefined);
     return result.promise;
   };
 }

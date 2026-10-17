@@ -315,7 +315,7 @@ describe("worker tunnel manager", () => {
         },
       );
       const resetDispatched = createDeferred();
-      const run = fake.runner.run;
+      const run = fake.runner.run.bind(fake.runner);
       fake.runner.run = (argv, options) => {
         const operation = run(argv, options);
         if (

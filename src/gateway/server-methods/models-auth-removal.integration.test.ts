@@ -171,9 +171,13 @@ describe("models.authLogout with a concurrent registered config set", () => {
             });
           }
         }
-        expect(settled.parsed.models?.providers).toMatchObject({
-          FIXTURE: { apiKey: "${INLINE_REMOVAL_TEST_KEY}" },
-          ...(conflict ? { fixture: { apiKey: replacement } } : {}),
+        expect(settled.parsed).toMatchObject({
+          models: {
+            providers: {
+              FIXTURE: { apiKey: "${INLINE_REMOVAL_TEST_KEY}" },
+              ...(conflict ? { fixture: { apiKey: replacement } } : {}),
+            },
+          },
         });
         expect(settled.sourceConfig.models?.providers?.fixture?.apiKey).toEqual(
           conflict ? selectedKey : undefined,

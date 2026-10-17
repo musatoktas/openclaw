@@ -46,8 +46,8 @@ function expectNotFound(respond: ReturnType<typeof vi.fn<RespondFn>>, jobId: str
 function makeRun(
   jobId: string,
   runId: string,
-  fields: Partial<CronRunLogEntry> = {},
-): CronRunLogEntry {
+  fields: Omit<Partial<CronRunLogEntry>, "runId"> = {},
+): CronRunLogEntry & { runId: string } {
   return { action: "finished", jobId, runId, status: "ok", ts: Date.now(), ...fields };
 }
 function createOwnedSession(
@@ -220,7 +220,7 @@ describe("cron.runs session visibility", () => {
             "research-main",
             visible ? viewer : owner,
           );
-          const entry: CronRunLogEntry = makeRun(jobId, "retained-main-run", {
+          const entry = makeRun(jobId, "retained-main-run", {
             sessionKey: "agent:main:main",
             summary: "Retained run before the job changed agents",
           });
@@ -450,7 +450,7 @@ describe("cron.runs session visibility", () => {
           const unavailableId = "job" in unavailable ? unavailable.job.id : unavailable.id;
           expectNotFound(await query({ id: unavailableId, agentId: "main" }), unavailableId);
           await cron.remove(unavailableId);
-          const historicalEntry: CronRunLogEntry = makeRun(jobId, "historical-ops-run", {
+          const historicalEntry = makeRun(jobId, "historical-ops-run", {
             summary: "run before the job changed agents",
           });
           recordRun(historicalEntry, "historical-ops-run", "ops");
@@ -468,7 +468,7 @@ describe("cron.runs session visibility", () => {
             [foreignJobId, "hidden-unavailable"],
             [jobId, "filtered-unavailable"],
           ] as const) {
-            const entry: CronRunLogEntry = makeRun(id, runId, {
+            const entry = makeRun(id, runId, {
               sessionKey: `agent:broken:${runId}`,
               status: "error",
             });
@@ -492,7 +492,7 @@ describe("cron.runs session visibility", () => {
   it("refreshes run and job visibility after session creation and deletion", () =>
     withCronHistory(async ({ jobId, query, owner, rows, recordRun }) => {
       const sessionKey = "agent:main:history-created";
-      const entry: CronRunLogEntry = makeRun(jobId, "created-session-run", {
+      const entry = makeRun(jobId, "created-session-run", {
         sessionKey,
         ts: Math.max(...rows.map((row) => row.endedAt ?? row.startedAt)) + 1,
       });

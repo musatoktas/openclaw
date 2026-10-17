@@ -217,7 +217,10 @@ describe("buildOnboardingWelcome", () => {
   });
 
   it("ignores a blank authored workspace", async () => {
-    mocks.sourceConfig.agents.defaults.workspace = "   ";
+    mocks.sourceConfig.agents = {
+      ...mocks.sourceConfig.agents,
+      defaults: { ...mocks.sourceConfig.agents?.defaults, workspace: "   " },
+    };
     const engine = createWelcomeEngine("openai/gpt-5.5");
     const { propose } = engine;
 
