@@ -99,7 +99,10 @@ export function bindPostgresMemoryPublication(
   }
   let cacheSize: number | undefined;
   const readCacheSize = () => (cacheSize ??= countMemoryEmbeddingCache(db));
-  const write = <T>(run: () => T): MemoryPublicationResult<T> => {
+  const write = <T>(
+    run: () => T,
+    options?: { publishFacts: boolean },
+  ): MemoryPublicationResult<T> => {
     let entered = false;
     let committed = false;
     const previousFacts = rebuilding && { ...rebuilding };
@@ -126,6 +129,9 @@ export function bindPostgresMemoryPublication(
           },
         },
       );
+      if (options?.publishFacts) {
+        return { ok: true, value, facts: rebuilding ?? readMemoryDatabaseFacts(db) };
+      }
       return { ok: true, value };
     } catch (error) {
       if (!committed) {
@@ -156,8 +162,6 @@ export function bindPostgresMemoryPublication(
       }
     }
   };
-  const withFacts = <T>(result: MemoryPublicationResult<T>): MemoryPublicationResult<T> =>
-    result.ok ? { ...result, facts: rebuilding ?? readMemoryDatabaseFacts(db) } : result;
   const ensureSpool = () => {
     if (created) {
       return;
@@ -263,8 +267,8 @@ export function bindPostgresMemoryPublication(
     typeof bindSqliteWorkerDatabase<MemoryPublicationOperations>
   >[1]["execute"] = (command) => {
     if (command.type === "database.reset") {
-      return withFacts(
-        write(() => {
+      return write(
+        () => {
           const query = getNodeSqliteKysely<
             Record<(typeof MEMORY_INDEX_DERIVED_TABLES)[number], unknown> & {
               memory_index_state: { id: number; revision: number };
@@ -291,7 +295,8 @@ export function bindPostgresMemoryPublication(
             );
           }
           return changed;
-        }),
+        },
+        { publishFacts: true },
       );
     }
     if (stageId && !stages.has(stageId) && command.type !== "database.stage.start") {
@@ -357,8 +362,8 @@ export function bindPostgresMemoryPublication(
     }
     if (command.type === "database.stage.start") {
       retainState = stageId !== undefined;
-      return withFacts(
-        write(() => {
+      return write(
+        () => {
           ensureSpool();
           rebuilding = {
             ...readMemoryDatabaseFacts(db),
@@ -369,12 +374,13 @@ export function bindPostgresMemoryPublication(
             invalidatedSources: [],
             vectorState: { state: "empty" },
           };
-        }),
+        },
+        { publishFacts: true },
       );
     }
     if (command.type === "database.stage.publish") {
-      return withFacts(
-        write(() => {
+      return write(
+        () => {
           if (!rebuilding || !metadata) {
             throw new Error("Memory reindex stage is incomplete");
           }
@@ -410,7 +416,8 @@ export function bindPostgresMemoryPublication(
             markMemoryVectorIndexClean(db);
           }
           rebuilding = undefined;
-        }),
+        },
+        { publishFacts: true },
       );
     }
     if (command.type === "index.facts") {
@@ -455,19 +462,20 @@ export function bindPostgresMemoryPublication(
     if (command.type === "index.upgradeProviderKey") {
       return rebuilding
         ? { ok: true, value: false }
-        : withFacts(
-            write(() => {
+        : write(
+            () => {
               const changed = upgradeMemoryIndexProviderKey(db, command.input);
               if (changed) {
                 cacheSize = undefined;
               }
               return changed;
-            }),
+            },
+            { publishFacts: true },
           );
     }
     if (command.type === "index.writeMetadata") {
-      return withFacts(
-        write(() => {
+      return write(
+        () => {
           if (rebuilding) {
             metadata = command.input;
             rebuilding.meta = metadata;
@@ -475,21 +483,22 @@ export function bindPostgresMemoryPublication(
           } else {
             writeMemoryIndexMetadata(db, command.input);
           }
-        }),
+        },
+        { publishFacts: true },
       );
     }
     if (command.type === "source.refresh") {
       return rebuilding
         ? { ok: true, value: false }
-        : withFacts(write(() => refreshMemorySessionSourceState(db, command.input)));
+        : write(() => refreshMemorySessionSourceState(db, command.input), { publishFacts: true });
     }
     if (command.type === "source.delete") {
       return rebuilding
         ? { ok: true, value: false }
-        : withFacts(
-            write(() =>
+        : write(
+            () =>
               new MemorySourceIndexKernel(db, command.input.state).deleteIfCurrent(command.input),
-            ),
+            { publishFacts: true },
           );
     }
     if (command.type === "cache.clear") {
@@ -550,8 +559,8 @@ export function bindPostgresMemoryPublication(
         return true;
       });
     }
-    return withFacts(
-      write(() => {
+    return write(
+      () => {
         const sources =
           command.type === "source.replace.group"
             ? command.input.sources
@@ -573,7 +582,8 @@ export function bindPostgresMemoryPublication(
           }
         }
         return true;
-      }),
+      },
+      { publishFacts: true },
     );
   };
   return bindSqliteWorkerDatabase<MemoryPublicationOperations>(db, {

@@ -294,6 +294,30 @@ describe.skipIf(!connection)("PostgreSQL memory publication worker", () => {
     }
   });
 
+  it("reports a committed publication when its subsequent facts read fails", () =>
+    admitted(() => {
+      const query = pg().query.bind(pg());
+      const queried = vi.spyOn(pg(), "query").mockImplementation((sql, parameters) => {
+        if (sql.includes('as "hasIndexedChunks"')) {
+          throw new Error("facts read failed");
+        }
+        return query(sql, parameters);
+      });
+      try {
+        expect(publishInline(replacement("committed"))).toMatchObject({
+          ok: false,
+          entered: true,
+          committed: true,
+          error: { message: "facts read failed" },
+        });
+        expect(rows()).toEqual([
+          { path: "memory/committed.md", text: "committed searchable", vector: "[1,0,0]" },
+        ]);
+      } finally {
+        queried.mockRestore();
+      }
+    }));
+
   it("atomically resets derived rows while retaining admitted search schema and revision", () =>
     admitted(() => {
       expect(publishInline(replacement("reset-me"))).toMatchObject({ ok: true });
