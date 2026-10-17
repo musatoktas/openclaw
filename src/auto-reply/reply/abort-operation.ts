@@ -442,7 +442,7 @@ export async function executeFastAbortRequest(
                   })
                   .then((resolution) => {
                     if (resolution.kind === "none") {
-                      return;
+                      return undefined;
                     }
                     return acpManager.cancelSession({
                       cfg,
