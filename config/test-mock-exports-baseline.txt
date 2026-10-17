@@ -3229,7 +3229,6 @@
 ["src/auto-reply/reply.triggers.trigger-handling.stages-inbound-media-into-sandbox-workspace.test.ts","../agents/sandbox-paths.js","5d7879b6cfe366f225932280fbf91099922b098a117fe0e197d887c13ef07615",1]
 ["src/auto-reply/reply.triggers.trigger-handling.stages-inbound-media-into-sandbox-workspace.test.ts","../media/channel-inbound-roots.js","a566d678dd195c324861b6b41c833038a235b0b23afe519088c248f90dda6b01",1]
 ["src/auto-reply/reply/abort.lazy.test.ts","../../agents/subagents/registry/subagent-control.js","01c4e81b02587ba6db02301bb4650dab4adcece1e04894577591c1924af7c9db",1]
-["src/auto-reply/reply/abort.test.ts","../../acp/control-plane/manager.js","99a031b4b5b75f4b6db2f0ecac4abb83d6dcaa3ac482ea9d5eeaaa1479fbe988",1]
 ["src/auto-reply/reply/abort.test.ts","../../agents/embedded-agent-runner/active-run-projections.js","851913050350db10505c86372b1bf77138611dcbb9a008ee46ec375a3c39d1af",1]
 ["src/auto-reply/reply/abort.test.ts","../../agents/embedded-agent-runner/runs.js","082b3c21a8d618262d033b1c51ec4be4a25b2be0e1778468dfd13db5d6b025a7",1]
 ["src/auto-reply/reply/abort.test.ts","../../agents/embedded-agent.js","d07bbb57ff1e1936538eb50d60679333f2bd73f96c315c1f541b6473a2dcab3a",1]
