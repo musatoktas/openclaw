@@ -29,6 +29,8 @@ function seed(database: DatabaseSync): void {
       VALUES ('agent:main:test', 'session', '{"sessionId":"session","updatedAt":1}', 1);
     INSERT INTO session_windows (session_id, session_key, created_at, updated_at)
       VALUES ('session', 'agent:main:test', 1, 1);
+    INSERT INTO transcript_events (session_id, seq, event_json, created_at)
+      VALUES ('session', 1, '{"type":"message","message":{"role":"user"}}', 1);
     INSERT INTO cache_entries (scope, key, blob, updated_at)
       VALUES ('unrelated', 'bytes', X'000100FF', 3);
     INSERT INTO acp_parent_stream_events (session_id, run_id, seq, event_json, created_at)
