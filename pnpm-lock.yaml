@@ -820,9 +820,9 @@ importers:
 
   extensions/browser:
     dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: 1.32.1
-        version: 1.32.1(supports-color@10.2.2)(zod@4.6.5)
+      '@modelcontextprotocol/client':
+        specifier: 2.3.1
+        version: 2.3.1
       chrome-devtools-mcp:
         specifier: 1.10.1
         version: 1.10.1(patch_hash=d31d6e7e187ea9fd4dad87ed3ad08073c77ffcfddd52bc4761b39a2dfce0ac1e)
@@ -2077,9 +2077,9 @@ importers:
       '@copilotkit/aimock':
         specifier: 1.44.0
         version: 1.44.0(vitest@5.0.3)
-      '@modelcontextprotocol/sdk':
-        specifier: 1.32.1
-        version: 1.32.1(supports-color@10.2.2)(zod@4.6.5)
+      '@modelcontextprotocol/client':
+        specifier: 2.3.1
+        version: 2.3.1
       '@openclaw/crabline':
         specifier: 0.1.29
         version: 0.1.29
