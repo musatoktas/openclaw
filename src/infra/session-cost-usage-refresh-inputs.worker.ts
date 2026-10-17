@@ -9,6 +9,10 @@ import { listTranscriptArchivesFromDatabase } from "../config/sessions/session-a
 import type { SessionTranscriptStats } from "../config/sessions/session-accessor.sqlite-contract.js";
 import { getSessionKysely } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { readTranscriptStatsBatchFromDatabase } from "../config/sessions/session-accessor.sqlite-transcript-stats.js";
+import {
+  assertCanonicalSqliteSessionKeysCurrent,
+  readWithCanonicalSessionAdmission,
+} from "../config/sessions/session-canonical-key.js";
 import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import { SessionMetadataUnavailableError } from "../state/session-metadata-unavailable-error.js";
@@ -110,22 +114,25 @@ export function createUsageCostCollectionAccess(params: {
       return readStore(agentId, storePath, () => {
         const result = withOpenClawAgentDatabaseReadOnly(
           (opened) =>
-            executeSqliteQuerySync(
-              opened.db,
-              getSessionKysely(opened.db)
-                .selectFrom("session_windows")
-                .select(["session_id", "session_key", "transcript_updated_at"])
-                .where("transcript_updated_at", "is not", null)
-                .$narrowType<{ transcript_updated_at: number }>()
-                .orderBy("transcript_updated_at", "desc")
-                .orderBy("session_id", "asc"),
-            )
-              .rows.filter((row) => !isInternalSessionEffectsKey(row.session_key))
-              .map((row) => ({
-                agentId: resolveAgentIdFromSessionKey(row.session_key, opened.agentId),
-                sessionId: row.session_id,
-                updatedAtMs: row.transcript_updated_at,
-              })),
+            readWithCanonicalSessionAdmission(opened, () => {
+              assertCanonicalSqliteSessionKeysCurrent(opened);
+              return executeSqliteQuerySync(
+                opened.db,
+                getSessionKysely(opened.db)
+                  .selectFrom("session_windows")
+                  .select(["session_id", "session_key", "transcript_updated_at"])
+                  .where("transcript_updated_at", "is not", null)
+                  .$narrowType<{ transcript_updated_at: number }>()
+                  .orderBy("transcript_updated_at", "desc")
+                  .orderBy("session_id", "asc"),
+              )
+                .rows.filter((row) => !isInternalSessionEffectsKey(row.session_key))
+                .map((row) => ({
+                  agentId: resolveAgentIdFromSessionKey(row.session_key, opened.agentId),
+                  sessionId: row.session_id,
+                  updatedAtMs: row.transcript_updated_at,
+                }));
+            }),
           { ...database, env },
         );
         return result.found ? result.value : [];

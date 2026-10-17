@@ -22,9 +22,11 @@ import {
   appendTranscriptEventsInTransaction,
   rewriteSqliteTranscriptEventRowsInTransaction,
 } from "../config/sessions/session-accessor.sqlite-transcript-store.js";
+import { markCanonicalSessionValidationPending } from "../config/sessions/session-canonical-key.js";
 import { CURRENT_SESSION_VERSION } from "../config/sessions/version.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import {
+  closeOpenClawAgentDatabasesAsync,
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
 } from "../state/openclaw-agent-db.js";
@@ -76,6 +78,32 @@ function transcriptText(sessionId: string, entry: unknown): string {
 }
 
 describe("session cost usage worker I/O", () => {
+  it("refuses unvalidated legacy session keys before assigning usage ownership", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const database = openOpenClawAgentDatabase({ agentId: "main" });
+      database.db
+        .prepare(
+          "INSERT INTO session_nodes (session_key, current_session_id, entry_json, entry_valid, updated_at) VALUES (?, ?, ?, 1, 1)",
+        )
+        .run(
+          "legacy",
+          "legacy-session",
+          JSON.stringify({ sessionId: "legacy-session", updatedAt: 1 }),
+        );
+      database.db
+        .prepare(
+          "INSERT INTO session_windows (session_id, session_key, created_at, updated_at, transcript_updated_at) VALUES (?, ?, 1, 1, 1)",
+        )
+        .run("legacy-session", "legacy");
+      markCanonicalSessionValidationPending(database, ["legacy"]);
+      await closeOpenClawAgentDatabasesAsync();
+
+      await expect(discoverAllSessions({ agentId: "main" })).rejects.toThrow(
+        "openclaw doctor --fix",
+      );
+    });
+  });
+
   it("reuses discovered inputs and rollups across append, rewrite, and rollup replacement", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const probe = await observeUsageWorkerReads(state.stateDir, []);
