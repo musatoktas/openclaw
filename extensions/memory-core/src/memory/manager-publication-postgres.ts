@@ -13,6 +13,7 @@ import {
   bindSqliteWorkerDatabase,
   executeSqliteQuerySync,
   getNodeSqliteKysely,
+  readSqliteDatabaseScopedWriteToken,
   tableExists,
 } from "openclaw/plugin-sdk/sqlite-worker-runtime";
 import { hasMemorySessionTombstone } from "../memory-session-tombstones.js";
@@ -34,6 +35,7 @@ import type {
   MemoryPublicationOperations,
   MemoryPublicationResult,
 } from "./manager-publication-task.js";
+import { MEMORY_EMBEDDING_CACHE_WRITE_SCOPE } from "./manager-publication-task.js";
 import type { MemoryIndexMeta } from "./manager-reindex-state.js";
 import { readMemoryDatabaseFacts, type MemoryDatabaseFacts } from "./manager-retrieval-read.js";
 import { memoryTextSearchSchema, memoryVectorSearchSchema } from "./manager-search-schema.js";
@@ -57,6 +59,7 @@ type StagingState = {
   metadata: MemoryIndexMeta | undefined;
 };
 const reindexStages = new WeakMap<EngineConnection, Map<string, StagingState>>();
+const embeddingCacheSizes = new WeakMap<EngineConnection, { size: number; token?: string }>();
 
 /** A connection-local spool bounds transfer memory and disappears with its owning worker. */
 export function bindPostgresMemoryPublication(
@@ -94,12 +97,18 @@ export function bindPostgresMemoryPublication(
   if (stageId && stages.has(stageId)) {
     restore(stages.get(stageId)!);
   }
+  let cacheSize: number | undefined;
+  const readCacheSize = () => (cacheSize ??= countMemoryEmbeddingCache(db));
   const write = <T>(run: () => T): MemoryPublicationResult<T> => {
     let entered = false;
     let committed = false;
     const previousFacts = rebuilding && { ...rebuilding };
     const previousMetadata = metadata;
     const previousCreated = created;
+    const retained = embeddingCacheSizes.get(db);
+    const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
+    cacheSize = retained?.token === token ? retained?.size : undefined;
+    const previousCacheSize = cacheSize;
     try {
       const value = db.runTransaction(
         () => {
@@ -121,6 +130,7 @@ export function bindPostgresMemoryPublication(
         rebuilding = previousFacts;
         metadata = previousMetadata;
         created = previousCreated;
+        cacheSize = previousCacheSize;
       }
       return {
         ok: false,
@@ -131,6 +141,17 @@ export function bindPostgresMemoryPublication(
           message: error instanceof Error ? error.message : String(error),
         },
       };
+    } finally {
+      // PG commits publish broad receipts. Carry our count across owned writes,
+      // but recount after another owner (for example session forget) changes the store.
+      if (cacheSize === undefined) {
+        embeddingCacheSizes.delete(db);
+      } else {
+        embeddingCacheSizes.set(db, {
+          size: cacheSize,
+          token: readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE),
+        });
+      }
     }
   };
   const ensureSpool = () => {
@@ -141,6 +162,14 @@ export function bindPostgresMemoryPublication(
       `CREATE TEMP TABLE ${spool} (ordinal BIGINT GENERATED ALWAYS AS IDENTITY, lane TEXT NOT NULL, header TEXT, json TEXT, last INTEGER, PRIMARY KEY (lane, ordinal))`,
     );
     created = true;
+  };
+  const dropSpool = (name: string) => {
+    const retained = embeddingCacheSizes.get(db);
+    const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
+    db.exec(`DROP TABLE ${name}`);
+    if (retained && retained.token === token) {
+      retained.token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
+    }
   };
   const append = (
     lane: string,
@@ -246,6 +275,7 @@ export function bindPostgresMemoryPublication(
           const result = executeSqliteQuerySync(db, query.deleteFrom(table));
           changed ||= (result.numAffectedRows ?? 0n) > 0n;
         }
+        cacheSize = 0;
         if (changed) {
           executeSqliteQuerySync(
             db,
@@ -264,7 +294,7 @@ export function bindPostgresMemoryPublication(
     if (command.type === "database.stage.discard") {
       const retained = stages.get(command.input.stageId);
       if (retained?.created) {
-        db.exec(`DROP TABLE ${retained.spool}`);
+        dropSpool(retained.spool);
       }
       stages.delete(command.input.stageId);
       if (bindingStageId === command.input.stageId) {
@@ -415,7 +445,13 @@ export function bindPostgresMemoryPublication(
     if (command.type === "index.upgradeProviderKey") {
       return rebuilding
         ? { ok: true, value: false }
-        : write(() => upgradeMemoryIndexProviderKey(db, command.input));
+        : write(() => {
+            const changed = upgradeMemoryIndexProviderKey(db, command.input);
+            if (changed) {
+              cacheSize = undefined;
+            }
+            return changed;
+          });
     }
     if (command.type === "index.writeMetadata") {
       return write(() => {
@@ -442,17 +478,20 @@ export function bindPostgresMemoryPublication(
     }
     if (command.type === "cache.clear") {
       return write(() => {
-        clearMemoryEmbeddingCacheIdentities(db, command.input.identities);
+        const removed = clearMemoryEmbeddingCacheIdentities(db, command.input.identities);
+        if (cacheSize !== undefined) {
+          cacheSize -= removed;
+        }
         return true;
       });
     }
     if (command.type === "cache.prune") {
       return write(() => {
-        const size = countMemoryEmbeddingCache(db);
+        const size = readCacheSize();
         if (size <= command.input.maxEntries) {
           return false;
         }
-        pruneMemoryEmbeddingCache(db, size, command.input.maxEntries);
+        cacheSize = pruneMemoryEmbeddingCache(db, size, command.input.maxEntries);
         return true;
       });
     }
@@ -479,12 +518,18 @@ export function bindPostgresMemoryPublication(
             }
           }
         }
-        upsertMemoryEmbeddingCache({
+        const bounded =
+          typeof cacheHeader.maxEntries === "number" &&
+          Number.isFinite(cacheHeader.maxEntries) &&
+          cacheHeader.maxEntries > 0;
+        const nextSize = upsertMemoryEmbeddingCache({
           ...cacheHeader,
           db,
-          cacheSize: countMemoryEmbeddingCache(db),
+          cacheSize: bounded ? readCacheSize() : 0,
           entries,
         });
+        // Unbounded upserts return an upper bound because existing hashes can be replaced.
+        cacheSize = bounded ? nextSize : undefined;
         return true;
       });
     }
@@ -524,7 +569,7 @@ export function bindPostgresMemoryPublication(
     },
     close() {
       if (!bindingStageId && created && db.isOpen) {
-        db.exec(`DROP TABLE ${spool}`);
+        dropSpool(spool);
       }
     },
   });

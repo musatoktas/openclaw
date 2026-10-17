@@ -531,6 +531,114 @@ describe.skipIf(!connection)("PostgreSQL memory publication worker", () => {
       backend.execute({ type: "database.stage.discard", input: { stageId } });
     }));
 
+  it("retains an exact bounded cache count across bindings, rollback, and other writers", () =>
+    admitted(() => {
+      const statements: string[] = [];
+      const observations = channel("openclaw.database.statement");
+      const listener = (message: unknown) => {
+        const event = message as { engine: string; sql: string };
+        if (event.engine === "postgres") {
+          statements.push(event.sql);
+        }
+      };
+      observations.subscribe(listener);
+      const header = {
+        agentId: "publication-fixture",
+        provider: { id: "fixture", model: "fixture" },
+        providerKey: "fixture",
+        maxEntries: 3,
+      };
+      const write = (hashes: string[], options = header) =>
+        backend.execute({
+          type: "cache.write.inline",
+          input: { header: options, entries: hashes.map((hash) => ({ hash, embedding: [1] })) },
+        });
+      const hashes = () =>
+        pg().prepare("SELECT hash FROM memory_embedding_cache ORDER BY hash").all();
+      const counts = () =>
+        statements.filter((sql) => /select count\(\*\).*from "memory_embedding_cache"/iu.test(sql))
+          .length;
+      const rebind = () => {
+        backend.close();
+        backend = bind();
+      };
+      try {
+        expect(write(["a", "b", "a"])).toMatchObject({ ok: true });
+        backend.execute({
+          type: "stage.start",
+          input: { header: memoryPublicationHeader(replacement("spool")) },
+        });
+        rebind();
+        expect(write(["b", "c"])).toMatchObject({ ok: true });
+        expect(hashes()).toEqual([{ hash: "a" }, { hash: "b" }, { hash: "c" }]);
+        expect(backend.execute({ type: "cache.prune", input: { maxEntries: 3 } })).toMatchObject({
+          ok: true,
+          value: false,
+        });
+        expect(counts()).toBe(1);
+
+        denyCommit = true;
+        expect(write(["d"], { ...header, maxEntries: 1 })).toMatchObject({
+          ok: false,
+          committed: false,
+        });
+        denyCommit = false;
+        rebind();
+        expect(write(["d"])).toMatchObject({ ok: true });
+        expect(hashes()).toEqual([{ hash: "b" }, { hash: "c" }, { hash: "d" }]);
+        expect(counts()).toBe(1);
+        expect(backend.execute({ type: "cache.prune", input: { maxEntries: 1 } })).toMatchObject({
+          ok: true,
+          value: true,
+        });
+        expect(hashes()).toHaveLength(1);
+        expect(
+          backend.execute({
+            type: "cache.clear",
+            input: {
+              identities: [{ provider: "fixture", model: "fixture", providerKey: "fixture" }],
+            },
+          }),
+        ).toMatchObject({ ok: true });
+        expect(write(["e", "f", "g"])).toMatchObject({ ok: true });
+        expect(hashes()).toHaveLength(3);
+        expect(counts()).toBe(1);
+
+        // Session forget and other admitted owners can clear the cache on the same connection.
+        pg().runTransaction(() => pg().exec("DELETE FROM memory_embedding_cache"));
+        expect(write(["h", "i"])).toMatchObject({ ok: true });
+        expect(hashes()).toEqual([{ hash: "h" }, { hash: "i" }]);
+        expect(counts()).toBe(2);
+        expect(write(["h"], { ...header, maxEntries: 0 })).toMatchObject({ ok: true });
+        expect(write(["j"])).toMatchObject({ ok: true });
+        expect(hashes()).toEqual([{ hash: "h" }, { hash: "i" }, { hash: "j" }]);
+        expect(counts()).toBe(3);
+        expect(backend.execute({ type: "database.reset", input: undefined })).toMatchObject({
+          ok: true,
+        });
+        expect(write(["k", "l", "m"])).toMatchObject({ ok: true });
+        expect(hashes()).toHaveLength(3);
+        expect(counts()).toBe(3);
+        const legacyMeta = { ...metadata, providerKey: "fixture" };
+        expect(backend.execute({ type: "index.writeMetadata", input: legacyMeta })).toMatchObject({
+          ok: true,
+        });
+        expect(write(["m"], { ...header, providerKey: "canonical" })).toMatchObject({ ok: true });
+        expect(
+          backend.execute({
+            type: "index.upgradeProviderKey",
+            input: { meta: legacyMeta, providerKey: "canonical" },
+          }),
+        ).toMatchObject({ ok: true, value: true });
+        expect(write(["n"], { ...header, providerKey: "canonical" })).toMatchObject({ ok: true });
+        expect(hashes()).toEqual([{ hash: "l" }, { hash: "m" }, { hash: "n" }]);
+        expect(counts()).toBe(4);
+      } finally {
+        denyCommit = false;
+        observations.unsubscribe(listener);
+      }
+    }));
+
   it("replays a multi-request cache through bounded connection-local staging", () =>
     admitted(() => {
       const entries = Array.from({ length: 40 }, (_, index) => ({
