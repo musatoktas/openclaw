@@ -472,7 +472,8 @@
     "!dist/plugin-sdk/realtime-transcription-provider.d.ts",
     "!dist/plugin-sdk/meeting-config.d.ts",
     "!dist/plugin-sdk/collection-input-runtime.d.ts",
-    "!dist/plugin-sdk/http-response-runtime.d.ts"
+    "!dist/plugin-sdk/http-response-runtime.d.ts",
+    "!dist/plugin-sdk/node-crypto-runtime.d.ts"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -721,6 +722,9 @@
     },
     "./plugin-sdk/file-access-runtime": {
       "default": "./dist/plugin-sdk/file-access-runtime.js"
+    },
+    "./plugin-sdk/node-crypto-runtime": {
+      "default": "./dist/plugin-sdk/node-crypto-runtime.js"
     },
     "./plugin-sdk/node-selection-runtime": {
       "default": "./dist/plugin-sdk/node-selection-runtime.js"
@@ -2266,6 +2270,8 @@
     "ui:solid:inventory": "node --import ./scripts/tsx.mjs scripts/control-ui-solid-inventory.mts",
     "ui:build": "node scripts/ui.js build",
     "ui:parity": "node --import ./scripts/tsx.mjs scripts/control-ui-parity/index.mts",
+    "ui:validators:gen": "node --import ./scripts/tsx.mjs scripts/generate-control-ui-validators.mts",
+    "ui:validators:check": "node --import ./scripts/tsx.mjs scripts/generate-control-ui-validators.mts --check",
     "ui:check-performance": "node --import ./scripts/tsx.mjs scripts/check-control-ui-performance.mts",
     "ui:check-performance:base": "node --import ./scripts/tsx.mjs scripts/check-control-ui-performance-base.mts",
     "ui:dev": "node scripts/ui.js dev",
