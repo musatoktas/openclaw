@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { expect, it } from "vitest";
 import { encodeSessionArchiveContent } from "../config/sessions/archive-compression.js";
+import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { refreshCostUsageCacheForAgent } from "./session-cost-usage-aggregation.js";
 import { observeUsageWorkerReads } from "./session-cost-usage-worker-io.test-support.js";
@@ -76,23 +77,30 @@ it("keeps overview reads on committed aggregates and preserves exact transcript 
       }
       if (archive.suffix) {
         await probe.clear();
-        await expect(
-          loadSessionCostSummariesFromCache({
-            ...request,
-            sessions: [{ sessionFile }, { sessionFile: archiveFile }],
-            committedOnly: true,
-            requestRefresh: true,
-          }),
-        ).resolves.toMatchObject({
-          summaries: [{ totalTokens: 5 }, null],
-          staleSessionFiles: [],
-          cacheStatus: {
-            status: "partial",
-            staleFiles: 0,
-            pendingFiles: 1,
-            partial: { reason: "aggregate-boundary" },
-          },
-        });
+        const work = new AsyncWorkScope();
+        try {
+          await expect(
+            work.track(() =>
+              loadSessionCostSummariesFromCache({
+                ...request,
+                sessions: [{ sessionFile }, { sessionFile: archiveFile }],
+                committedOnly: true,
+                requestRefresh: true,
+              }),
+            ),
+          ).resolves.toMatchObject({
+            summaries: [{ totalTokens: 5 }, null],
+            cacheStatus: {
+              status: "partial",
+              staleFiles: 0,
+              pendingFiles: 1,
+              partial: { reason: "aggregate-boundary" },
+            },
+          });
+          await work.runWhenIdle(() => undefined);
+        } finally {
+          await work.drain();
+        }
         expect((await probe.read()).filter((entry) => entry.kind === "transcript")).toEqual([]);
       }
     });
