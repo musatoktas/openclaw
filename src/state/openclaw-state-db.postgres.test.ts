@@ -39,6 +39,9 @@ import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
+  prepareOpenClawStateDatabaseSchema,
+  repairOpenClawStateDatabaseIndexesForDoctor,
+  repairOpenClawStateDatabaseReadabilityForDoctor,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
 import { ensureUserBackgroundSchema } from "./user-background.store.js";
@@ -73,6 +76,19 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       );
       expect(namespace).toBeDefined();
       const anchorBytes = fs.readFileSync(pathname);
+      let prepared: Promise<{ changes: string[]; warnings: string[] }> | undefined;
+      withEngineStoreAdmission(() => {
+        prepared = prepareOpenClawStateDatabaseSchema(options, "doctor-preparation");
+        expect(repairOpenClawStateDatabaseIndexesForDoctor(options)).toEqual({
+          changes: [],
+          warnings: [],
+        });
+        expect(repairOpenClawStateDatabaseReadabilityForDoctor(options)).toEqual({
+          changes: [],
+          warnings: [],
+        });
+      });
+      expect(await prepared).toEqual({ changes: [], warnings: [] });
       for (const source of ["warm", "cold"]) {
         if (source === "cold") {
           await closeOpenClawStateDatabaseAsync();
