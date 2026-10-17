@@ -315,15 +315,22 @@ describe("direct compactor through the context-engine delegate", () => {
     async ({ operation, ownsCompaction, prepared }) => {
       const fixture = await createFixture(operation);
       const backend = vi.fn<ContextEngine["compact"]>(delegate);
+      const info = {
+        id: prepared ? "legacy" : "fixture",
+        name: "Compaction fixture",
+        ownsCompaction,
+      } satisfies ContextEngine["info"];
       resolveContextEngineMock.mockResolvedValueOnce({
-        info: { id: prepared ? "legacy" : "fixture", ownsCompaction },
+        info,
         compact: backend,
       });
-      const { sessionManagerOpenCompaction } = await import("../sessions/session-manager-core.js");
+      const sessionManagerCore = await import("../sessions/session-manager-core.js");
       const { persistCompactionBoundaryWithSessionEntryAsync } =
         await import("../../config/sessions/session-accessor.sqlite-compaction-runtime.js");
       const preparation = prepared
-        ? await sessions.SessionManager[sessionManagerOpenCompaction](fixture.target)
+        ? await sessions.SessionManager[sessionManagerCore.sessionManagerOpenCompaction](
+            fixture.target,
+          )
         : undefined;
       const persistBoundary = vi.fn(
         async (

@@ -343,17 +343,23 @@ it("prepares current compaction metadata and retained history in one worker read
 
 it("keeps the requested entry separate from the persisted compaction window owner", async () => {
   await withOpenClawTestState({ label: "compaction-window-owner" }, async (state) => {
-    const { target, manager } = await openFixture(state, "window-owner");
+    const requested = {
+      agentId: "main",
+      sessionId: "window-owner",
+      sessionKey: "agent:main:window-alias",
+      storePath: path.join(state.agentDir("main"), "openclaw-agent.sqlite"),
+    };
+    await replaceSessionEntry(requested, {
+      sessionId: requested.sessionId,
+      updatedAt: 2,
+      label: "Alias metadata",
+    });
+    // A newly created entry claims the shared window, so create its intended owner last.
+    const { target, manager } = await openFixture(state, requested.sessionId);
     const retained = await manager.appendMessageAsync({
       role: "user",
       content: "Window-owned content",
       timestamp: 1,
-    });
-    const requested = { ...target, sessionKey: "agent:main:window-alias" };
-    await replaceSessionEntry(requested, {
-      sessionId: target.sessionId,
-      updatedAt: 2,
-      label: "Alias metadata",
     });
     const prepared = await SessionManager[sessionManagerOpenCompaction](requested);
     expect(prepared.sessionTarget).toEqual(target);

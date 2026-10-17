@@ -102,8 +102,12 @@ test.each([55, undefined])(
         tokensAfter !== undefined ? SESSION_TOTAL_TOKENS_VERSION : undefined,
       );
       const transcript = await loadTranscriptEvents(scope);
-      expect(transcript.filter((event) => event.type === "compaction")).toHaveLength(1);
-      expect(transcript.filter((event) => event.type === "message")).toHaveLength(2);
+      expect(transcript).toMatchObject([
+        { type: "session" },
+        { type: "message", message: { content: "Retained first message" } },
+        { type: "message", message: { content: "Retained second message" } },
+        { type: "compaction" },
+      ]);
     } finally {
       ws.close();
     }

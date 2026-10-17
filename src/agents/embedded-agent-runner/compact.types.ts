@@ -7,12 +7,12 @@ import type { AgentHarnessCompactionSourceAuthority } from "../harness/host-sour
 import type { ModelCallUrgency } from "../run-trigger.js";
 import type { AgentRuntimeAuthPlan, AgentRuntimePlan } from "../runtime-plan/types.js";
 import type { CompactionRequestConstraints } from "../sessions/compaction/request-budget.js";
+import type {
+  CompactionAppendPersistence,
+  CompactionAppendPersistenceAsync,
+} from "../sessions/session-compaction-persistence.js";
 import type { AcceptedCompactionSuccessor } from "./compaction-successor.js";
 import type { PreparedCompactionSession } from "./run/compaction-accounting-bridge.js";
-import type {
-  TranscriptByteCompactionPersistence,
-  TranscriptByteCompactionPersistenceAsync,
-} from "./transcript-byte-preflight-authority.js";
 
 export type CompactEmbeddedAgentSessionParams = Pick<
   import("./run/params.js").RunEmbeddedAgentParams,
@@ -163,8 +163,8 @@ export type QueuedCompactionHostOptions = CompactionRequestConstraints & {
   assertActive?: SessionSourceAssertion;
   preparedSession?: PreparedCompactionSession;
   transcriptBytePreflightHarness?: "codex";
-  withCompactionPersistence?: TranscriptByteCompactionPersistence;
-  withCompactionPersistenceAsync?: TranscriptByteCompactionPersistenceAsync;
+  withCompactionPersistence?: CompactionAppendPersistence;
+  withCompactionPersistenceAsync?: CompactionAppendPersistenceAsync;
   onCommitted?: (accepted: AcceptedCompactionSuccessor) => void;
   onHostCompactionCommitted?: (commit: QueuedCompactionHostCommit) => Promise<void> | void;
   onHostCompactionTranscriptSettled?: (commit: QueuedCompactionHostCommit) => Promise<void> | void;

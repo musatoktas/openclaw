@@ -1,5 +1,4 @@
 import path from "node:path";
-import { Worker } from "node:worker_threads";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, expect, it, vi } from "vitest";
@@ -129,7 +128,7 @@ it.each([false, true])(
       incognito ? "dashboard:incognito-successive-compactions" : "successive-compactions",
       "successive-compactions",
     );
-    const { manager, compact } = await seedCompaction(scope, { incognito });
+    const { manager, compact } = await seedCompaction(scope, incognito ? { incognito: true } : {});
     await compact();
     await upsertSessionEntryCore(scope, {
       ...loadSessionEntry(scope)!,
@@ -236,7 +235,6 @@ it("recovers both transcript and accounting after a worker crash before compacti
   );
   const { env: _env, ...target } = scope;
   const prepared = preparedBoundary(target, keptId, "interrupted-compaction");
-  const exits = vi.spyOn(Worker.prototype, "emit");
   try {
     await expect(
       worker.execute(
@@ -246,14 +244,12 @@ it("recovers both transcript and accounting after a worker crash before compacti
         },
         () => {},
       ),
-    ).rejects.toThrow(/worker|exit|confirmed native completion/i);
-    expect(exits.mock.calls.some(([event, code]) => event === "exit" && code === 92)).toBe(true);
+    ).rejects.toMatchObject({
+      code: "outcome-unknown",
+      cause: expect.objectContaining({ message: "SQLite worker exited with code 92" }),
+    });
   } finally {
-    try {
-      await worker.close();
-    } finally {
-      exits.mockRestore();
-    }
+    await worker.close();
   }
   expect((await SessionManager.openAsync(scope)).getEntries()).toEqual(initialEntries);
   expectRolledBack(scope, before);
