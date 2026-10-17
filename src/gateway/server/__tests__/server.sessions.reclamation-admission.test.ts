@@ -226,6 +226,14 @@ test("sessions.delete admits unrelated same-store patches during Worker validati
     },
     storePath,
   });
+  // Eventless deletion uses the admitted writer; retain the real reclamation path here.
+  await seedLinearSessionTranscript({
+    agentId: "main",
+    sessionKey: targetKey,
+    sessionId: "validation-delete",
+    storePath,
+    contents: ["retained during validation"],
+  });
   const { ws } = await openClient();
   const databasePath = resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path;
   // Seed a host handle; the worker interceptor expires proof after executor preparation.

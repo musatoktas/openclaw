@@ -384,6 +384,17 @@ export function createAgentDatabaseNativeGeneration(
       captured.admission.observeRequests(observeNative);
       return captured;
     };
+  const captureOpeningAdmission =
+    (
+      source: AgentDatabaseRequestExecutionSource,
+      registration?: AgentDatabaseRegistration,
+      assertCallerCurrent?: (identity?: AgentDatabaseExecutionFileIdentity) => void,
+    ): SqliteWorkerAdmissionFactory =>
+    (operation) => {
+      const captured = admission(source, registration, assertCallerCurrent)(operation);
+      openingAdmission = { admission: captured.admission, settled: operation.settled };
+      return captured;
+    };
   const open = (
     source: AgentDatabaseRequestExecutionSource,
     assertCallerCurrent?: (identity?: AgentDatabaseExecutionFileIdentity) => void,
@@ -431,11 +442,7 @@ export function createAgentDatabaseNativeGeneration(
               stateDatabasePath: context.admission.databasePath,
               assertCurrent: assertOpening,
               signal,
-              createAdmission: (operation) => {
-                const captured = admission(source, registration, assertCallerCurrent)(operation);
-                openingAdmission = { admission: captured.admission, settled: operation.settled };
-                return captured;
-              },
+              createAdmission: captureOpeningAdmission(source, registration, assertCallerCurrent),
               onNativeStopped: (stopped, readReceipt, readRefused) => {
                 nativeStopped = stopped;
                 readCloseReceipt = readReceipt;
@@ -453,7 +460,7 @@ export function createAgentDatabaseNativeGeneration(
                 (scope) => scope.execute({ type: "database.prepareWrite", input: undefined }),
                 undefined,
                 assertCurrent,
-                admission(sharedPreparation.source, registration),
+                captureOpeningAdmission(sharedPreparation.source, registration),
               ),
             );
           }
