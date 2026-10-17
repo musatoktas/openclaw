@@ -48,7 +48,7 @@ function WidgetPagination(props: WidgetProps) {
   return (
     <Show when={state().more}>
       <div class="workboard-widget__state" role="status">
-        <span>{t("workboard.widget.partialCards", { count: state().count })}</span>{" "}
+        <span>{t("workboard.widget.partialCards", { count: String(state().count) })}</span>{" "}
         <button
           class="btn btn--sm"
           type="button"

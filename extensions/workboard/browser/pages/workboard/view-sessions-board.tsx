@@ -226,8 +226,8 @@ export function SessionsBoard(props: SessionsBoardProps) {
           <div class="workboard-pagination" role="status">
             <span>
               {t("workboard.sessionsBoard.partial", {
-                count: state().loaded,
-                total: state().total,
+                count: String(state().loaded),
+                total: String(state().total),
               })}
             </span>
             <button

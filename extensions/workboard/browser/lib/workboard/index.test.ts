@@ -65,7 +65,7 @@ describe("Workboard native owners", () => {
       },
     });
     const partial = getWorkboardDependencyState(card, [card], false);
-    expect(partial.parents[0].missing).toBe(false);
+    expect(partial.parents).toEqual([expect.objectContaining({ missing: false })]);
     expect(partial.blockedParents).toEqual([]);
     expect(getWorkboardDependencyState(card, [card]).blockedParents).toHaveLength(1);
   });

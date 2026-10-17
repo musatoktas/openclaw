@@ -314,6 +314,7 @@ function button(page: ReturnType<typeof mountPage>, label: string) {
 it("loads the next Sessions board page and refreshes the loaded window after a write receipt", async () => {
   const page = sessionsPage();
   const all = [...page.result.sessions];
+  const first = expectDefined(all[0], "first session");
   const request = expectDefined(page.request.getMockImplementation(), "request");
   page.request.mockImplementation(async (method, params) => {
     if (method === "workboard.sessionsBoard.read") {
@@ -323,7 +324,7 @@ it("loads the next Sessions board page and refreshes the loaded window after a w
         ...page.result,
         sessions: input.after ? all.slice(1) : all.slice(0, 1),
         total: 2,
-        nextCursor: input.after ? undefined : all[0].key,
+        nextCursor: input.after ? undefined : first.key,
       };
     }
     return request(method, params);
@@ -336,11 +337,11 @@ it("loads the next Sessions board page and refreshes the loaded window after a w
   expect(page.request).toHaveBeenCalledWith("workboard.sessionsBoard.read", {
     boardId: "sessions",
     view: { includePeople: true },
-    after: all[0].key,
+    after: first.key,
   });
   expect(page.container.querySelectorAll(".workboard-session-tile")).toHaveLength(2);
   expect(page.container.textContent).not.toContain("Load more sessions");
-  all[0].label = "Updated retries";
+  first.label = "Updated retries";
   page.fixture.emit("plugin.workboard.changed", { epoch: "facts", revision: 2 });
   await vi.advanceTimersByTimeAsync(0);
   expect(page.container.querySelectorAll(".workboard-session-tile")).toHaveLength(2);

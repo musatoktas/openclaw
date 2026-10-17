@@ -32,7 +32,7 @@ it("bounds Sessions board read and move responses and rejects a retired cursor v
     },
   });
   const first = (await invoke("workboard.sessionsBoard.read", { boardId: "sessions" })).mock
-    .calls[0][1];
+    .calls[0]?.[1];
   expect(first.sessions).toHaveLength(100);
   expect(first.total).toBe(205);
   expect(first.nextCursor).toBe("agent:main:session-99");
@@ -42,7 +42,7 @@ it("bounds Sessions board read and move responses and rejects a retired cursor v
       after: first.nextCursor,
       sinceRevision: first.revision,
     })
-  ).mock.calls[0][1];
+  ).mock.calls[0]?.[1];
   expect(second.sessions).toHaveLength(100);
   expect(second.sessions[0].key).toBe("agent:main:session-100");
   const last = (
@@ -50,7 +50,7 @@ it("bounds Sessions board read and move responses and rejects a retired cursor v
       boardId: "sessions",
       after: second.nextCursor,
     })
-  ).mock.calls[0][1];
+  ).mock.calls[0]?.[1];
   expect(last.sessions).toHaveLength(5);
   expect(last.nextCursor).toBeUndefined();
   const moved = (
@@ -59,13 +59,13 @@ it("bounds Sessions board read and move responses and rejects a retired cursor v
       sessionKey: "agent:main:session-204",
       columnId: "working",
     })
-  ).mock.calls[0][1];
+  ).mock.calls[0]?.[1];
   expect(moved.sessions).toHaveLength(100);
   const retired = await invoke("workboard.sessionsBoard.read", {
     boardId: "sessions",
     after: "deleted",
   });
-  expect(retired.mock.calls[0][0]).toBe(false);
-  expect(retired.mock.calls[0][2].message).toContain("Refresh the board");
+  expect(retired.mock.calls[0]?.[0]).toBe(false);
+  expect(retired.mock.calls[0]?.[2].message).toContain("Refresh the board");
   await sessionsBoard.stop();
 });

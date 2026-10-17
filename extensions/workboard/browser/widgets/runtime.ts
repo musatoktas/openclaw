@@ -191,7 +191,7 @@ export class WorkboardWidgetModel {
   get loading() {
     return this.runtime.loading;
   }
-  loadMore() {
+  async loadMore(): Promise<boolean> {
     if (this.isActive() && this.connected) {
       return loadWorkboard({
         host: this.runtime.owner,
@@ -200,6 +200,7 @@ export class WorkboardWidgetModel {
         requestUpdate: () => this.runtime.notify(),
       });
     }
+    return false;
   }
   get statuses() {
     return getWorkboardState(this.runtime.owner).statuses;
