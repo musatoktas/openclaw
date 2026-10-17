@@ -45,6 +45,7 @@ backup and its matching build, not just reinstalling the older package.
 | 26      | Portable query columns for session maintenance, transcript navigation discriminators, and context-engine outbox state                                                                                                                                  | `Unreleased` |
 | 27      | Explicit context-engine outbox enqueue sequence preserving FIFO through SQLite rebuilds and PostgreSQL generation                                                                                                                                      | `Unreleased` |
 | 28      | Smaller transcript/conversation indexes and primary-key storage for memory origins                                                                                                                                                                     | `Unreleased` |
+| 29      | Retire redundant reaction and unused last-interaction indexes without changing retained rows                                                                                                                                                           | `Unreleased` |
 | 30      | Brotli trajectory payloads with per-row codec markers and logical-byte retention                                                                                                                                                                       | `Unreleased` |
 
 Schema 1 first appeared in `v2026.5.30-beta.1` and was also written by the
@@ -90,6 +91,25 @@ SQLite may scan the trajectory table while adding columns, and rebuilding the
 covering index reads retained event sizes. It does not scan or rewrite transcript
 payloads. Older builds refuse the new schema; rollback needs the verified
 pre-upgrade backup and its matching build.
+
+### Agent schema 29
+
+Schema 29 removes `idx_agent_session_nodes_last_interaction_at` and
+`idx_agent_session_reactions_message`. Session readers use other indexes; the
+reaction primary key already supplies the removed index's lookup prefix and
+continues enforcing reaction uniqueness. Neither migration rewrites rows.
+
+PostgreSQL also makes `openclaw_transcript_navigation_check(text)` strict with a
+fixed `pg_catalog` search path. Absent navigation metadata skips JSON validation;
+present metadata retains the same CHECK. The versioned step updates existing
+stores without rewriting transcript rows. Historical backups retain the old
+function attributes for rollback.
+
+SQLite and PostgreSQL publish the index changes and schema metadata in one
+transaction. A scoped SQLite backup covers `session_nodes`, `session_reactions`,
+and planner statistics. Historical admission and PostgreSQL rollback retain the
+old index definitions. Older binaries require the verified pre-upgrade backup;
+never lower schema markers to roll back.
 
 ### Agent schema 28
 

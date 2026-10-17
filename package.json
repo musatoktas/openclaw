@@ -9,7 +9,7 @@
     ],
     "postgresFamilies": ["state", "agent", "workboard", "logbook", "team-reports"],
     "schemaVersions": {
-      "state": 26,
+      "state": 27,
       "agent": 30
     }
   },

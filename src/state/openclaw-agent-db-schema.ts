@@ -19,6 +19,7 @@ import {
   type SqliteIntegrityDiagnostics,
   type SqliteIntegrityOperation,
 } from "../infra/sqlite-integrity.js";
+import type { SqliteTableContractReader } from "../infra/sqlite-schema-contract.js";
 import {
   admitSqliteSchema,
   getAdmittedSqliteSchemaFacts,
@@ -48,6 +49,7 @@ import {
   canonicalSessionValidationSchemaSql,
 } from "./openclaw-agent-canonical-validation-schema.js";
 import {
+  AGENT_INDEX_RETIREMENT_SCHEMA_VERSION,
   AGENT_MEDIA_SCHEMA_VERSION,
   AGENT_STORAGE_SCHEMA_VERSION,
   AGENT_JSON_PREDICATE_SCHEMA_VERSION,
@@ -105,6 +107,7 @@ import {
   isPersistentOpenClawAgentDatabasePath,
   resolveOpenClawAgentSqlitePath,
 } from "./openclaw-agent-db.paths.js";
+import { AGENT_INDEX_RETIREMENT_SQL } from "./openclaw-agent-index-retirement-migration.js";
 import { migrateAgentJsonPredicatesInTransaction } from "./openclaw-agent-json-predicate-schema.js";
 import { migrateOutboxEnqueueSequenceInTransaction } from "./openclaw-agent-outbox-sequence-migration.js";
 import { migrateSessionParticipantsSchema } from "./openclaw-agent-participants-migration.js";
@@ -212,14 +215,16 @@ export function* agentDatabaseIntegrityBeforeMutationSteps(
     const reuseIntegrity =
       reuseRuntimeIntegrity ||
       (verification !== undefined && !migrationPending && !hasPendingCurrentVersionMigration);
+    const validateSchema = (readTable?: SqliteTableContractReader) =>
+      assertOpenClawAgentCurrentRuntimeSchema(database, { agentId, pathname }, readTable);
     const rebuiltIndexes = yield* verifyAndRepairCanonicalSqliteIndexSteps(
       database,
       pathname,
       OPENCLAW_AGENT_SCHEMA_SQL,
       {
         allowMissingColumns: true,
-        validateAfterRepair: () =>
-          assertOpenClawAgentCurrentRuntimeSchema(database, { agentId, pathname }),
+        validateAfterRepair: validateSchema,
+        validateUnchanged: validateSchema,
         diagnostics,
         reuseIntegrity,
         integrity: integrityCheck ? integrity : undefined,
@@ -236,7 +241,6 @@ export function* agentDatabaseIntegrityBeforeMutationSteps(
         },
       );
     }
-    assertOpenClawAgentCurrentRuntimeSchema(database, { agentId, pathname });
   } else if (
     userVersion === 0 &&
     !hasApplicationSchema &&
@@ -298,7 +302,7 @@ function ensureAgentSchema(
   agentId: string,
   pathname: string,
   targetVersion = OPENCLAW_AGENT_SCHEMA_VERSION,
-  withMutation: AgentSchemaMutationGuard = (run) => run(),
+  withCommit: AgentSchemaMutationGuard = (run) => run(),
   onMigrationWarning?: (warning: string) => void,
   versionMigrationOnly = false,
   integrityCheck?: "quick" | "full",
@@ -407,6 +411,9 @@ function ensureAgentSchema(
         }
         if (crossesVersion(AGENT_WRITE_LAYOUT_SCHEMA_VERSION)) {
           migrateAgentWriteLayoutInTransaction(db);
+        }
+        if (crossesVersion(AGENT_INDEX_RETIREMENT_SCHEMA_VERSION)) {
+          db.exec(AGENT_INDEX_RETIREMENT_SQL);
         }
         if (requiresTrajectoryMigration) {
           migrateAgentTrajectoryStorageInTransaction(db);
@@ -570,10 +577,10 @@ function ensureAgentSchema(
       }
       finishStorageMigration();
     };
-    runSqliteImmediateTransactionSync(db, () => withMutation(mutate), {
+    runSqliteImmediateTransactionSync(db, mutate, {
       databaseLabel: pathname,
       operationLabel: "agent.schema.ensure",
-      withCommit: withMutation,
+      withCommit,
     });
   } finally {
     if (db.isOpen) {
@@ -647,7 +654,7 @@ export function* ensureOpenClawAgentDatabaseSchemaSteps(
       { env: databaseOptions.env, initializationAgentPaths: [pathname] },
     );
   };
-  // Validate history before touching an independent store, without holding shared -> agent locks.
+  // Check admission now; hold shared state only for commit so maintenance heartbeats can run.
   withRegistrationFence(() => undefined);
   if (db.location()) {
     maintenanceAuthority.invalidateOpenClawAgentDatabaseIntegrityBeforeMutation(pathname);
@@ -658,7 +665,7 @@ export function* ensureOpenClawAgentDatabaseSchemaSteps(
   assertExistingAgentSchemaOwner(readExistingAgentSchemaMeta(db), agentId, pathname);
   const withIntegrityMutation: AgentSchemaMutationGuard = (run) =>
     deletionFence
-      ? runSqliteImmediateTransactionSync(db, () => withRegistrationFence(run), {
+      ? runSqliteImmediateTransactionSync(db, run, {
           databaseLabel: pathname,
           operationLabel: "agent.schema.integrity",
           withCommit: withRegistrationFence,
@@ -719,12 +726,7 @@ export function* ensureOpenClawAgentDatabaseSchemaSteps(
     admittedDb = db;
   }
   if (databaseOptions.register === true) {
-    registerOpenClawAgentDatabase({
-      agentId,
-      path: pathname,
-      env: databaseOptions.env,
-      admittedDb,
-    });
+    registerOpenClawAgentDatabase({ agentId, path: pathname, env: options.env, admittedDb });
   }
 }
 

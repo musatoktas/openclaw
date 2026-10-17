@@ -212,7 +212,7 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
     });
   });
 
-  it("migrates version 27 while retaining rows, search and schema admission", async () => {
+  it("migrates version 27 indexes and navigation validation while retaining rows and search", async () => {
     const target = {
       agentId: "migration",
       sessionId: "migration-session",
@@ -399,7 +399,8 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
       });
       const indexes = await client.query(
         `SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1
-          AND indexname IN ('idx_agent_session_windows_conversation', 'idx_agent_transcript_event_parent')`,
+          AND indexname IN ('idx_agent_session_windows_conversation', 'idx_agent_transcript_event_parent',
+            'idx_agent_session_nodes_last_interaction_at', 'idx_agent_session_reactions_message')`,
         [facts.namespace],
       );
       expect(indexes.rows).toEqual([
@@ -407,6 +408,15 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
           indexname: "idx_agent_session_windows_conversation",
           indexdef: `CREATE INDEX idx_agent_session_windows_conversation ON ${facts.namespace}.session_windows USING btree (primary_conversation_id NULLS FIRST) WHERE (primary_conversation_id IS NOT NULL)`,
         },
+      ]);
+      const navigationFunction = await client.query(
+        `SELECT p.proisstrict, p.proconfig FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = $1 AND p.proname = 'openclaw_transcript_navigation_check'`,
+        [facts.namespace],
+      );
+      expect(navigationFunction.rows).toEqual([
+        { proisstrict: true, proconfig: ["search_path=pg_catalog"] },
       ]);
       expect(
         (

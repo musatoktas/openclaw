@@ -19,6 +19,7 @@ import {
   readExistingAgentSchemaMeta,
 } from "../../state/openclaw-agent-db-schema-helpers.js";
 import { ensureOpenClawAgentDatabaseSchema } from "../../state/openclaw-agent-db-schema.js";
+import { withLegacyAgentPostgresIndexes } from "../../state/openclaw-agent-index-retirement-migration.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "../../state/openclaw-agent-schema.js";
 import { agentTranscriptSearchSchema } from "../../state/openclaw-agent-search-schema.js";
 import { withLegacyAgentPostgresTrajectoryStorage } from "../../state/openclaw-agent-trajectory-storage-migration.js";
@@ -120,7 +121,7 @@ export async function loadAgentPortDescriptor(
     if (
       backup ||
       OPENCLAW_AGENT_SCHEMA_VERSION !== 30 ||
-      (sourceVersion !== 27 && sourceVersion !== 28)
+      (sourceVersion !== 27 && sourceVersion !== 28 && sourceVersion !== 29)
     ) {
       throw new DatabasePortDataError(
         `Missing agent PostgreSQL backup descriptor for version ${sourceVersion}`,
@@ -325,30 +326,38 @@ export async function loadAgentPortDescriptor(
       );
     },
   };
-  return sourceVersion === agentEngineSchema.version
-    ? descriptor
-    : {
-        ...descriptor,
-        version: sourceVersion,
-        sqlite: getOpenClawAgentMigrationSchema(sourceVersion).replace(
-          /^INSERT OR IGNORE INTO[^;]+;/gm,
-          "",
-        ),
-        preData: withLegacyAgentPostgresTrajectoryStorage(descriptor.preData),
-        postData: withLegacyAgentPostgresTrajectoryStorage(
-          sourceVersion < 28
-            ? withLegacyAgentPostgresWriteLayout(descriptor.postData)
-            : descriptor.postData,
-        ),
-        expectedCatalog: catalog.map((fact) =>
-          sourceVersion < 28 &&
-          fact.table === "transcript_event_identities" &&
-          fact.kind === "indexes"
-            ? { table: fact.table, kind: fact.kind, value: 5 }
-            : fact,
-        ),
-        inspectSqliteSource: undefined,
-        migrateSqliteSource: undefined,
-        admit: undefined,
-      };
+  if (!historical) {
+    return descriptor;
+  }
+  let postData = withLegacyAgentPostgresTrajectoryStorage(descriptor.postData);
+  if (sourceVersion < 29) {
+    postData = withLegacyAgentPostgresIndexes(postData);
+  }
+  if (sourceVersion < 28) {
+    postData = withLegacyAgentPostgresWriteLayout(postData);
+  }
+  return {
+    ...descriptor,
+    version: sourceVersion,
+    sqlite: getOpenClawAgentMigrationSchema(sourceVersion).replace(
+      /^INSERT OR IGNORE INTO[^;]+;/gm,
+      "",
+    ),
+    preData: withLegacyAgentPostgresTrajectoryStorage(descriptor.preData),
+    postData,
+    expectedCatalog: catalog.map((fact) =>
+      sourceVersion < 29 &&
+      fact.kind === "indexes" &&
+      (fact.table === "session_nodes" || fact.table === "session_reactions")
+        ? { table: fact.table, kind: fact.kind, value: Number(fact.value) + 1 }
+        : sourceVersion < 28 &&
+            fact.table === "transcript_event_identities" &&
+            fact.kind === "indexes"
+          ? { table: fact.table, kind: fact.kind, value: 5 }
+          : fact,
+    ),
+    inspectSqliteSource: undefined,
+    migrateSqliteSource: undefined,
+    admit: undefined,
+  };
 }

@@ -1,5 +1,6 @@
 import { extractSqliteTableSchema } from "../infra/sqlite-schema-sql.js";
 import {
+  AGENT_INDEX_RETIREMENT_SCHEMA_VERSION,
   AGENT_JSON_PREDICATE_SCHEMA_VERSION,
   AGENT_OUTBOX_SEQUENCE_SCHEMA_VERSION,
   AGENT_STORAGE_SCHEMA_VERSION,
@@ -9,6 +10,7 @@ import {
   CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION,
   SESSION_PARTICIPANTS_TABLE,
 } from "./openclaw-agent-db-contract.js";
+import { withLegacyAgentIndexes } from "./openclaw-agent-index-retirement-migration.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "./openclaw-agent-schema.js";
 import {
   SESSION_ENTRY_SNAPSHOTS_SCHEMA_VERSION,
@@ -305,10 +307,14 @@ export function getOpenClawAgentMigrationSchema(targetVersion: number): string {
     targetVersion < AGENT_TRAJECTORY_STORAGE_SCHEMA_VERSION
       ? withoutTrajectoryPayloadColumns(OPENCLAW_AGENT_SCHEMA_SQL)
       : OPENCLAW_AGENT_SCHEMA_SQL;
+  const indexSchemaSql =
+    targetVersion < AGENT_INDEX_RETIREMENT_SCHEMA_VERSION
+      ? withLegacyAgentIndexes(trajectorySchemaSql)
+      : trajectorySchemaSql;
   const layoutSchemaSql =
     targetVersion < AGENT_WRITE_LAYOUT_SCHEMA_VERSION
-      ? withLegacyAgentWriteLayout(trajectorySchemaSql)
-      : trajectorySchemaSql;
+      ? withLegacyAgentWriteLayout(indexSchemaSql)
+      : indexSchemaSql;
   const sequenceSchemaSql =
     targetVersion < AGENT_OUTBOX_SEQUENCE_SCHEMA_VERSION
       ? withoutOutboxEnqueueSequence(layoutSchemaSql)
@@ -346,8 +352,8 @@ export const OPENCLAW_AGENT_BOARD_SCHEMA_SQL = extractSqliteTableSchema(
   },
 );
 export const AGENT_V14_BOARD_SCHEMA_SQL = OPENCLAW_AGENT_BOARD_SCHEMA_SQL;
-const OPENCLAW_AGENT_SCHEMA_WITHOUT_BOARD_SQL = withoutTrajectoryPayloadColumns(
-  OPENCLAW_AGENT_SCHEMA_SQL,
+const OPENCLAW_AGENT_SCHEMA_WITHOUT_BOARD_SQL = withLegacyAgentIndexes(
+  withoutTrajectoryPayloadColumns(OPENCLAW_AGENT_SCHEMA_SQL),
 ).replace(OPENCLAW_AGENT_BOARD_SCHEMA_SQL, "");
 
 export const SESSION_PROGRESS_CARDS_TABLE = "session_progress_cards";
