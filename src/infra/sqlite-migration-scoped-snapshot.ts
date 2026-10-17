@@ -324,7 +324,7 @@ export function createScopedMigrationSnapshotSync(
     } finally {
       archive.close();
     }
-    const descriptor = fs.openSync(params.targetPath, "r");
+    const descriptor = fs.openSync(params.targetPath, "r+");
     try {
       fs.fsyncSync(descriptor);
     } finally {

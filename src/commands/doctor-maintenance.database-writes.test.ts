@@ -9,6 +9,7 @@ import { readUpdateDatabaseGenerations } from "../infra/update-database-generati
 import { createUpdateRun } from "../infra/update-run-ledger.js";
 import { finishUpdateRun } from "../infra/update-run-write.js";
 import type { UpdateRunResult } from "../infra/update-runner-types.js";
+import { withOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
 import {
   closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
@@ -55,6 +56,12 @@ it.each([false, true])(
         });
         try {
           maintenance!.run(() => {
+            expect(
+              withOpenClawStateDatabaseReadOnly(
+                ({ db }) => db.prepare("SELECT count(*) AS count FROM update_runs").get()?.count,
+                { env: state.env },
+              ),
+            ).toBe(1);
             expect(openOpenClawStateDatabase({ env: state.env }).path).toBe(pathname);
             admission.assertCurrent();
           });

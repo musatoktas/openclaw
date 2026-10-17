@@ -1727,7 +1727,7 @@ describe("openclaw state database", () => {
         "Qualified historical cron creator attribution as unknown (v14)",
         "Removed redundant conversation binding target projections (v15)",
         "Replaced retained task indexes with ordered cron history indexes (v24)",
-        "Migrated shared state tables to SQLite STRICT typing (48)",
+        "Migrated shared state tables to SQLite STRICT typing (46)",
       ],
       warnings: [],
     });

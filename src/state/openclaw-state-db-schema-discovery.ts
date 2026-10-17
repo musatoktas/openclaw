@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { requireNativeDatabaseFile } from "../infra/database-engine/physical-facts.js";
 import { isPostgresSqlConnection } from "../infra/sql-connection.js";
 import { openSqliteReadOnlyDatabase } from "../infra/sqlite-snapshot-source.js";
+import { hasUpdateDoctorMigrationCapture } from "../infra/update-doctor-migration-attribution.js";
 import type {
   OpenClawStateDatabaseOptions,
   OpenClawStateDatabaseSchemaMigration,
@@ -18,7 +19,7 @@ export function detectOpenClawStateDatabaseSchemaMigrations(
   if (!existsSync(pathname)) {
     return [];
   }
-  if (behavior.artifactPreservingReadOnly) {
+  if (behavior.artifactPreservingReadOnly || hasUpdateDoctorMigrationCapture()) {
     return (
       withExistingOpenClawStateDatabaseArtifactPreservingReadOnly(
         ({ db }) => {

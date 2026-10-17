@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { PassThrough, type Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
@@ -174,7 +175,7 @@ function replaceRestartSentinelRow(env: NodeJS.ProcessEnv, sentinel: unknown): v
 }
 
 function readRestartSentinelPayload(env: NodeJS.ProcessEnv, key = "current"): unknown {
-  const { db } = openOpenClawStateDatabase({ env });
+  using db = new DatabaseSync(resolveOpenClawStateSqlitePath(env), { readOnly: true });
   const stateDb = getNodeSqliteKysely<GatewayRestartSentinelDatabase>(db);
   const row = executeSqliteQueryTakeFirstSync(
     db,
@@ -615,7 +616,6 @@ describe("managed service update handoff state ownership and sentinel persistenc
       ? (["closed-gate"] as const)
       : (["closed-gate", "unavailable-identity"] as const),
   )("joins the exact gated runner and records failure after %s", async (runnerFault) => {
-    const { DatabaseSync } = await import("node:sqlite");
     const handoffId = `handoff-runner-${runnerFault}`;
     const {
       result,
@@ -751,7 +751,6 @@ describe("managed service update handoff state ownership and sentinel persistenc
   it.each(["continuation", "stats", "empty routing"] as const)(
     "uses canonical sentinel rows without overwriting invalid metadata (%s)",
     async (shape) => {
-      const { DatabaseSync } = await import("node:sqlite");
       let before: unknown;
       const { result, env } = await runOwnershipHelper({
         handoffId: "handoff-typed-row",
@@ -814,7 +813,6 @@ describe("managed service update handoff state ownership and sentinel persistenc
       metaHandoffId: "handoff-123",
       prepareStateDatabase: async (stateEnv) => {
         await createLegacyRestartSentinelTable(stateEnv);
-        const { DatabaseSync } = await import("node:sqlite");
         const db = new DatabaseSync(resolveOpenClawStateSqlitePath(stateEnv));
         try {
           db.exec("PRAGMA user_version = 7");
@@ -825,7 +823,6 @@ describe("managed service update handoff state ownership and sentinel persistenc
     });
 
     expect(result).toEqual({ code: 1, signal: null });
-    const { DatabaseSync } = await import("node:sqlite");
     const db = new DatabaseSync(resolveOpenClawStateSqlitePath(env), { readOnly: true });
     try {
       expect(db.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: 7 });

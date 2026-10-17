@@ -9,6 +9,17 @@ import { updateAuthProfileStoreWithLock } from "../agents/auth-profiles/store-ru
 import { assertAgentHarnessRunAdmission } from "../agents/embedded-agent-runner/run/session-bootstrap.js";
 import { resolveRunWorkspaceDir } from "../agents/workspace-run.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveClientCredentialStorePath } from "../infra/client-credential-paths.js";
+import {
+  readClientCredentialReceipt,
+  writeClientCredentialReceipt,
+} from "../infra/client-credential-readiness.js";
+import { openClientCredentialCustody } from "../infra/client-credential-store.js";
+import {
+  generateStoredDeviceIdentity,
+  storedDeviceIdentityToRow,
+} from "../infra/device-identity-material.js";
+import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { summarizeMigrationItems } from "../plugin-sdk/migration.js";
 import type {
   MigrationApplyResult,
@@ -446,6 +457,7 @@ describe("transactional setup migration import", () => {
     const stateDir = path.join(root, "openclaw-state");
     const liveEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
     const runtimeDatabasePath = path.join(root, "runtime-agent.sqlite");
+    let liveClientBytes: Buffer | undefined;
     mocks.provider = provider({
       source,
       mutateDuringApply: async () => {
@@ -454,6 +466,15 @@ describe("transactional setup migration import", () => {
           path: runtimeDatabasePath,
           env: liveEnv,
         });
+        {
+          using credentials = openClientCredentialCustody(liveEnv, { migration: true });
+          expect(credentials).toBeDefined();
+          credentials!.run({
+            kind: "identity.create",
+            identity: storedDeviceIdentityToRow("primary", generateStoredDeviceIdentity(42), 42),
+          });
+        }
+        liveClientBytes = await fs.readFile(resolveClientCredentialStorePath(liveEnv));
       },
     });
 
@@ -466,6 +487,11 @@ describe("transactional setup migration import", () => {
     );
     expect(JSON.stringify(currentConfig.value)).not.toContain(".openclaw-migration-");
     expect(mocks.verify).not.toHaveBeenCalled();
+    expect(liveClientBytes).toBeDefined();
+    expect(await fs.readFile(resolveClientCredentialStorePath(liveEnv))).toEqual(liveClientBytes);
+    expect(
+      (await fs.readdir(root)).filter((name) => name.startsWith(".openclaw-migration-")),
+    ).toEqual([]);
     expect(listOpenClawRegisteredAgentDatabases({ env: liveEnv })).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ agentId: "main" }),
@@ -473,6 +499,76 @@ describe("transactional setup migration import", () => {
       ]),
     );
   });
+
+  it.each(["identity", "token", "origin-token", "socket", "import-claim"] as const)(
+    "rejects unsupported staged client %s without publishing or retaining the stage",
+    async (material) => {
+      const { root, source, currentConfig } = await createImportFixture();
+      mocks.provider = provider({
+        source,
+        mutateDuringApply: async (ctx) => {
+          using credentials = openClientCredentialCustody(
+            { OPENCLAW_STATE_DIR: ctx.stateDir },
+            { migration: true },
+          );
+          expect(credentials).toBeDefined();
+          const owner = credentials!;
+          if (material === "identity") {
+            owner.run({
+              kind: "identity.create",
+              identity: storedDeviceIdentityToRow("primary", generateStoredDeviceIdentity(42), 42),
+            });
+          } else if (material === "token" || material === "origin-token") {
+            owner.run({
+              kind: "token.replace",
+              key: {
+                device_id: "synthetic-device",
+                role: "operator",
+                ...(material === "origin-token"
+                  ? { gateway_scope: "https://example.invalid" }
+                  : {}),
+              },
+              token: {
+                device_id: "synthetic-device",
+                role: "operator",
+                token: "synthetic-staged-token",
+                scopes_json: '["operator.read"]',
+                updated_at_ms: 42,
+              },
+            });
+          } else if (material === "socket") {
+            owner.run({
+              kind: "socket.ensure",
+              fallback: {
+                socket_key: "current",
+                socket_path: path.join(ctx.stateDir, "exec-approvals.sock"),
+                socket_token: "synthetic-staged-socket",
+                updated_at_ms: 42,
+              },
+            });
+          } else {
+            const stored = readClientCredentialReceipt(owner.database)!;
+            stored.receipt.legacyImports["auth:primary"] = { sha256: null };
+            runSqliteImmediateTransactionSync(owner.database, () =>
+              writeClientCredentialReceipt(owner.database, stored.receipt, stored.phase),
+            );
+          }
+        },
+      });
+
+      await expect(runImport({ root, source, currentConfig })).rejects.toThrow(
+        "unsupported staged client credentials",
+      );
+      expect(currentConfig.value).toEqual({});
+      await expect(fs.access(path.join(root, "workspace", "MEMORY.md"))).rejects.toThrow();
+      await expect(
+        fs.access(path.join(root, "openclaw-state", "client", "credentials.sqlite")),
+      ).rejects.toThrow();
+      expect(
+        (await fs.readdir(root)).filter((name) => name.startsWith(".openclaw-migration-")),
+      ).toEqual([]);
+    },
+  );
 
   it("still aborts promotion when another writer changes the workspace", async () => {
     const { root, source, currentConfig } = await createImportFixture();
