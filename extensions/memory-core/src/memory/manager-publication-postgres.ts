@@ -14,6 +14,7 @@ import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
   readSqliteDatabaseScopedWriteToken,
+  readSqliteDatabaseWriteRevision,
   tableExists,
 } from "openclaw/plugin-sdk/sqlite-worker-runtime";
 import { hasMemorySessionTombstone } from "../memory-session-tombstones.js";
@@ -59,7 +60,7 @@ type StagingState = {
   metadata: MemoryIndexMeta | undefined;
 };
 const reindexStages = new WeakMap<EngineConnection, Map<string, StagingState>>();
-const embeddingCacheSizes = new WeakMap<EngineConnection, { size: number; token?: string }>();
+const embeddingCacheSizes = new WeakMap<EngineConnection, { size: number; token: string }>();
 
 /** A connection-local spool bounds transfer memory and disappears with its owning worker. */
 export function bindPostgresMemoryPublication(
@@ -99,6 +100,19 @@ export function bindPostgresMemoryPublication(
   }
   let cacheSize: number | undefined;
   const readCacheSize = () => (cacheSize ??= countMemoryEmbeddingCache(db));
+  const retainCacheSize = (size: number | undefined, expectedRevision: number | undefined) => {
+    if (size === undefined || expectedRevision === undefined) {
+      embeddingCacheSizes.delete(db);
+      return;
+    }
+    const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
+    // Read the token before checking the revision so a later writer cannot certify this count.
+    if (token === undefined || readSqliteDatabaseWriteRevision(db) !== expectedRevision) {
+      embeddingCacheSizes.delete(db);
+    } else {
+      embeddingCacheSizes.set(db, { size, token });
+    }
+  };
   const write = <T>(
     run: () => T,
     options?: { publishFacts: boolean },
@@ -109,12 +123,14 @@ export function bindPostgresMemoryPublication(
     const previousMetadata = metadata;
     const previousCreated = created;
     let previousCacheSize: number | undefined;
+    let cacheRevision: number | undefined;
     try {
       const value = db.runTransaction(
         () => {
           context.admit("transaction");
           entered = true;
           // Another owner may commit while this transaction waits for the store's writer lock.
+          cacheRevision = readSqliteDatabaseWriteRevision(db);
           const retained = embeddingCacheSizes.get(db);
           const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
           cacheSize = retained?.token === token ? retained?.size : undefined;
@@ -150,16 +166,11 @@ export function bindPostgresMemoryPublication(
         },
       };
     } finally {
-      // PG commits publish broad receipts. Carry our count across owned writes,
-      // but recount after another owner (for example session forget) changes the store.
-      if (cacheSize === undefined) {
-        embeddingCacheSizes.delete(db);
-      } else {
-        embeddingCacheSizes.set(db, {
-          size: cacheSize,
-          token: readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE),
-        });
-      }
+      // A PG commit advances the broad receipt once. Any other advance invalidates our snapshot.
+      retainCacheSize(
+        cacheSize,
+        cacheRevision === undefined ? undefined : (cacheRevision + Number(committed)) | 0,
+      );
     }
   };
   const ensureSpool = () => {
@@ -172,12 +183,15 @@ export function bindPostgresMemoryPublication(
     created = true;
   };
   const dropSpool = (name: string) => {
+    const revision = readSqliteDatabaseWriteRevision(db);
     const retained = embeddingCacheSizes.get(db);
     const token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
+    const commits = Number(!db.isTransaction);
     db.exec(`DROP TABLE ${name}`);
-    if (retained && retained.token === token) {
-      retained.token = readSqliteDatabaseScopedWriteToken(db, MEMORY_EMBEDDING_CACHE_WRITE_SCOPE);
-    }
+    retainCacheSize(
+      retained?.token === token ? retained?.size : undefined,
+      revision === undefined ? undefined : (revision + commits) | 0,
+    );
   };
   const append = (
     lane: string,

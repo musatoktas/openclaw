@@ -696,6 +696,42 @@ describe.skipIf(!connection)("PostgreSQL memory publication worker", () => {
       }
     }));
 
+  it("invalidates cache sizing when another owner commits during post-commit facts", () =>
+    admitted(() => {
+      const header = {
+        agentId: "publication-fixture",
+        provider: { id: "fixture", model: "fixture" },
+        providerKey: "fixture",
+        maxEntries: 3,
+      };
+      const command = (hashes: string[]) => ({
+        type: "cache.write.inline" as const,
+        input: { header, entries: hashes.map((hash) => ({ hash, embedding: [1] })) },
+      });
+      expect(backend.execute(command(["a", "b"]))).toMatchObject({ ok: true });
+      const other = bind();
+      const query = pg().query.bind(pg());
+      let interleaved = false;
+      const queried = vi.spyOn(pg(), "query").mockImplementation((sql, parameters) => {
+        if (!interleaved && sql.includes('as "hasIndexedChunks"')) {
+          interleaved = true;
+          expect(other.execute(command(["c"]))).toMatchObject({ ok: true });
+        }
+        return query(sql, parameters);
+      });
+      try {
+        expect(backend.execute({ type: "index.writeMetadata", input: metadata })).toMatchObject({
+          ok: true,
+        });
+        expect(interleaved).toBe(true);
+        expect(backend.execute(command(["d"]))).toMatchObject({ ok: true });
+        expect(pg().prepare("SELECT hash FROM memory_embedding_cache").all()).toHaveLength(3);
+      } finally {
+        queried.mockRestore();
+        other.close();
+      }
+    }));
+
   it("replays a multi-request cache through bounded connection-local staging", () =>
     admitted(() => {
       const entries = Array.from({ length: 40 }, (_, index) => ({
