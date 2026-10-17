@@ -154,13 +154,13 @@ export function bindPostgresMemoryPublication(
         JSON.stringify(source),
       );
     }
-    // The transfer owner caps each request at 512 KiB; booleans never cross the SQL boundary.
-    for (const fragment of fragments) {
-      db.prepare(`INSERT INTO ${spool} (lane, json, last) VALUES (?, ?, ?)`).run(
-        lane,
-        fragment.json,
-        Number(fragment.last),
-      );
+    // Transfer batches cap bytes at 512 KiB; also bound the three binds per row to PostgreSQL's limit.
+    const maxRows = Math.floor(65_535 / 3);
+    for (let offset = 0; offset < fragments.length; offset += maxRows) {
+      const batch = fragments.slice(offset, offset + maxRows);
+      db.prepare(
+        `INSERT INTO ${spool} (lane, json, last) VALUES ${batch.map(() => "(?, ?, ?)").join(", ")}`,
+      ).run(...batch.flatMap((fragment) => [lane, fragment.json, Number(fragment.last)]));
     }
   };
   function* records(lane: string) {

@@ -241,6 +241,29 @@ describe.skipIf(!connection)("PostgreSQL memory publication worker", () => {
       expect(keyword("orchid")).toEqual([{ path: "memory/orchid.md" }]);
     }));
 
+  it("preserves fragment order across the PostgreSQL bind-parameter limit", () =>
+    admitted(() => {
+      const next = replacement("fragmented", `fragmented ${"x".repeat(22_000)}`);
+      const json = [...memoryPublicationBatches(next)]
+        .flat()
+        .map((fragment) => fragment.json)
+        .join("");
+      const fragments = Array.from(json, (part, index) => ({
+        json: part,
+        last: index === json.length - 1,
+      }));
+      expect(fragments.length).toBeGreaterThan(65_535 / 3);
+      backend.execute({ type: "stage.start", input: { header: memoryPublicationHeader(next) } });
+      backend.execute({ type: "stage.append", input: { fragments } });
+      expect(backend.execute({ type: "source.replace", input: { state } })).toMatchObject({
+        ok: true,
+        value: true,
+      });
+      expect(rows()).toEqual([
+        { path: "memory/fragmented.md", text: next.chunks[0]!.text, vector: "[1,0,0]" },
+      ]);
+    }));
+
   it("routes PostgreSQL indexing reads through the publication owner", async () => {
     const command = {
       type: "source.hash",
