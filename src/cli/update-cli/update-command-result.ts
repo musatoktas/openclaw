@@ -439,7 +439,10 @@ export async function withUpdateAdmissionReporting<T>(
     if (
       !(error instanceof GatewayServiceUpdateOwnershipError) &&
       !(error instanceof SystemPackageOwnershipError) &&
-      !(error instanceof UpdatePreMutationError)
+      !(
+        error instanceof UpdatePreMutationError &&
+        (error.reason === "config-read-failed" || error.reason === "invalid-config")
+      )
     ) {
       throw error;
     }
