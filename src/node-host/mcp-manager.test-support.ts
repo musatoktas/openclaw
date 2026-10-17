@@ -1,9 +1,9 @@
-import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {
+  RequestOptions,
   CallToolRequest,
   CallToolResult,
   ListToolsRequest,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/client";
 import { onTestFinished, vi } from "vitest";
 import type { resolveMcpTransport } from "../agents/mcp-transport.js";
 import { startNodeHostMcpManager as startManager } from "./mcp.js";
@@ -13,8 +13,8 @@ const { clientConstructor, resolveTransport } = vi.hoisted(() => ({
   resolveTransport: vi.fn(),
 }));
 
-vi.mock("@modelcontextprotocol/sdk/client/index.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@modelcontextprotocol/sdk/client/index.js")>()),
+vi.mock("@modelcontextprotocol/client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@modelcontextprotocol/client")>()),
   Client: clientConstructor,
 }));
 // mock-isolation: Fixtures own transport lifetimes instead of opening real MCP connections.
@@ -27,12 +27,8 @@ type TransportFixture = Pick<
 
 type ClientFixture = {
   onclose?: () => void;
-  request(request: ListToolsRequest, schema: unknown, options?: RequestOptions): Promise<unknown>;
-  callTool(
-    params: CallToolRequest["params"],
-    schema?: undefined,
-    options?: RequestOptions,
-  ): Promise<CallToolResult>;
+  request(request: ListToolsRequest, options?: RequestOptions): Promise<unknown>;
+  callTool(params: CallToolRequest["params"], options?: RequestOptions): Promise<CallToolResult>;
 };
 
 export function startNodeHostMcpManager(
@@ -64,14 +60,10 @@ export function startNodeHostMcpManager(
       set onclose(callback: ClientFixture["onclose"]) {
         Object.assign(client, { onclose: callback });
       },
-      request(
-        request: ListToolsRequest | CallToolRequest,
-        schema: unknown,
-        requestOptions?: RequestOptions,
-      ) {
+      request(request: ListToolsRequest | CallToolRequest, requestOptions?: RequestOptions) {
         return request.method === "tools/call"
-          ? client.callTool(request.params, undefined, requestOptions)
-          : client.request(request, schema, requestOptions);
+          ? client.callTool(request.params, requestOptions)
+          : client.request(request, requestOptions);
       },
     };
   });

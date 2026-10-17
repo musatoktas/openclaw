@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import {
+  Client,
+  INTERNAL_ERROR,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
@@ -45,7 +47,10 @@ describe("node Claude Workshop result settlement", () => {
           },
         },
       });
-      const client = new Client({ name: "workshop-result-fixture", version: "1" });
+      const client = new Client(
+        { name: "workshop-result-fixture", version: "1" },
+        { versionNegotiation: { mode: "legacy" } },
+      );
       onTestFinished(async () => {
         try {
           await client.close();
@@ -81,7 +86,7 @@ describe("node Claude Workshop result settlement", () => {
         await expect(Promise.resolve().then(() => dispatch(response))).rejects.toMatchObject({
           name: "ZodError",
         });
-        await expect(result).rejects.toMatchObject({ code: ErrorCode.InternalError });
+        await expect(result).rejects.toMatchObject({ code: INTERNAL_ERROR });
       } else {
         await dispatch(response);
         await expect(result).resolves.toMatchObject({

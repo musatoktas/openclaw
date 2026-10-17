@@ -4,8 +4,8 @@
 import crypto from "node:crypto";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { z } from "zod";
 const protocolModulePath = "../../../../dist/gateway/protocol/index.js" as string;
 const errorsModulePath = "../../../../dist/infra/errors.js" as string;
@@ -455,7 +455,10 @@ export async function connectMcpClient(params: {
     pushBounded(rawMessages, message, MCP_RAW_MESSAGE_RETAIN_LIMIT);
   });
 
-  const client = new Client({ name: "docker-mcp-channels", version: "1.0.0" });
+  const client = new Client(
+    { name: "docker-mcp-channels", version: "1.0.0" },
+    { versionNegotiation: { mode: "legacy" } },
+  );
   try {
     await connectMcpWithTimeout(client, transport, MCP_CONNECT_TIMEOUT_MS);
     return {

@@ -1,12 +1,6 @@
 /** Process-lifetime MCP clients owned by the headless node host. */
 import { isDeepStrictEqual } from "node:util";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import {
-  CallToolResultSchema,
-  ErrorCode,
-  ListToolsResultSchema,
-  type Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { Client, SdkErrorCode, type Tool } from "@modelcontextprotocol/client";
 import { formatErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
@@ -296,7 +290,6 @@ export async function startNodeHostMcpManager(
       loadPage: async ({ cursor, requestTimeoutMs, signal: requestSignal }) => {
         const page = await session.client.request(
           { method: "tools/list", params: cursor === undefined ? undefined : { cursor } },
-          ListToolsResultSchema,
           {
             timeout: requestTimeoutMs,
             maxTotalTimeout: requestTimeoutMs,
@@ -341,6 +334,7 @@ export async function startNodeHostMcpManager(
           { name: "openclaw-node-host", version: VERSION },
           {
             jsonSchemaValidator: createMcpJsonSchemaValidator(),
+            versionNegotiation: { mode: "legacy" },
             listChanged: {
               tools: {
                 autoRefresh: false,
@@ -523,7 +517,6 @@ export async function startNodeHostMcpManager(
             method: "tools/call",
             params: { name: params.tool, arguments: params.arguments ?? {} },
           },
-          CallToolResultSchema,
           {
             timeout: Math.min(requestedTimeoutMs, session.toolCallTimeoutMs),
             ...(params.signal ? { signal: params.signal } : {}),
@@ -546,12 +539,17 @@ export async function startNodeHostMcpManager(
             { cause: error },
           );
         }
-        const message = truncateUtf16Safe(formatErrorMessage(error), NODE_MCP_ERROR_MAX_CHARS);
+        const cancelled = params.signal?.aborted === true;
+        const message = truncateUtf16Safe(
+          formatErrorMessage(cancelled ? params.signal?.reason : error),
+          NODE_MCP_ERROR_MAX_CHARS,
+        );
         if (
+          !cancelled &&
           error &&
           typeof error === "object" &&
           "code" in error &&
-          error.code === ErrorCode.RequestTimeout
+          error.code === SdkErrorCode.RequestTimeout
         ) {
           throw new NodeHostMcpError("MCP_TOOL_TIMEOUT", message, { cause: error });
         }
